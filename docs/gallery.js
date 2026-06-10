@@ -150,6 +150,10 @@
     mount.appendChild(nav);
   }
 
+  const upcoming = el("p", "gallery-upcoming");
+  upcoming.textContent = "More videos from additional versions are coming soon.";
+  mount.appendChild(upcoming);
+
   // ---- build sections ----------------------------------------------------
   sections.forEach((sec) => {
     if (!sec) return;
