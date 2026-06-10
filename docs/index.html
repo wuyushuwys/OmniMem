@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-0MJT0XK78R"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+
+    gtag('config', 'G-0MJT0XK78R');
+  </script>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OmniMem: Scalable and Adaptive Memory Retrieval for Long Video Generation</title>
+  <meta name="description" content="OmniMem: Scalable and Adaptive Memory Retrieval for Long Video Generation — project page." />
+
+  <!-- Open Graph / social preview -->
+  <meta property="og:title" content="OmniMem: Scalable and Adaptive Memory Retrieval for Long Video Generation" />
+  <meta property="og:description" content="Project page for OmniMem." />
+  <meta property="og:type" content="website" />
+
+  <!-- Icon fonts: Academicons (arXiv) + Font Awesome (GitHub, video) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1.9.4/css/academicons.min.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" />
+
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="hero">
+    <h1>OmniMem</h1>
+    <p class="subtitle">Scalable and Adaptive Memory Retrieval for Long Video Generation</p>
+
+    <p class="authors">
+      <a href="https://lin-zhao-resolve.github.io/">Lin Zhao</a><sup>1,2*</sup>,
+      <a href="http://wuyushuwys.github.io/">Yushu Wu</a><sup>1*</sup>,
+      <a href="https://yifanfanfanfan.github.io/">Yifan Gong</a><sup>2</sup>,
+      <a href="https://www.yanzhiwang.com/">Yanzhi Wang</a><sup>1</sup>,
+      <a href="https://puzhao.info/">Pu Zhao</a><sup>1&dagger;</sup>
+    </p>
+    <p class="affiliations">
+      <sup>1</sup>Northeastern University&nbsp;&nbsp;
+      <sup>2</sup>Adobe Research
+    </p>
+    <p class="notes"><sup>*</sup>Equal contribution&nbsp;&nbsp;<sup>&dagger;</sup>Corresponding author</p>
+
+    <nav class="links">
+      <a href="https://arxiv.org/abs/2605.30519" class="btn"><i class="ai ai-arxiv"></i> Paper</a>
+      <a href="https://github.com/wuyushuwys/OmniMem" class="btn"><i class="fab fa-github"></i> Code</a>
+      <a href="#video-gallery" class="btn"><i class="fas fa-circle-play"></i> Videos</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="band">
+      <div class="container">
+        <p class="tldr">
+          <strong>TL;DR</strong> — OmniMem does explicit sparse KV retrieval over the
+          <em>full</em> history for autoregressive long-video generation, keeping the
+          query-relevant details that are lost when the KV cache is truncated or
+          compressed, and improves Dynamic Degree by <b>52.3%</b> at comparable memory cost.
+        </p>
+      </div>
+    </section>
+
+    <section class="band band-alt abstract">
+      <div class="container">
+        <h2>Abstract</h2>
+        <p>
+          Autoregressive (AR) video generation extends videos by producing latent chunks sequentially, but scaling to long videos requires repeated access to a growing historical KV cache.
+          Existing methods reduce this cost by truncating the KV cache or compressing it into implicit memory, but both lose explicit access to query-relevant historical details.
+          We propose OmniMem, an explicit full-range memory retrieval framework that performs sparse KV retrieval over the historical cache.
+          To make this practical for chunk-based AR video generation, OmniMem addresses two issues: (i) local bias in sparse KV selection and (ii) Union Explosion in memory access.
+          Adaptive Window Exclusion removes local-window blocks from the selection candidates when sufficient long-range history is available, preserving the sparse budget for informative long-range retrieval.
+          Query-Shared KV Selection reduces cross-query diversity, while Per-Head Scattered KV Access avoids expanding head-specific selections into a large selected KV buffer.
+          This allows each attention head to retrieve non-contiguous KV blocks according to its own selection pattern. Experiments on long-video generation show that OmniMem improves Dynamic Degree by 52.3% and preserves strong consistency over strong baselines, while maintaining comparable memory usage.
+        </p>
+      </div>
+    </section>
+
+    <section class="band">
+      <div class="container wide">
+        <div id="figure-gallery"></div>
+      </div>
+    </section>
+
+    <section class="band">
+      <div class="container wide">
+        <div id="video-gallery"></div>
+      </div>
+    </section>
+
+    <section class="band band-alt bibtex">
+      <div class="container">
+        <h2>BibTeX</h2>
+        <pre><code>@article{zhao2026omnimem,
+  title   = {OmniMem: Scalable and Adaptive Memory Retrieval for Long Video Generation},
+  author  = {Zhao, Lin and Wu, Yushu and Gong, Yifan and Wang, Yanzhi and Zhao, Pu},
+  journal = {arXiv preprint arXiv:2605.30519},
+  year    = {2026}
+}</code></pre>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <a href="https://github.com/wuyushuwys/OmniMem">GitHub</a>
+  </footer>
+
+  <!-- YAML parser for videos.yaml (exposes global `jsyaml`); must load before gallery.js -->
+  <script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"></script>
+  <script src="gallery.js"></script>
+  <script src="figures.js"></script>
+</body>
+</html>

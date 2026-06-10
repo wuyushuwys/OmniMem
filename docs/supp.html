@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>OmniMem: Scalable and Adaptive Memory Retrieval for Long Video Generation</title>
+<style>
+  :root{
+    --bg:#fafafa;
+    --panel:#ffffff;
+    --text:#1a1a1a;
+    --muted:#666;
+    --border:#e5e5e5;
+    --accent:#2b6cb0;
+    --accent-soft:#ebf3fb;
+    --shadow:0 1px 2px rgba(0,0,0,0.04), 0 4px 16px rgba(0,0,0,0.04);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg);
+    color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    line-height:1.65;
+    font-size:18px;
+  }
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+
+  header.hero{
+    padding:64px 24px 40px;
+    text-align:center;
+    border-bottom:1px solid var(--border);
+    background:#fff;
+  }
+  .paper-id{
+    display:inline-block;
+    font-size:14px;
+    letter-spacing:0.08em;
+    color:var(--muted);
+    text-transform:uppercase;
+    margin-bottom:18px;
+    padding:5px 14px;
+    border:1px solid var(--border);
+    border-radius:999px;
+  }
+  h1.title{
+    font-size:44px;
+    line-height:1.2;
+    margin:0 auto 8px;
+    max-width:1000px;
+    font-weight:700;
+    letter-spacing:-0.01em;
+  }
+  h1.title .sub{
+    display:block;
+    font-size:26px;
+    color:var(--muted);
+    font-weight:500;
+    margin-top:10px;
+  }
+  .anon{
+    color:var(--muted);
+    font-size:17px;
+    margin-top:16px;
+  }
+  .badges{
+    margin-top:24px;
+    display:flex;
+    gap:10px;
+    justify-content:center;
+    flex-wrap:wrap;
+  }
+  .badge{
+    display:inline-flex;
+    align-items:center;
+    gap:6px;
+    padding:9px 18px;
+    border-radius:999px;
+    background:#1a1a1a;
+    color:#fff;
+    font-size:15px;
+    font-weight:500;
+  }
+  .badge.outline{background:#fff;color:var(--text);border:1px solid var(--border)}
+
+  nav.toc{
+    position:sticky;
+    top:0;
+    z-index:50;
+    background:rgba(255,255,255,0.92);
+    backdrop-filter:saturate(180%) blur(8px);
+    -webkit-backdrop-filter:saturate(180%) blur(8px);
+    border-bottom:1px solid var(--border);
+  }
+  nav.toc ul{
+    list-style:none;
+    margin:0;
+    padding:14px 24px;
+    display:flex;
+    gap:28px;
+    justify-content:center;
+    flex-wrap:wrap;
+    font-size:15px;
+  }
+  nav.toc a{color:var(--text);font-weight:500}
+  nav.toc a:hover{color:var(--accent);text-decoration:none}
+
+  main{max-width:1280px;margin:0 auto;padding:0 24px 80px}
+  section{padding:56px 0 16px;scroll-margin-top:60px}
+  section h2{
+    font-size:32px;
+    margin:0 0 10px;
+    font-weight:700;
+    letter-spacing:-0.01em;
+  }
+  section .lead{
+    color:var(--muted);
+    margin:0 0 28px;
+    max-width:980px;
+    font-size:17px;
+  }
+  section .hint{
+    color:var(--muted);
+    font-size:15px;
+    font-style:italic;
+    margin:0 0 20px;
+  }
+
+  .speed-bar{
+    display:flex;
+    align-items:center;
+    gap:10px;
+    margin-bottom:22px;
+    font-size:15px;
+    color:var(--muted);
+  }
+  .speed-btn{
+    padding:5px 14px;
+    border:1px solid var(--border);
+    border-radius:999px;
+    background:#fff;
+    cursor:pointer;
+    font-size:14px;
+    color:var(--text);
+    font-weight:500;
+    transition:all 0.15s;
+  }
+  .speed-btn:hover{border-color:#bbb}
+  .speed-btn.active{
+    background:var(--accent);
+    color:#fff;
+    border-color:var(--accent);
+  }
+
+  .grid{display:grid;gap:20px}
+  .grid.cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .grid.cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .grid.cols-4{grid-template-columns:repeat(4,minmax(0,1fr))}
+  @media (max-width:1000px){
+    .grid.cols-3,.grid.cols-4{grid-template-columns:repeat(2,minmax(0,1fr))}
+  }
+  @media (max-width:640px){
+    .grid.cols-2,.grid.cols-3,.grid.cols-4{grid-template-columns:1fr}
+  }
+
+  .vcard{
+    display:flex;
+    flex-direction:column;
+    background:transparent;
+  }
+  .vmedia{
+    position:relative;
+    border-radius:12px;
+    overflow:hidden;
+    background:#000;
+    box-shadow:var(--shadow);
+    aspect-ratio:16/9;
+  }
+  .vcard video{
+    display:block;
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    background:#000;
+  }
+  .duration-tag{
+    position:absolute;
+    top:12px;
+    right:12px;
+    padding:5px 12px;
+    border-radius:6px;
+    background:rgba(0,0,0,0.65);
+    color:#fff;
+    font-size:14px;
+    font-weight:600;
+    letter-spacing:0.02em;
+    z-index:3;
+    pointer-events:none;
+  }
+  .col-label{
+    position:absolute;
+    top:12px;
+    left:12px;
+    padding:5px 13px;
+    border-radius:6px;
+    background:rgba(0,0,0,0.65);
+    color:#fff;
+    font-size:14px;
+    font-weight:600;
+    z-index:3;
+    pointer-events:none;
+  }
+  .col-label.ours{background:var(--accent)}
+
+  .compare-row{margin-bottom:48px}
+  .compare-row .row-title{
+    font-size:16px;
+    color:var(--muted);
+    margin:0 0 12px;
+    font-weight:500;
+  }
+  .prompt-block{
+    margin-top:14px;
+    padding:16px 20px;
+    background:#fff;
+    border:1px solid var(--border);
+    border-radius:10px;
+    font-size:15px;
+    line-height:1.65;
+    color:var(--text);
+    box-shadow:var(--shadow);
+  }
+  .prompt-block p{margin:0}
+  .prompt-block .seg{
+    display:flex;
+    gap:14px;
+    align-items:flex-start;
+    padding:8px 0;
+    border-bottom:1px dashed var(--border);
+  }
+  .prompt-block .seg:last-child{border-bottom:none}
+  .prompt-block .seg-time{
+    flex:0 0 auto;
+    min-width:90px;
+    color:var(--accent);
+    font-weight:600;
+    font-size:13px;
+    letter-spacing:0.04em;
+    padding-top:1px;
+  }
+  .prompt-block .seg-text{
+    flex:1;
+    color:var(--text);
+  }
+
+  footer{
+    border-top:1px solid var(--border);
+    padding:32px 24px;
+    text-align:center;
+    color:var(--muted);
+    font-size:14px;
+    margin-top:40px;
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="paper-id">Paper ID 4154</div>
+  <h1 class="title">
+    OmniMem
+    <span class="sub">Scalable and Adaptive Memory Retrieval for Long Video Generation</span>
+  </h1>
+  <div class="anon">Anonymous Authors &middot; Supplementary Material</div>
+  <div class="badges">
+    <span class="badge outline">Supplementary Video Showcases</span>
+  </div>
+</header>
+
+<nav class="toc">
+  <ul>
+    <li><a href="#compare">Comparison with LongLive</a></li>
+    <li><a href="#interactive">Interactive 60s</a></li>
+    <li><a href="#showcase-60s">60s Videos</a></li>
+    <li><a href="#showcase-20s">20s Videos</a></li>
+    <li><a href="#showcase-10s">10s Videos</a></li>
+  </ul>
+</nav>
+
+<main>
+
+  <!-- ===== Comparison ===== -->
+  <section id="compare">
+    <h2>Comparison with LongLive</h2>
+    <p class="lead">We compare our method against LongLive on both standard 60-second generation and interactive prompt-switching scenarios. Each pair is synchronized for direct side-by-side comparison; the corresponding prompt is shown below the videos.</p>
+    <div class="speed-bar" data-speed-group="gcmp">
+      <span>Play speed:</span>
+      <button class="speed-btn active" data-speed="1">×1</button>
+      <button class="speed-btn" data-speed="2">×2</button>
+    </div>
+
+    <div data-speed-group-target="gcmp">
+
+      <div class="compare-row">
+        <p class="row-title">Case 1 &mdash; Standard 60s generation</p>
+        <div class="grid cols-2" data-sync-group="cmp1">
+          <div class="vcard">
+            <div class="vmedia">
+              <span class="col-label">LongLive</span>
+              <span class="duration-tag">60s</span>
+              <video src="./assets/longlive_video_60s/vid_01.mp4" muted loop playsinline preload="auto"></video>
+            </div>
+          </div>
+          <div class="vcard">
+            <div class="vmedia">
+              <span class="col-label ours">Ours</span>
+              <span class="duration-tag">60s</span>
+              <video src="./assets/video_60s/vid_01.mp4" muted loop playsinline preload="auto"></video>
+            </div>
+          </div>
+        </div>
+        <div class="prompt-block">
+          <p>3D animation of a small, round, fluffy creature with big, expressive eyes explores a vibrant, enchanted forest. The creature, a whimsical blend of a rabbit and a squirrel, has soft blue fur and a bushy, striped tail. It hops along a sparkling stream, its eyes wide with wonder. The forest is alive with magical elements: flowers that glow and change colors, trees with leaves in shades of purple and silver, and small floating lights that resemble fireflies. The creature stops to interact playfully with a group of tiny, fairy-like beings dancing around a mushroom ring. The creature looks up in awe at a large, glowing tree that seems to be the heart of the forest.</p>
+        </div>
+      </div>
+
+      <div class="compare-row">
+        <p class="row-title">Case 2 &mdash; Interactive 60s generation with prompt switching every 10s</p>
+        <div class="grid cols-2" data-sync-group="cmp2">
+          <div class="vcard">
+            <div class="vmedia">
+              <span class="col-label">LongLive</span>
+              <span class="duration-tag">60s</span>
+              <video src="./assets/longlive_interactivate_video_60s/vid_02.mp4" muted loop playsinline preload="auto"></video>
+            </div>
+          </div>
+          <div class="vcard">
+            <div class="vmedia">
+              <span class="col-label ours">Ours</span>
+              <span class="duration-tag">60s</span>
+              <video src="./assets/interactivate_video_60s/vid_02.mp4" muted loop playsinline preload="auto"></video>
+            </div>
+          </div>
+        </div>
+        <div class="prompt-block">
+          <div class="seg"><span class="seg-time">0s – 10s</span><span class="seg-text">A realistic video of a Texas Hold'em poker event at a casino. A male player in his late 30s sits at a well-lit poker table and tightly grips his hole cards, wearing a tense, serious expression. The table is filled with chips of various colors.</span></div>
+          <div class="seg"><span class="seg-time">10s – 20s</span><span class="seg-text">The player flicks his cards onto the felt, then leans back in the chair with arms spread wide in celebration.</span></div>
+          <div class="seg"><span class="seg-time">20s – 30s</span><span class="seg-text">The player reveals the winning hand; a nearby patron claps and cheers for the winner.</span></div>
+          <div class="seg"><span class="seg-time">30s – 40s</span><span class="seg-text">The player sits upright and begins neatly arranging the stacks of chips in front of him.</span></div>
+          <div class="seg"><span class="seg-time">40s – 50s</span><span class="seg-text">The player glances over his chips and breaks into a proud, self-assured smile.</span></div>
+          <div class="seg"><span class="seg-time">50s – 60s</span><span class="seg-text">The player shares a celebratory high-five with a nearby patron after the win, laughter and cheers rippling around the table.</span></div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ===== Interactive 60s ===== -->
+  <section id="interactive">
+    <h2>Interactive 60-Second Video Showcases</h2>
+    <p class="lead">Our method supports interactive prompt switching during generation. Each video begins with a main prompt and adapts to a new prompt every 10 seconds, demonstrating smooth transitions while preserving long-range consistency.</p>
+    <div class="speed-bar" data-speed-group="gint">
+      <span>Play speed:</span>
+      <button class="speed-btn active" data-speed="1">×1</button>
+      <button class="speed-btn" data-speed="2">×2</button>
+    </div>
+    <div class="grid cols-2" data-speed-group-target="gint">
+      <div class="vcard">
+        <div class="vmedia">
+          <span class="duration-tag">60s</span>
+          <video src="./assets/interactivate_video_60s/vid_01.mp4" muted loop playsinline preload="metadata"></video>
+        </div>
+        <div class="prompt-block">
+          <div class="seg"><span class="seg-time">0s – 10s</span><span class="seg-text">A little boy in a blue T-shirt stands on a lush green lawn, arms relaxed at his sides, smiling at the camera, natural fresh realistic style.</span></div>
+          <div class="seg"><span class="seg-time">10s – 20s</span><span class="seg-text">A little boy in a blue T-shirt starts to step forward, lightly running, with his arms swinging naturally. The grass and blue sky remain unchanged.</span></div>
+          <div class="seg"><span class="seg-time">20s – 30s</span><span class="seg-text">A little boy in a blue T-shirt runs faster, leaning slightly forward, arms swinging naturally, feet lightly off the ground. The background remains the same grassy lawn.</span></div>
+          <div class="seg"><span class="seg-time">30s – 40s</span><span class="seg-text">A little boy in a blue T-shirt jumps into the air, knees bent, arms raised, performing a light jump. The grass and sky stay consistent.</span></div>
+          <div class="seg"><span class="seg-time">40s – 50s</span><span class="seg-text">A little boy in a blue T-shirt lands and continues running forward, arms swinging naturally, smiling as he enjoys the run. The background remains the same.</span></div>
+          <div class="seg"><span class="seg-time">50s – 60s</span><span class="seg-text">A little boy in a blue T-shirt stops running, hands on his hips with a smile, body leaning slightly forward, sunlight falling on the grass, natural fresh realistic style.</span></div>
+        </div>
+      </div>
+      <div class="vcard">
+        <div class="vmedia">
+          <span class="duration-tag">60s</span>
+          <video src="./assets/interactivate_video_60s/vid_03.mp4" muted loop playsinline preload="metadata"></video>
+        </div>
+        <div class="prompt-block">
+          <div class="seg"><span class="seg-time">0s – 10s</span><span class="seg-text">A hacker, wearing dark sunglasses and a hoodie, sits in front of multiple computer screens with flashing codes and notifications. They type rapidly on a keyboard, fingers moving quickly over the keys. The room is dimly lit with neon lights casting eerie shadows. The hacker's face shows intense concentration and determination.</span></div>
+          <div class="seg"><span class="seg-time">10s – 20s</span><span class="seg-text">They suddenly pause, leaning back in their chair to rub their eyes, while the screens continue to flicker with rapid updates. The room remains dimly lit with neon lights casting eerie shadows.</span></div>
+          <div class="seg"><span class="seg-time">20s – 30s</span><span class="seg-text">A small, blinking red light appears on one of the monitors, drawing the hacker's attention. The hacker's face still shows intense concentration and determination.</span></div>
+          <div class="seg"><span class="seg-time">30s – 40s</span><span class="seg-text">The hacker's hand reaches for a red button labeled EXECUTE, hesitating briefly before pressing it firmly. The room remains dimly lit with neon lights casting eerie shadows.</span></div>
+          <div class="seg"><span class="seg-time">40s – 50s</span><span class="seg-text">The hacker glances at a small, blinking LED on a nearby device, confirming the successful transmission. The cluttered workspace with various gadgets and wires fills the background.</span></div>
+          <div class="seg"><span class="seg-time">50s – 60s</span><span class="seg-text">A second device, previously unnoticed, starts beeping rapidly, drawing the hacker's attention. The cyberpunk aesthetic and neon lighting persist throughout.</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 60s ===== -->
+  <section id="showcase-60s">
+    <h2>60-Second Video Showcases</h2>
+    <p class="lead">Long-horizon generation results from our method, demonstrating sustained temporal consistency over extended durations.</p>
+    <div class="speed-bar" data-speed-group="g60">
+      <span>Play speed:</span>
+      <button class="speed-btn active" data-speed="1">×1</button>
+      <button class="speed-btn" data-speed="2">×2</button>
+    </div>
+    <div class="grid cols-2" data-speed-group-target="g60">
+      <div class="vcard">
+        <div class="vmedia">
+          <span class="duration-tag">60s</span>
+          <video src="./assets/video_60s/vid_02.mp4" muted loop playsinline preload="metadata"></video>
+        </div>
+        <div class="prompt-block"><p>A cinematic tracking shot follows a lone astronaut walking slowly across a vast, rust-colored Martian plain at sunset. The astronaut's white spacesuit is dusted with fine red sand, and the helmet visor reflects the distant horizon where two faint moons are rising. Each footstep leaves a clear print in the powdery soil, and a thin trail of dust drifts behind. The camera glides smoothly alongside, occasionally pulling back to reveal towering rock formations, deep canyons, and a pale orange sky streaked with high-altitude clouds. The lighting transitions gradually from warm amber to cool violet as the sun sinks lower, casting long, sharp shadows across the terrain. A wide cinematic shot with slow lateral motion, emphasizing solitude and scale.</p></div>
+      </div>
+      <div class="vcard">
+        <div class="vmedia">
+          <span class="duration-tag">60s</span>
+          <video src="./assets/video_60s/vid_03.mp4" muted loop playsinline preload="metadata"></video>
+        </div>
+        <div class="prompt-block"><p>A continuous slow-motion shot of a Holi festival celebration in India, with dozens of people throwing brightly colored powder into the air. Vibrant clouds of pink, yellow, blue, green, and orange burst and swirl around laughing dancers dressed in white. The colored powder coats faces, hair, and clothing, transforming each person into a living rainbow. Drummers and musicians play in the background, their rhythms driving the celebration. The camera moves through the crowd at chest height, capturing joyful expressions, raised hands, and the chaotic beauty of the swirling colors. Sunlight backlights the powder, making each cloud glow vividly. A cinematic slow-motion handheld shot, emphasizing joy and cultural vibrancy.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 20s ===== -->
+  <section id="showcase-20s">
+    <h2>20-Second Video Showcases</h2>
+    <p class="lead">Medium-horizon generation results from our method.</p>
+    <div class="speed-bar" data-speed-group="g20">
+      <span>Play speed:</span>
+      <button class="speed-btn active" data-speed="1">×1</button>
+      <button class="speed-btn" data-speed="2">×2</button>
+    </div>
+    <div class="grid cols-2" data-speed-group-target="g20">
+      <div class="vcard">
+        <div class="vmedia">
+          <span class="duration-tag">20s</span>
+          <video src="./assets/video_20s/vid_01.mp4" muted loop playsinline preload="metadata"></video>
+        </div>
+        <div class="prompt-block"><p>A dynamic over-the-shoulder perspective of a chef meticulously plating a dish in a bustling kitchen. The chef, a middle-aged man with a neatly trimmed beard and focused expression, deftly arranges ingredients on a pristine white plate. His hands move with precision, each gesture deliberate and practiced. The background shows a crowded kitchen with steaming pots, whirring blenders, and the clatter of utensils. Bright lights highlight the scene, casting shadows across the busy workspace. The camera angle captures the chef's detailed work from behind, emphasizing his skill and dedication.</p></div>
+      </div>
+      <div class="vcard">
+        <div class="vmedia">
+          <span class="duration-tag">20s</span>
+          <video src="./assets/video_20s/vid_02.mp4" muted loop playsinline preload="metadata"></video>
+        </div>
+        <div class="prompt-block"><p>A slow tracking shot following a hot air balloon ascending gracefully over the temples of Bagan, Myanmar at sunrise. The balloon, striped in deep red and gold, rises through layers of low-hanging mist that shrouds thousands of ancient stone stupas dotting the plains below. Other balloons drift in the distance, creating a fairy-tale silhouette against the warm pink and orange sky. The camera follows the balloon from a parallel position, occasionally swinging around to reveal the breathtaking view: terracotta temples emerging from the fog, flocks of birds taking flight, and the winding Irrawaddy River reflecting the morning light. A wide aerial tracking shot with slow upward drift, emphasizing serenity and timelessness.</p></div>
+      </div>
+      <div class="vcard">
+        <div class="vmedia">
+          <span class="duration-tag">20s</span>
+          <video src="./assets/video_20s/vid_03.mp4" muted loop playsinline preload="metadata"></video>
+        </div>
+        <div class="prompt-block"><p>A continuous slow-motion shot of a cheetah sprinting across the African savanna at full speed in pursuit of prey. Every powerful muscle in its sleek body ripples visibly as it accelerates, its long tail acting as a counterbalance. Dust and dry grass kick up behind it with each thunderous bound. The cheetah's spotted coat catches the warm late-afternoon sunlight, and its golden eyes are locked forward with intense focus. Acacia trees and distant gazelles dot the rolling golden landscape. The camera tracks alongside it at ground level, then briefly lifts above to reveal the chase pattern, and finally returns low for the dramatic final lunge. A cinematic slow-motion side-tracking shot, emphasizing speed and primal power.</p></div>
+      </div>
+      <div class="vcard">
+        <div class="vmedia">
+          <span class="duration-tag">20s</span>
+          <video src="./assets/video_20s/vid_04.mp4" muted loop playsinline preload="metadata"></video>
+        </div>
+        <div class="prompt-block"><p>A long continuous shot of a blacksmith working in a medieval-style forge at night. The smith, a broad-shouldered man with a leather apron and soot-streaked face, hammers a glowing orange piece of iron on a heavy anvil. Each strike sends a shower of bright sparks into the dim workshop, briefly illuminating tools hanging on the stone walls. He plunges the metal into a barrel of water, releasing a great hiss of steam, then returns it to the roaring forge fire to reheat. Embers float upward through the air. The camera moves smoothly from wide shots of the workshop to close-ups of the hammer striking, the sparks flying, and the smith's intense concentration. The warm orange firelight contrasts with cool blue shadows in the corners. A cinematic medium shot with shifting focus, emphasizing craftsmanship and elemental power.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 10s ===== -->
+  <section id="showcase-10s">
+    <h2>10-Second Video Showcases</h2>
+    <p class="lead">Short-horizon generation results from our method.</p>
+    <div class="speed-bar" data-speed-group="g10">
+      <span>Play speed:</span>
+      <button class="speed-btn active" data-speed="1">×1</button>
+      <button class="speed-btn" data-speed="2">×2</button>
+    </div>
+    <div class="grid cols-2" data-speed-group-target="g10">
+      <div class="vcard">
+        <div class="vmedia">
+          <span class="duration-tag">10s</span>
+          <video src="./assets/video_10s/vid_01.mp4" muted loop playsinline preload="metadata"></video>
+        </div>
+        <div class="prompt-block"><p>A close-up shot of a chocolatier carefully drizzling melted dark chocolate over a tray of fresh strawberries. The glossy chocolate flows in a thin, controlled ribbon, coating each strawberry in a smooth glaze. The strawberries are arranged neatly on parchment paper, their red surfaces still glistening with droplets of water. The chocolatier's hands move with practiced precision, the spoon rotating gently to create elegant zigzag patterns. Soft warm kitchen lighting highlights the rich textures of the chocolate and the vivid red of the fruit. The camera moves slowly across the tray, capturing each detail. A macro shot from a low angle, emphasizing craftsmanship and indulgence.</p></div>
+      </div>
+      <div class="vcard">
+        <div class="vmedia">
+          <span class="duration-tag">10s</span>
+          <video src="./assets/video_10s/vid_02.mp4" muted loop playsinline preload="metadata"></video>
+        </div>
+        <div class="prompt-block"><p>A continuous shot of a street performer playing a saxophone on a rainy night in a city plaza. The musician, wearing a dark fedora and a long coat, stands beneath a flickering streetlamp, the polished brass of his saxophone reflecting the warm yellow light. Rain falls softly around him, creating ripples in the puddles at his feet. A small crowd gathers in the background, their umbrellas forming a colorful canopy. Wisps of steam rise from a nearby manhole cover. The camera slowly circles the performer, occasionally moving in for close-ups of his hands on the keys and the gleam of raindrops on the saxophone. A cinematic orbital shot with moody lighting, emphasizing soul and atmosphere.</p></div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <p>Anonymous submission &middot; Paper ID 4154 &middot; Supplementary material for review purposes only.</p>
+</footer>
+
+<script>
+  document.querySelectorAll('.speed-bar').forEach(bar => {
+    const group = bar.getAttribute('data-speed-group');
+    const target = document.querySelector('[data-speed-group-target="'+group+'"]');
+    if (!target) return;
+    const buttons = bar.querySelectorAll('.speed-btn');
+    buttons.forEach(btn => {
+      btn.addEventListener('click', () => {
+        const rate = parseFloat(btn.getAttribute('data-speed'));
+        buttons.forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        target.querySelectorAll('video').forEach(v => { v.playbackRate = rate; });
+      });
+    });
+  });
+
+  // Group videos that should co-start.
+  const syncGroups = new Map(); // video -> [videoA, videoB]
+  document.querySelectorAll('[data-sync-group]').forEach(group => {
+    const vids = Array.from(group.querySelectorAll('video'));
+    vids.forEach(v => syncGroups.set(v, vids));
+  });
+
+  function waitReady(video){
+    return new Promise(resolve => {
+      if (video.readyState >= 3) { resolve(); return; }
+      const on = () => { video.removeEventListener('canplay', on); resolve(); };
+      video.addEventListener('canplay', on);
+    });
+  }
+
+  async function playGroup(vids){
+    // Pause and reset both, wait until both can play, then start together
+    vids.forEach(v => { try { v.pause(); } catch(_){} });
+    await Promise.all(vids.map(waitReady));
+    vids.forEach(v => { try { v.currentTime = 0; } catch(_){} });
+    vids.forEach(v => v.play().catch(()=>{}));
+  }
+
+  if ('IntersectionObserver' in window) {
+    const startedGroups = new WeakSet();
+    const io = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        const v = e.target;
+        const group = syncGroups.get(v);
+        if (e.isIntersecting) {
+          if (group) {
+            // Only co-start once per group entering view; let it loop naturally afterwards
+            if (!startedGroups.has(group)) {
+              startedGroups.add(group);
+              playGroup(group);
+            } else {
+              v.play().catch(()=>{});
+            }
+          } else {
+            v.play().catch(()=>{});
+          }
+        } else {
+          v.pause();
+          if (group) startedGroups.delete(group); // re-sync next time it enters view
+        }
+      });
+    }, { rootMargin: '200px 0px' });
+    document.querySelectorAll('video').forEach(v => io.observe(v));
+  }
+</script>
+
+</body>
+</html>

@@ -1,0 +1,112 @@
+# Video gallery, rendered by gallery.js. Edit to add or remove videos.
+
+assets_base: "https://github.com/wuyushuwys/OmniMem/releases/download/assets-v1"
+
+sections:
+
+  # === Comparison ===
+  - id: compare
+    title: "Comparison with LongLive"
+    lead: >-
+      We compare our method against LongLive on both standard 60-second
+      generation and interactive prompt-switching scenarios. Each pair is
+      synchronized for direct side-by-side comparison; the corresponding prompt
+      is shown below the videos.
+    type: compare
+    speed_toggle: true
+    duration: "60s"          # section default; per-row `duration:` overrides
+    rows:
+      - title: "Case 1 — Standard 60s generation"
+        left:  { label: "LongLive", src: "longlive_video_60s_vid_01.mp4" }
+        right: { label: "Ours",     src: "video_60s_vid_01.mp4" }
+        prompt: "3D animation of a small, round, fluffy creature with big, expressive eyes explores a vibrant, enchanted forest. The creature, a whimsical blend of a rabbit and a squirrel, has soft blue fur and a bushy, striped tail. It hops along a sparkling stream, its eyes wide with wonder. The forest is alive with magical elements: flowers that glow and change colors, trees with leaves in shades of purple and silver, and small floating lights that resemble fireflies. The creature stops to interact playfully with a group of tiny, fairy-like beings dancing around a mushroom ring. The creature looks up in awe at a large, glowing tree that seems to be the heart of the forest."
+
+      - title: "Case 2 — Interactive 60s generation with prompt switching every 10s"
+        left:  { label: "LongLive", src: "longlive_interactivate_video_60s_vid_02.mp4" }
+        right: { label: "Ours",     src: "interactivate_video_60s_vid_02.mp4" }
+        segments:
+          - { time: "0s – 10s",  text: "A realistic video of a Texas Hold'em poker event at a casino. A male player in his late 30s sits at a well-lit poker table and tightly grips his hole cards, wearing a tense, serious expression. The table is filled with chips of various colors." }
+          - { time: "10s – 20s", text: "The player flicks his cards onto the felt, then leans back in the chair with arms spread wide in celebration." }
+          - { time: "20s – 30s", text: "The player reveals the winning hand; a nearby patron claps and cheers for the winner." }
+          - { time: "30s – 40s", text: "The player sits upright and begins neatly arranging the stacks of chips in front of him." }
+          - { time: "40s – 50s", text: "The player glances over his chips and breaks into a proud, self-assured smile." }
+          - { time: "50s – 60s", text: "The player shares a celebratory high-five with a nearby patron after the win, laughter and cheers rippling around the table." }
+
+  # === Interactive 60s ===
+  - id: interactive
+    title: "Interactive 60-Second Video Showcases"
+    lead: >-
+      Our method supports interactive prompt switching during generation. Each
+      video begins with a main prompt and adapts to a new prompt every 10
+      seconds, demonstrating smooth transitions while preserving long-range
+      consistency.
+    type: grid
+    cols: 2
+    duration: "60s"
+    speed_toggle: true
+    videos:
+      - src: "interactivate_video_60s_vid_01.mp4"
+        segments:
+          - { time: "0s – 10s",  text: "A little boy in a blue T-shirt stands on a lush green lawn, arms relaxed at his sides, smiling at the camera, natural fresh realistic style." }
+          - { time: "10s – 20s", text: "A little boy in a blue T-shirt starts to step forward, lightly running, with his arms swinging naturally. The grass and blue sky remain unchanged." }
+          - { time: "20s – 30s", text: "A little boy in a blue T-shirt runs faster, leaning slightly forward, arms swinging naturally, feet lightly off the ground. The background remains the same grassy lawn." }
+          - { time: "30s – 40s", text: "A little boy in a blue T-shirt jumps into the air, knees bent, arms raised, performing a light jump. The grass and sky stay consistent." }
+          - { time: "40s – 50s", text: "A little boy in a blue T-shirt lands and continues running forward, arms swinging naturally, smiling as he enjoys the run. The background remains the same." }
+          - { time: "50s – 60s", text: "A little boy in a blue T-shirt stops running, hands on his hips with a smile, body leaning slightly forward, sunlight falling on the grass, natural fresh realistic style." }
+
+      - src: "interactivate_video_60s_vid_03.mp4"
+        segments:
+          - { time: "0s – 10s",  text: "A hacker, wearing dark sunglasses and a hoodie, sits in front of multiple computer screens with flashing codes and notifications. They type rapidly on a keyboard, fingers moving quickly over the keys. The room is dimly lit with neon lights casting eerie shadows. The hacker's face shows intense concentration and determination." }
+          - { time: "10s – 20s", text: "They suddenly pause, leaning back in their chair to rub their eyes, while the screens continue to flicker with rapid updates. The room remains dimly lit with neon lights casting eerie shadows." }
+          - { time: "20s – 30s", text: "A small, blinking red light appears on one of the monitors, drawing the hacker's attention. The hacker's face still shows intense concentration and determination." }
+          - { time: "30s – 40s", text: "The hacker's hand reaches for a red button labeled EXECUTE, hesitating briefly before pressing it firmly. The room remains dimly lit with neon lights casting eerie shadows." }
+          - { time: "40s – 50s", text: "The hacker glances at a small, blinking LED on a nearby device, confirming the successful transmission. The cluttered workspace with various gadgets and wires fills the background." }
+          - { time: "50s – 60s", text: "A second device, previously unnoticed, starts beeping rapidly, drawing the hacker's attention. The cyberpunk aesthetic and neon lighting persist throughout." }
+
+  # === 60-Second Showcases ===
+  - id: showcase-60s
+    title: "60-Second Video Showcases"
+    lead: >-
+      Long-horizon generation results from our method, demonstrating sustained
+      temporal consistency over extended durations.
+    type: grid
+    cols: 2
+    duration: "60s"
+    speed_toggle: true
+    videos:
+      - src: "video_60s_vid_02.mp4"
+        prompt: "A cinematic tracking shot follows a lone astronaut walking slowly across a vast, rust-colored Martian plain at sunset. The astronaut's white spacesuit is dusted with fine red sand, and the helmet visor reflects the distant horizon where two faint moons are rising. Each footstep leaves a clear print in the powdery soil, and a thin trail of dust drifts behind. The camera glides smoothly alongside, occasionally pulling back to reveal towering rock formations, deep canyons, and a pale orange sky streaked with high-altitude clouds. The lighting transitions gradually from warm amber to cool violet as the sun sinks lower, casting long, sharp shadows across the terrain. A wide cinematic shot with slow lateral motion, emphasizing solitude and scale."
+      - src: "video_60s_vid_03.mp4"
+        prompt: "A continuous slow-motion shot of a Holi festival celebration in India, with dozens of people throwing brightly colored powder into the air. Vibrant clouds of pink, yellow, blue, green, and orange burst and swirl around laughing dancers dressed in white. The colored powder coats faces, hair, and clothing, transforming each person into a living rainbow. Drummers and musicians play in the background, their rhythms driving the celebration. The camera moves through the crowd at chest height, capturing joyful expressions, raised hands, and the chaotic beauty of the swirling colors. Sunlight backlights the powder, making each cloud glow vividly. A cinematic slow-motion handheld shot, emphasizing joy and cultural vibrancy."
+
+  # === 20-Second Showcases ===
+  - id: showcase-20s
+    title: "20-Second Video Showcases"
+    lead: "Medium-horizon generation results from our method."
+    type: grid
+    cols: 2
+    duration: "20s"
+    speed_toggle: true
+    videos:
+      - src: "video_20s_vid_01.mp4"
+        prompt: "A dynamic over-the-shoulder perspective of a chef meticulously plating a dish in a bustling kitchen. The chef, a middle-aged man with a neatly trimmed beard and focused expression, deftly arranges ingredients on a pristine white plate. His hands move with precision, each gesture deliberate and practiced. The background shows a crowded kitchen with steaming pots, whirring blenders, and the clatter of utensils. Bright lights highlight the scene, casting shadows across the busy workspace. The camera angle captures the chef's detailed work from behind, emphasizing his skill and dedication."
+      - src: "video_20s_vid_02.mp4"
+        prompt: "A slow tracking shot following a hot air balloon ascending gracefully over the temples of Bagan, Myanmar at sunrise. The balloon, striped in deep red and gold, rises through layers of low-hanging mist that shrouds thousands of ancient stone stupas dotting the plains below. Other balloons drift in the distance, creating a fairy-tale silhouette against the warm pink and orange sky. The camera follows the balloon from a parallel position, occasionally swinging around to reveal the breathtaking view: terracotta temples emerging from the fog, flocks of birds taking flight, and the winding Irrawaddy River reflecting the morning light. A wide aerial tracking shot with slow upward drift, emphasizing serenity and timelessness."
+      - src: "video_20s_vid_03.mp4"
+        prompt: "A continuous slow-motion shot of a cheetah sprinting across the African savanna at full speed in pursuit of prey. Every powerful muscle in its sleek body ripples visibly as it accelerates, its long tail acting as a counterbalance. Dust and dry grass kick up behind it with each thunderous bound. The cheetah's spotted coat catches the warm late-afternoon sunlight, and its golden eyes are locked forward with intense focus. Acacia trees and distant gazelles dot the rolling golden landscape. The camera tracks alongside it at ground level, then briefly lifts above to reveal the chase pattern, and finally returns low for the dramatic final lunge. A cinematic slow-motion side-tracking shot, emphasizing speed and primal power."
+      - src: "video_20s_vid_04.mp4"
+        prompt: "A long continuous shot of a blacksmith working in a medieval-style forge at night. The smith, a broad-shouldered man with a leather apron and soot-streaked face, hammers a glowing orange piece of iron on a heavy anvil. Each strike sends a shower of bright sparks into the dim workshop, briefly illuminating tools hanging on the stone walls. He plunges the metal into a barrel of water, releasing a great hiss of steam, then returns it to the roaring forge fire to reheat. Embers float upward through the air. The camera moves smoothly from wide shots of the workshop to close-ups of the hammer striking, the sparks flying, and the smith's intense concentration. The warm orange firelight contrasts with cool blue shadows in the corners. A cinematic medium shot with shifting focus, emphasizing craftsmanship and elemental power."
+
+  # === 10-Second Showcases ===
+  - id: showcase-10s
+    title: "10-Second Video Showcases"
+    lead: "Short-horizon generation results from our method."
+    type: grid
+    cols: 2
+    duration: "10s"
+    speed_toggle: true
+    videos:
+      - src: "video_10s_vid_01.mp4"
+        prompt: "A close-up shot of a chocolatier carefully drizzling melted dark chocolate over a tray of fresh strawberries. The glossy chocolate flows in a thin, controlled ribbon, coating each strawberry in a smooth glaze. The strawberries are arranged neatly on parchment paper, their red surfaces still glistening with droplets of water. The chocolatier's hands move with practiced precision, the spoon rotating gently to create elegant zigzag patterns. Soft warm kitchen lighting highlights the rich textures of the chocolate and the vivid red of the fruit. The camera moves slowly across the tray, capturing each detail. A macro shot from a low angle, emphasizing craftsmanship and indulgence."
+      - src: "video_10s_vid_02.mp4"
+        prompt: "A continuous shot of a street performer playing a saxophone on a rainy night in a city plaza. The musician, wearing a dark fedora and a long coat, stands beneath a flickering streetlamp, the polished brass of his saxophone reflecting the warm yellow light. Rain falls softly around him, creating ripples in the puddles at his feet. A small crowd gathers in the background, their umbrellas forming a colorful canopy. Wisps of steam rise from a nearby manhole cover. The camera slowly circles the performer, occasionally moving in for close-ups of his hands on the keys and the gleam of raindrops on the saxophone. A cinematic orbital shot with moody lighting, emphasizing soul and atmosphere."

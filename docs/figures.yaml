@@ -1,0 +1,42 @@
+# Paper figures, rendered by figures.js. Edit to add or remove figures.
+
+assets_base: "./assets"
+
+sections:
+
+  - id: framework
+    title: "Framework"
+    body: "
+          Current-chunk queries to recent KV blocks, pooled historical KV blocks and
+          retrieved full-resolution KV blocks through sliding-window, compression, 
+          and selection attention, respectively. The right panels summarize the key 
+          retrieval and access designs: filtering near-window candidates before Top-K selection, 
+          sharing Top-K selection within query groups, and accessing per-head block slots with 
+          on-demand GPU residency.
+          "
+    images:
+      - { src: "framework.jpg", caption: "Overview of OmniMem." }
+
+  - id: motivation
+    title: "Motivation"
+    body: "
+          Top-K selection focuses near the current chunk without AWE, and shifts to long-range blocks with AWE.
+          Different query chunks in one head select different blocks.
+          Different heads also select different regions.
+          "
+    equal_height: true
+    images:
+      - { src: "awe.jpg",         caption: "Top-K selection is locally biased" }
+      - { src: "cross_query.jpg", caption: "Queries select different KV blocks" }
+      - { src: "cross_head.jpg",  caption: "Heads select different KV blocks" }
+
+  - id: profile
+    title: "Profiling"
+    body: "
+          Memory access scalability.
+          Naive Sparse reduces latency but also loses the memory benefits due to Union Explosion.
+          OmniMem maintains memory usage nearly constant while remaining efficient.
+          "
+    images:
+      - { src: "latency.jpg", caption: "Latency" }
+      - { src: "memory.jpg",  caption: "Memory" }
