@@ -132,9 +132,9 @@ h2 {
 .gallery-nav a:hover { border-color: var(--accent); color: var(--accent); text-decoration: none; }
 .gallery-upcoming {
   margin: -1rem 0 2.5rem;
-  color: var(--muted);
-  font-size: 1rem;
-  font-weight: 500;
+  color: var(--accent);
+  font-size: 1.35rem;
+  font-weight: 700;
   text-align: center;
 }
 
