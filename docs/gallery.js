@@ -42,34 +42,26 @@
     return v;
   }
 
-  // A prompt block: timed `segments` -> multi-line; plain `prompt` -> paragraph.
-  function promptBlock(item) {
+  // Prompt text shown as an overlay on hover, matching the LongLive page pattern.
+  function promptText(item) {
     if (Array.isArray(item.segments) && item.segments.length) {
-      const block = el("div", "prompt-block");
-      item.segments.forEach((s) => {
-        const seg = el("div", "seg");
-        const time = el("span", "seg-time");
-        time.textContent = s.time || "";
-        const text = el("span", "seg-text");
-        text.textContent = s.text || "";
-        seg.appendChild(time);
-        seg.appendChild(text);
-        block.appendChild(seg);
-      });
-      return block;
+      return item.segments
+        .map((s) => `${s.time || ""}: ${s.text || ""}`.trim())
+        .join("\n");
     }
-    if (item.prompt) {
-      const block = el("div", "prompt-block");
-      const p = el("p");
-      p.textContent = item.prompt;
-      block.appendChild(p);
-      return block;
-    }
-    return null;
+    return item.prompt || "";
   }
 
-  // A single video card (media only; caller adds a prompt block where wanted).
-  function mediaCard({ src, duration, label, ours, preload }) {
+  function addPromptOverlay(media, item) {
+    const text = promptText(item || {});
+    if (!text) return;
+    const overlay = el("div", "prompt-overlay");
+    overlay.textContent = text;
+    media.appendChild(overlay);
+  }
+
+  // A single video card with a hover prompt overlay.
+  function mediaCard({ src, duration, label, ours, preload, promptItem }) {
     const card = el("div", "vcard");
     const media = el("div", "vmedia");
     if (label) {
@@ -83,6 +75,7 @@
       media.appendChild(d);
     }
     media.appendChild(videoEl(src, preload));
+    addPromptOverlay(media, promptItem);
     card.appendChild(media);
     return card;
   }
@@ -119,17 +112,15 @@
       const L = row.left || {};
       const R = row.right || {};
       // Default: the right card is "Ours" (accent label); override with `ours:`.
-      grid.appendChild(mediaCard({ src: L.src, duration: dur, label: L.label, ours: L.ours === true, preload: "auto" }));
-      grid.appendChild(mediaCard({ src: R.src, duration: dur, label: R.label, ours: R.ours !== false, preload: "auto" }));
+      grid.appendChild(mediaCard({ src: L.src, duration: dur, label: L.label, ours: L.ours === true, preload: "auto", promptItem: row }));
+      grid.appendChild(mediaCard({ src: R.src, duration: dur, label: R.label, ours: R.ours !== false, preload: "auto", promptItem: row }));
       cr.appendChild(grid);
-      const pb = promptBlock(row);
-      if (pb) cr.appendChild(pb);
       frag.appendChild(cr);
     });
     return frag;
   }
 
-  // A grid of N videos, each with its own prompt block underneath.
+  // A grid of N videos, each with its own hover prompt overlay.
   function renderGrid(sec) {
     const cols = Math.min(Math.max(parseInt(sec.cols, 10) || 2, 1), 4);
     const grid = el("div", `grid cols-${cols}`);
@@ -139,9 +130,8 @@
         duration: item.duration || sec.duration,
         label: item.label,
         ours: item.ours === true,
+        promptItem: item,
       });
-      const pb = promptBlock(item);
-      if (pb) card.appendChild(pb);
       grid.appendChild(card);
     });
     return grid;
@@ -168,6 +158,10 @@
     const h2 = el("h2");
     h2.textContent = sec.title || "";
     section.appendChild(h2);
+
+    const hint = el("h3", "prompt-hint");
+    hint.textContent = "Hover on the video to see corresponding text prompts";
+    section.appendChild(hint);
 
     if (sec.lead) {
       const lead = el("p", "lead");
