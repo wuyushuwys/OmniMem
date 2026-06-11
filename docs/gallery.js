@@ -34,11 +34,17 @@
 
   function videoEl(src, preload) {
     const v = el("video");
-    v.src = url(src);
     v.muted = true;
     v.loop = true;
     v.playsInline = true;
     v.preload = preload || "metadata";
+    if (src) {
+      // VP9/WebM is preferred; H.264/MP4 is the universal fallback. videos.yaml
+      // lists the .mp4 name; the .webm name is derived by swapping the extension.
+      const webm = url(src.replace(/\.[^.]+$/, ".webm"));
+      v.appendChild(el("source", null, { src: webm, type: "video/webm" }));
+      v.appendChild(el("source", null, { src: url(src), type: "video/mp4" }));
+    }
     return v;
   }
 
