@@ -6,7 +6,7 @@
 
 [[ArXiv](https://arxiv.org/abs/2605.30519)] [[Page](https://wuyushuwys.github.io/OmniMem/)]
 
-OmniMem builds long-video generation on [Wan2.1](https://github.com/Wan-Video/Wan2.1) with Native Sparse Attention (NSA), self-forcing / teacher-forcing distillation, and a streaming KV cache with adaptive memory retrieval.
+OmniMem builds long-video generation on [Wan2.1](https://github.com/Wan-Video/Wan2.1) with adaptive memory retrieval.
 
 ## Installation
 
