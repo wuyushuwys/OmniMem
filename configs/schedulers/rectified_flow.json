@@ -1,0 +1,12 @@
+{
+  "_class_name": "RectifiedFlowScheduler",
+  "_diffusers_version": "0.29.1",
+  "eps": 0.001,
+  "loc": 0.0,
+  "num_train_timesteps": 1000,
+  "prediction_type": "v_prediction",
+  "sample_method": "logit-normal",
+  "scale": 1.0,
+  "shift": 1.0,
+  "init_noise_sigma": 1
+}

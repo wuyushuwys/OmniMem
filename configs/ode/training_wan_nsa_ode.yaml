@@ -1,0 +1,84 @@
+wandb_key: ${oc.env:WANDB_KEY}
+wandb_project: ${oc.env:WANDB_PROJ}
+wandb_host: ${oc.env:WANDB_HOST,null}
+
+s3_bucket: ${oc.env:S3_BUCKET,null}
+s3_dir: ${oc.env:S3_DIR,null}
+
+output_dir: "outputs"
+local_backup_dir: outputs/backup
+
+sharding_strategy: fully_shard
+gradient_accumulation_steps: 1
+num_workers: 8
+pin_memory: true
+
+train_gate_only: false
+
+nsa_kwargs:
+  pool_h: 6
+  pool_w: 4
+  enable_nsa: true
+  num_selected_blocks: 64
+  chunk_length: 4680 # 3 * 30 * 52
+  gate_mode: sigmoid
+  path_diff: false  # add per-path learnable scale/bias to differentiate attention outputs
+  noisy_gate: false  # add learnable noise to gate logits (Shazeer et al., 2017)
+  exclude_window_chunks: 3 
+  exclude_sink_chunks: 0     
+  progressive_exclude: true 
+
+# gate_learning_rate: 1e-3
+# gate_weight_decay: 0
+
+timestep_shift: 5
+
+frame_per_block: 3
+
+sink_size:
+  kv: 0
+  kv_cmp: null
+window_size:
+  kv: 3
+  kv_cmp: null
+
+torch_compile: true
+
+model_path: checkpoints/Wan-2.1-1.3B-causal-ODE-b3
+vae_path: wan_models/vae-2.1/vae
+text_encoder_path: wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+tokenizer_path: wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl
+
+scheduler_path: configs/schedulers/rectified_flow.json
+
+dataset_type: ode_dataset
+train_data:
+  train_shards_path_or_url: data/Wan2.1-T2V-1.3B_vidprom_81x480x832_40step_5cfg_5.0shift_4t
+  batch_size: 4
+
+
+validation_data:
+  prompt_file:
+#    - configs/prompts/eval_prompts.txt
+    - configs/prompts/demo.txt
+  num_inference_steps: 4
+  guidance_scale: 1
+  fps: 16
+  num_frames: 81
+  width: 832
+  height: 480
+  n_rows: 1
+
+learning_rate: 1.e-5
+
+max_train_steps: 100000
+checkpointing_steps: 50
+
+log_steps: 20
+
+validation_steps: 50
+
+global_seed: 42
+mixed_precision_training: true
+
+gradient_checkpointing: true

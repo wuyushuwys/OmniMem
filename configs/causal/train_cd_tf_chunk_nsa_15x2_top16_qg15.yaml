@@ -1,0 +1,91 @@
+wandb_key: ${oc.env:WANDB_KEY}
+wandb_project: ${oc.env:WANDB_PROJ}
+wandb_host: ${oc.env:WANDB_HOST,null}
+
+s3_bucket: ${oc.env:S3_BUCKET,null}
+s3_dir: ${oc.env:S3_DIR,null}
+
+output_dir: "outputs"
+
+sharding_strategy: fully_shard
+gradient_accumulation_steps: 1
+num_workers: 8
+pin_memory: true
+
+timestep_shift: 5
+frame_per_block: 3
+
+nsa_kwargs:
+  pool_h: 15
+  pool_w: 2
+  enable_nsa: true
+  num_selected_blocks: 16
+  chunk_length: 4680 # 3 * 30 * 52
+  exclude_window_chunks: 3
+  group_q_size: 15
+  fallback_slc: false
+  progressive_exclude: true
+  tf: true
+
+window_size:
+  kv: 3
+  kv_cmp: null
+sink_size:
+  kv: null
+  kv_cmp: null
+
+diffusion_forcing: true
+teacher_forcing: true
+
+discrete_cd_N: 48
+guidance_scale: 5.0
+use_cfg: true
+
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+
+lora_weights: null
+
+ema_decay: 0.99
+
+learning_rate: 1.e-5
+lr_warmup_steps: 0
+lr_scheduler: constant_with_warmup
+
+model_path: outputs/wan_gen_tf_nsa_15x2_top32_qg15/checkpoints/ema
+teacher_path: outputs/wan_gen_tf_nsa_15x2_top32_qg15/checkpoints/ema
+
+vae_path: wan_models/vae-2.1/vae
+scheduler_path: configs/schedulers/rectified_flow.json
+text_encoder_path: wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+tokenizer_path: wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl
+
+# dataset_type: image_video_dataset
+# train_data:
+#   train_shards_path_or_url: data/OpenVidHD/shards
+#   resample_fps: 16
+#   buckets:
+#     81:
+#       480x832: 1
+
+dataset_type: ode_dataset
+train_data:
+  train_shards_path_or_url: data/Wan2.1-T2V-1.3B_vidprom_81x480x832_40step_5cfg_5.0shift_4t
+  batch_size: 2
+
+validation_data:
+  prompt_file:
+    - configs/prompts/demo.txt
+  num_inference_steps: 4
+  guidance_scale: 1
+  fps: 16
+  num_frames: 81
+  width: 832
+  height: 480
+  n_rows: 1
+
+max_train_steps: 5000
+checkpointing_steps: 500
+log_steps: 20
+validation_steps: 500
+
+global_seed: 42

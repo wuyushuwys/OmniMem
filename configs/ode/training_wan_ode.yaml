@@ -1,0 +1,57 @@
+wandb_key: ${oc.env:WANDB_KEY}
+wandb_project: ${oc.env:WANDB_PROJ}
+wandb_host: ${oc.env:WANDB_HOST,null}
+
+s3_bucket: ${oc.env:S3_BUCKET,null}
+s3_dir: ${oc.env:S3_DIR,null}
+
+output_dir: "outputs"
+
+sharding_strategy: fully_shard
+gradient_accumulation_steps: 1
+num_workers: 8
+pin_memory: true
+
+timestep_shift: 5
+
+frame_per_block: 3
+
+torch_compile: true
+
+model_path: wan_models/Wan2.1-T2V-1.3B
+vae_path: wan_models/vae-2.1/vae
+scheduler_path: configs/schedulers/rectified_flow.json
+text_encoder_path: wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+tokenizer_path: wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl
+
+dataset_type: ode_dataset
+train_data:
+  train_shards_path_or_url: data/Wan2.1-T2V-1.3B_vidprom_81x480x832_40step_5cfg_5.0shift_4t
+  batch_size: 4
+
+
+validation_data:
+  prompt_file:
+#    - configs/prompts/eval_prompts.txt
+    - configs/prompts/demo.txt
+  num_inference_steps: 4
+  guidance_scale: 1
+  fps: 16
+  num_frames: 81
+  width: 832
+  height: 480
+  n_rows: 1
+
+learning_rate: 2.e-6
+
+max_train_steps: 100000
+checkpointing_steps: 1000
+
+log_steps: 20
+
+validation_steps: 1000
+
+global_seed: 42
+mixed_precision_training: true
+
+gradient_checkpointing: true

@@ -1,0 +1,48 @@
+torch==2.9.1
+torchvision==0.24.1
+numpy
+einops
+
+omegaconf
+pyyaml
+
+wandb
+tqdm
+
+webdataset
+ffmpeg-python
+imageio
+pillow
+opencv-python-headless
+av
+decord
+braceexpand
+
+# hugging-face
+peft>=0.13
+safetensors
+diffusers[torch]>=0.31
+transformers>=4.45
+accelerate
+timm
+
+# deepspeed support
+deepspeed
+
+# aws s3 library
+boto3
+
+# lpips
+lpips
+
+# t5 text-encoder
+ftfy==6.3.1
+bs4
+sentencepiece
+
+huggingface-hub>=0.26.2
+
+open-clip-torch
+tabulate
+
+matplotlib

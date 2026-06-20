@@ -1,0 +1,74 @@
+wandb_key: ${oc.env:WANDB_KEY}
+wandb_project: ${oc.env:WANDB_PROJ}
+wandb_host: ${oc.env:WANDB_HOST,null}
+
+s3_bucket: ${oc.env:S3_BUCKET,null}
+s3_dir: ${oc.env:S3_DIR,null}
+
+output_dir: "outputs"
+
+sharding_strategy: fully_shard
+gradient_accumulation_steps: 1
+num_workers: 8
+pin_memory: true
+
+timestep_shift: 5
+
+frame_per_block: 3
+
+ema_model: true
+# lora_weights: outputs/openvid_adapter
+ema_decay: 0.99
+init_sd_head: false
+self_distill: false
+diffusion_forcing: true
+teacher_forcing: true
+
+lr_warmup_steps: 0
+lr_scheduler: constant_with_warmup
+
+torch_compile: true
+conditioning_dropout_prob: 0.01
+
+model_path: wan_models/Wan2.1-T2V-1.3B
+vae_path: wan_models/vae-2.1/vae
+scheduler_path: configs/schedulers/rectified_flow.json
+text_encoder_path: wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+tokenizer_path: wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl
+
+dataset_type: image_video_dataset
+train_data:
+  train_shards_path_or_url: data/OpenVidHD/shards
+  resample_fps: 16
+  buckets:
+    81:
+      480x832: 1
+
+null_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+
+validation_data:
+  prompt_file:
+    - configs/prompts/demo.txt
+  num_inference_steps: 30
+  guidance_scale: 5
+  fps: 16
+  num_frames: 81
+  width: 832
+  height: 480
+  n_rows: 1
+
+learning_rate: 1.e-5
+adam_beta1: 0.9
+adam_beta2: 0.999
+
+max_train_steps: 10000
+checkpointing_steps: 1000
+
+log_steps: 20
+
+validation_steps: 500
+
+global_seed: 42
+mixed_precision_training: true
+
+gradient_checkpointing: true

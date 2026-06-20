@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omnimem"
+version = "0.1.0"
+description = "Scalable and Adaptive Memory Retrieval for Long Video Generation"
+readme = "README.md"
+requires-python = ">=3.10"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+# src layout: the importable package `omnimem` lives under src/omnimem/.
+# `where = ["src"]` makes `import omnimem` resolve after `pip install -e .`,
+# without `src` ever appearing in import paths.
+[tool.setuptools.packages.find]
+where = ["src"]
