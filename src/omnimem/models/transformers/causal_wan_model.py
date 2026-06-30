@@ -60,8 +60,8 @@ class CausalSelfAttention(WanSelfAttention):
             block_mask: Optional[Union[BlockMask, torch.Tensor]] = None,
     ):
         """
-        x: input tensor; block_mask=BlockMask → training (standard RoPE + flex_attention);
-        block_mask=None → inference (causal RoPE + KV-cache update).
+        x: input tensor; block_mask=BlockMask means training (standard RoPE + flex_attention);
+        block_mask=None means inference (causal RoPE + KV-cache update).
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 

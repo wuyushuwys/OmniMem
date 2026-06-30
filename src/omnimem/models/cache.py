@@ -478,8 +478,8 @@ class MMCache:
         elif is_chunk_per_head:
             chunk_id = start_id_int // block_seqlen
 
-            # Old: per-head loop calling hidden_state[:, :, h, :].contiguous()
-            #      → num_heads small kernel launches.
+            # Old: per-head loop calling hidden_state[:, :, h, :].contiguous(),
+            #      which means num_heads small kernel launches.
             # New: one permute+contiguous gives [H, B, S, D] in a single kernel,
             #      then per-head views (zero-copy, share storage).
             stacked = hidden_state.permute(2, 0, 1, 3).contiguous()

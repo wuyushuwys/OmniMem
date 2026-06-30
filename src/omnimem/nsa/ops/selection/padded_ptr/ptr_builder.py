@@ -1,8 +1,8 @@
 """
 GPU-side ptr table builder. Two modes (IS_CHUNK_BASE constexpr):
 
-  Block-level (IS_CHUNK_BASE=False): base[h, bid] → final ptr; adds batch_stride only.
-  Chunk-level (IS_CHUNK_BASE=True):  base[h, cid] → chunk ptr; kernel adds in-chunk offset:
+  Block-level (IS_CHUNK_BASE=False): base[h, bid] gives final ptr; adds batch_stride only.
+  Chunk-level (IS_CHUNK_BASE=True):  base[h, cid] gives chunk ptr; kernel adds in-chunk offset:
     cid = bid // BLOCKS_PER_CHUNK; off = (bid % BLOCKS_PER_CHUNK) * IN_CHUNK_BLOCK_BYTES
 
 Critical: base == 0 means chunk is NOT GPU-resident; kernel must produce ptr == 0

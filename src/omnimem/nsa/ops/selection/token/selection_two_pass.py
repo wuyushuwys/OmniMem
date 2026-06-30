@@ -217,7 +217,7 @@ def build_inverted_index(top_idx, NS, selection_block_size=1, chunk_size=1, caus
     )
 
     block_offsets = torch.zeros(B, H, NS + 1, dtype=torch.int32, device=device)
-    block_offsets[:, :, 1:] = histogram.cumsum(dim=-1)  # exclusive prefix sum → CSR offsets
+    block_offsets[:, :, 1:] = histogram.cumsum(dim=-1)  # exclusive prefix sum gives CSR offsets
 
     write_pos = block_offsets[:, :, :NS].clone()  # reuse as atomic write counter
     sorted_queries = torch.empty(B, H, M * T, dtype=torch.int32, device=device)
@@ -326,7 +326,7 @@ def _sel_attn_bwd_dq_kernel(
     m_physical = tl.program_id(1) + OFFSET_M
     h = tl.program_id(2)
 
-    # Order: sorted token position → original token index
+    # Order: sorted token position maps to original token index
     r_ptr = Order + b * stride_rb + m_physical * stride_rm + h * stride_rh
     m = tl.load(r_ptr)
 

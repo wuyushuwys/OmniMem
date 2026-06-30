@@ -4,7 +4,7 @@ Two-pass backward for padded-ptr selection attention.
 Pass 1: delta = rowsum(O * dO)  [B, H, M]
 Pass 2: dQ  — query-major, walks T selected blocks via PtrTable, no atomics
 Pass 3: build CSR inverted index from block_indices (expand to token-level via repeat_interleave(G))
-Pass 4: dK/dV — KV-major, resolves bid → physical addr (chunk-level or block-level base),
+Pass 4: dK/dV — KV-major, resolves bid to physical addr (chunk-level or block-level base),
          writes fp32 scratch directly (no atomics); caller zero-initializes and casts back to bf16
 
 Strides: stride_bn/bd in ELEMENTS for K/V (bf16); stride_dbn/dbd for dK/dV (fp32).
@@ -329,7 +329,7 @@ def build_inverted_index_padded_ptr(
     device = top_idx_expanded.device
     BLOCK_M = 256
 
-    # pass 1: count queries per KV block → histogram
+    # pass 1: count queries per KV block into the histogram
     histogram = torch.zeros(B, H, max_n, dtype=torch.int32, device=device)
     grid = (B, H, triton.cdiv(M, BLOCK_M))
     _inverted_index_histogram_kernel[grid](
@@ -340,7 +340,7 @@ def build_inverted_index_padded_ptr(
         M, T, BLOCK_M,
     )
 
-    # exclusive prefix sum → CSR offsets
+    # exclusive prefix sum gives CSR offsets
     block_offsets = torch.zeros(B, H, max_n + 1, dtype=torch.int32, device=device)
     block_offsets[:, :, 1:] = histogram.cumsum(dim=-1)
 
@@ -582,7 +582,7 @@ def selection_attention_padded_ptr_bwd(
     stride_bd: int,
     stride_dbn: Optional[int] = None,
     stride_dbd: Optional[int] = None,
-    blocks_per_chunk: int = 0,             # > 0 → chunk-level base, == 0 → block-level
+    blocks_per_chunk: int = 0,             # > 0 means chunk-level base, == 0 means block-level
     in_chunk_block_bytes_kv: int = 0,
     in_chunk_block_bytes_dkv: int = 0,
     softmax_scale: Optional[float] = None,

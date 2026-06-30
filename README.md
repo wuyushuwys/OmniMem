@@ -55,14 +55,14 @@ torchrun --nproc_per_node=$num_gpus train.py --config <config> --task <task> --n
 
 Two recipes are supported, both ending in a self-forcing stage — pick one:
 
-**Flow 1 · ODE → Self-Forcing**
+**Flow 1 · ODE -> Self-Forcing**
 
 | Step | `--task` | Config |
 |------|----------|--------|
 | ODE distillation | `nsa-ode` | `configs/ode/training_wan_nsa_ode.yaml` |
 | Self-forcing | `nsa-self-forcing` | `configs/self_forcing/training_wan_nsa_self_forcing_4step_flow.yaml` |
 
-**Flow 2 · Teacher-Forcing → Consistency Distillation → Self-Forcing**
+**Flow 2 · Teacher-Forcing -> Consistency Distillation -> Self-Forcing**
 
 | Step | `--task` | Config |
 |------|----------|--------|

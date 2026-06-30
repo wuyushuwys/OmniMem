@@ -4,7 +4,7 @@ Selection attention via gather-to-varlen-dense (streaming trainer with LRU offlo
 Avoids saving live cache refs in save_for_backward (which trips on device equality under AC).
 Steps: 1) gather unique (h, cid) chunks to dense K_gather/V_gather; build remapped ptr table.
        2) run existing Triton fwd with remapped indices; save only small stable tensors.
-       3) backward re-gathers K/V from cache (cache content is stable fwd→bwd); returns dq only.
+       3) backward re-gathers K/V from cache (cache content is stable across fwd and bwd); returns dq only.
 """
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -242,7 +242,7 @@ class _SelectionAttentionVarlenDense(torch.autograd.Function):
         k_store = ctx.kv_cache.cache[ctx.layer_idx]['k_cache']
         v_store = ctx.kv_cache.cache[ctx.layer_idx]['v_cache']
 
-        # re-gather K/V to dense (cache content is stable fwd→bwd)
+        # re-gather K/V to dense (cache content is stable across fwd and bwd)
         K_gather, V_gather, chunk_base_ptrs_k, chunk_base_ptrs_v, _ = _gather_kv_to_dense(
             k_store, v_store,
             ctx.head_cid_lists, ctx.head_offsets,
@@ -285,7 +285,7 @@ class _SelectionAttentionVarlenDense(torch.autograd.Function):
         stride_dbn = D  # in fp32 elements
         stride_dbd = 1
 
-        # build dK/dV base ptr table (CPU → GPU)
+        # build dK/dV base ptr table (CPU to GPU)
         H_n = len(ctx.head_cid_lists)
         max_chunks = chunk_base_ptrs_k.shape[1]
         dk_base = dk_scratch.data_ptr()

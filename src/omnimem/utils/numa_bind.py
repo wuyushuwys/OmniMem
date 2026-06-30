@@ -215,7 +215,7 @@ def bind_to_gpu_numa(
 
     if verbose:
         print(
-            f"[numa] GPU {target_gpu} → Node {node}, "
+            f"[numa] GPU {target_gpu} on Node {node}, "
             f"bound to {len(cpus)} CPUs",
             file=sys.stderr,
         )

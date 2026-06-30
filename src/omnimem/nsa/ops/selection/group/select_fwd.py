@@ -76,7 +76,7 @@ def _sel_attn_fwd_kernel(
     g_physical = tl.program_id(1) + OFFSET_M
     h = tl.program_id(2)
 
-    # Order: sorted group position → original group index
+    # Order: sorted group position maps to original group index
     r_ptr = Order + b * stride_rb + g_physical * stride_rm + h * stride_rh
     g = tl.load(r_ptr)
     m_start = g * GROUP_SIZE

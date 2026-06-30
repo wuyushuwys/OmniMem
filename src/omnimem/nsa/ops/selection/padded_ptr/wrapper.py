@@ -13,7 +13,7 @@ from .ptr_builder import build_ptr_table
 
 
 def _compute_needed_bids_per_head(block_indices: torch.Tensor) -> List[List[int]]:
-    """Derive needed bids per head. Single GPU→CPU sync via whole-tensor move."""
+    """Derive needed bids per head. Single GPU-to-CPU sync via whole-tensor move."""
     B, MG, H, T = block_indices.shape
     flat_cpu = block_indices.permute(2, 0, 1, 3).reshape(H, -1).cpu()
     needed = []

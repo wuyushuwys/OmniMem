@@ -289,7 +289,7 @@ def parallel_nsa_kernel_topk_tiled(
         else:
             b_i, o_i = _bitonic_merge(b_i, o_i.to(tl.int32), N_DIMS, True, N_DIMS)
 
-    # epilogue: extract top-S from bitonic heap (convert 1-based → 0-based)
+    # epilogue: extract top-S from bitonic heap (convert 1-based to 0-based)
     m_top = (tl.arange(0, BC // S) == 0)[None, :, None]
     o_i_reshaped = tl.reshape(o_i - 1, [BT, BC // S, S])
     b_top = tl.sum(m_top * o_i_reshaped, axis=1)

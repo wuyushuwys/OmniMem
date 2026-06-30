@@ -32,7 +32,7 @@ class WanNSASelfForcingStreamingSwitchTrainer(WanNSASelfForcingStreamingTrainer)
         """Pick a switch frame from switch_choices, synced across all ranks."""
         valid = [c for c in self.switch_choices if 0 < c < max_length]
         if not valid:
-            return max_length  # no valid choice → no switch
+            return max_length  # no valid choice, so no switch
 
         idx = torch.zeros(1, dtype=torch.long, device=self.device)
         if not dist.is_initialized() or dist.get_rank() == 0:

@@ -38,7 +38,7 @@ Notes:
 - **Quality knob:** lower `-crf` = higher quality + larger file. VP9 `30–34` and H.264 `21–25`
   are good ranges for these 480p clips. Check the result with
   `ffprobe -v error -show_entries stream=codec_name,width,height,r_frame_rate yourfile.webm`.
-- Reference result: the original 18 clips went from **274 MB → 130 MB** (`.webm`) at this setting.
+- Reference result: the original 18 clips went from **274 MB -> 130 MB** (`.webm`) at this setting.
 
 ## 2. Register it in the gallery
 
@@ -66,5 +66,5 @@ gh release upload assets-v1 -R wuyushuwys/OmniMem --clobber my_new_clip.webm my_
 ```bash
 cd docs
 python3 -m http.server 8000
-# open http://localhost:8000/  → in DevTools → Network, confirm the .webm is the file fetched
+# open http://localhost:8000/  -> in DevTools -> Network, confirm the .webm is the file fetched
 ```

@@ -240,7 +240,7 @@ class CausalNSSelfAttention(WanSelfAttention):
         """
         Training selection attention via padded_ptr.
 
-        Uses selective CPU→GPU reload (only (h, cid) pairs actually targeted by
+        Uses selective CPU-to-GPU reload (only (h, cid) pairs actually targeted by
         block_indices) and lru_touch_per_head to prevent LRU thrash.
         n_chunks caps per-head chunk count to current_chunk_id+1, which is
         required for gradient-checkpoint metadata consistency across recompute.

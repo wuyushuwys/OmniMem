@@ -71,7 +71,7 @@ def _sel_attn_fwd_kernel(
     m_physical = tl.program_id(1) + OFFSET_M
     h = tl.program_id(2)
 
-    # Order: sorted token position → original token index
+    # Order: sorted token position maps to original token index
     r_ptr = Order + b * stride_rb + m_physical * stride_rm + h * stride_rh
     m = tl.load(r_ptr)
 

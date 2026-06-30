@@ -1,7 +1,7 @@
 """
 Padded ptr table selection attention forward kernel.
 
-Q reads KV blocks via ptr table (pointer chasing: load int64 addr → load [BLOCK_SIZE, D] bf16 → online softmax).
+Q reads KV blocks via ptr table (pointer chasing: load int64 addr, then load [BLOCK_SIZE, D] bf16, then online softmax).
 PtrTableK/V: [B, MG, H, T] int64; 0 = invalid sentinel (byte addresses to [BLOCK_SIZE, D] bf16 regions).
 stride_bn / stride_bd: element counts (Triton scales by element size on typed ptrs).
 """
