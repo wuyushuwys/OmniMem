@@ -75,7 +75,7 @@ Optionally finetune for long video with `nsa-self-forcing-streaming` (`configs/s
 The ODE / teacher-forcing / consistency-distillation stages train on pre-generated ODE trajectories. Download the released dataset:
 
 ```bash
-hf download super-zhao/Wan2.1-T2V-1.3B_vidprom_81x480x832_40step_5cfg_5.0shift_4t \
+hf download omnimem/Wan2.1-T2V-1.3B_vidprom_81x480x832_40step_5cfg_5.0shift_4t \
     --repo-type dataset \
     --local-dir data/Wan2.1-T2V-1.3B_vidprom_81x480x832_40step_5cfg_5.0shift_4t
 ```
