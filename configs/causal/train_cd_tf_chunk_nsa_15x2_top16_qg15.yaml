@@ -59,14 +59,6 @@ scheduler_path: configs/schedulers/rectified_flow.json
 text_encoder_path: wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
 tokenizer_path: wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl
 
-# dataset_type: image_video_dataset
-# train_data:
-#   train_shards_path_or_url: data/OpenVidHD/shards
-#   resample_fps: 16
-#   buckets:
-#     81:
-#       480x832: 1
-
 dataset_type: ode_dataset
 train_data:
   train_shards_path_or_url: data/Wan2.1-T2V-1.3B_vidprom_81x480x832_40step_5cfg_5.0shift_4t

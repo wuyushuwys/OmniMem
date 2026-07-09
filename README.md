@@ -80,7 +80,7 @@ hf download omnimem/Wan2.1-T2V-1.3B_vidprom_81x480x832_40step_5cfg_5.0shift_4t \
     --local-dir data/Wan2.1-T2V-1.3B_vidprom_81x480x832_40step_5cfg_5.0shift_4t
 ```
 
-The configs read it from that `data/...` path; the teacher-forcing / consistency-distillation stages can alternatively use an image/video dataset. Or generate your own with `bash scripts/generate_ode_wan.sh`.
+The configs read it from that `data/...` path. Or generate your own with `bash scripts/generate_ode_wan.sh`.
 
 See [`run.sh`](run.sh) for a ready-to-edit end-to-end example.
 

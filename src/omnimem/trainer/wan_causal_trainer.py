@@ -15,7 +15,6 @@ from omnimem.models.flex_attention_utils import create_causal_block_mask_cached
 from omnimem.models.transformers.causal_wan_model import CausalWanModel, CausalWanAttentionBlock
 from omnimem.pipelines import CausalWanT2VPipeline
 from omnimem.schedulers import RectifiedFlowScheduler
-from omnimem.utils.train_utils import vae_encode
 from omnimem.utils.torch_utils import (
     get_fsdp_state_dict, 
     save_fsdp_checkpoint, 
@@ -405,25 +404,14 @@ class WanCausalTrainer(BaseWanTrainer):
                 self.accumulation_index = step % self.gradient_accumulation_steps
 
                 # load data
-                if self.dataset_type == 'ode_dataset':
-                    ode = tuple_batch['ode'].to(
-                        device=self.device, dtype=torch.float32, non_blocking=True,
-                    )
-                    latents = ode[:, -1]
-                    text_embeddings = [
-                        t.to(device=self.device, non_blocking=True)
-                        for t in tuple_batch['t5_embed']
-                    ]
-                else:
-                    pixel_values = tuple_batch['pixel_values'].to(
-                        device=self.device, dtype=torch.float32, non_blocking=True,
-                    )
-                    text = tuple_batch['text']
-                    latents = vae_encode(self.vae, pixel_values=pixel_values)
-                    text_embeddings, _ = self.text_encoder(
-                        texts=text,
-                        device=self.device,
-                    )
+                ode = tuple_batch['ode'].to(
+                    device=self.device, dtype=torch.float32, non_blocking=True,
+                )
+                latents = ode[:, -1]
+                text_embeddings = [
+                    t.to(device=self.device, non_blocking=True)
+                    for t in tuple_batch['t5_embed']
+                ]
                 data = dict(
                     latents=latents,
                     text_embeddings=text_embeddings,

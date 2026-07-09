@@ -5,7 +5,6 @@ import torch
 from omnimem.models.autoencoders import AutoencoderKLWan
 from omnimem.data.ode_dataset import OdeDataloader
 from omnimem.data.text_dataset import TextDataset
-from omnimem.data.webdataset import prepare_wds_dataloader, parse_shards
 from omnimem.utils.misc import get_world_size
 from omnimem.utils.logging_tool import get_logger
 
@@ -50,21 +49,6 @@ def prepare_dataloader(
             num_workers=num_workers,
             pin_memory=pin_memory
         )
-    elif dataset_type == "image_video_dataset":
-        all_shards = parse_shards(train_data.train_shards_path_or_url)
-        logger.info(f"Load {len(all_shards)} shards")
-
-        wds_dataset = prepare_wds_dataloader(
-            paired_shards=all_shards,
-            data_bucket=train_data.get('buckets'),
-            num_workers=num_workers,
-            resample_fps=train_data.get('resample_fps', 24),
-            match_aspect_ratio=train_data.get('match_aspect_ratio', True),
-            resize_method=train_data.get('resize_method', 'resize_crop_tv'),
-            pin_memory=pin_memory,
-            null_condition_prob=conditioning_dropout_prob,
-        )
-        train_dataloader = wds_dataset.dataloader
     else:
         raise NotImplementedError(f"Dataset type {dataset_type} is not supported.")
 
