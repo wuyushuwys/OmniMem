@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/omnimem.png" alt="OmniMem" width="140" />
+</p>
+
 # OmniMem: Scalable and Adaptive Memory Retrieval for Long Video Generation
 
 > **OmniMem: Scalable and Adaptive Memory Retrieval for Long Video Generation**\
