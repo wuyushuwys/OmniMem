@@ -105,13 +105,13 @@ def _ilog2(x: int) -> int:
     configs=get_tiled_configs(),
     key=['TC', 'BS', 'BK', 'BC'],
 )
-@triton.jit
+@triton.jit(do_not_specialize=['Q_CID_OFFSET'])
 def parallel_nsa_kernel_topk_tiled(
         q, k, scale, block_indices,
         stride_qb, stride_qt, stride_qh, stride_qk,
         stride_kb, stride_kc, stride_kh, stride_kk,
         stride_ib, stride_it, stride_ih, stride_is,
-        T, TC,
+        T, TC, Q_CID_OFFSET,
         H: tl.constexpr,
         K: tl.constexpr,
         S: tl.constexpr,
@@ -160,9 +160,9 @@ def parallel_nsa_kernel_topk_tiled(
     m_i = (tl.arange(0, BC) < BC // 2)[None, :]
 
     if CS_POW2:
-        q_cid = offs_t >> CS_LOG2
+        q_cid = (offs_t >> CS_LOG2) + Q_CID_OFFSET
     else:
-        q_cid = offs_t // CHUNK_SIZE
+        q_cid = offs_t // CHUNK_SIZE + Q_CID_OFFSET
 
     if TF_MASK:
         q_in_clean = q_cid < q_half_chunks
@@ -312,6 +312,7 @@ def _topk_fused_tiled(
         exclude_window_chunks=0, exclude_sink_chunks=0,
         progressive_exclude=False,
         tf_mask=False,
+        q_chunk_offset=0,
 ):
     B, T, H, K = q.shape
     TC = k.shape[1]
@@ -344,7 +345,7 @@ def _topk_fused_tiled(
         stride_kh=k.stride(2), stride_kk=k.stride(3),
         stride_ib=block_indices.stride(0), stride_it=block_indices.stride(1),
         stride_ih=block_indices.stride(2), stride_is=block_indices.stride(3),
-        T=T, TC=TC,
+        T=T, TC=TC, Q_CID_OFFSET=q_chunk_offset,
         H=H, K=K, S=S_padded,
         BC=BC, BS=BS, BK=BK, N_DIMS=N_DIMS,
         CHUNK_SIZE=chunk_size, CHUNK_SIZE_K=chunk_size_k,
@@ -536,6 +537,7 @@ def _topk_sparse_chunked(
         exclude_window_chunks=0, exclude_sink_chunks=0,
         progressive_exclude=False,
         tf_mask=False,
+        q_chunk_offset=0,
 ):
     B, TG, H, K = q.shape
     TC = k.shape[1]
@@ -603,7 +605,7 @@ def _topk_sparse_chunked(
         scores_chunk = scores_buf[:, :bt]
 
         if need_py_mask:
-            q_cids = torch.arange(t_start, t_start + bt, device=q.device) // chunk_size
+            q_cids = torch.arange(t_start, t_start + bt, device=q.device) // chunk_size + q_chunk_offset
 
             if progressive_exclude:
                 apply_excl = q_cids >= excl_threshold
@@ -678,6 +680,7 @@ def parallel_nsa_topk(
         exclude_sink_chunks: int = 0,
         progressive_exclude: bool = False,
         tf_mask: bool = False,
+        q_chunk_offset: int = 0,
         _chunk_size_k: Optional[int] = None,
 ) -> torch.Tensor:
     """Select top-K compressed-key block indices.
@@ -685,7 +688,10 @@ def parallel_nsa_topk(
     group_size pools every G queries before selection (G | chunk_size required).
     tf_mask=True enforces the 4-case teacher-forcing mask (see module docstring).
     AWE (window/sink) is restricted to the clean half so n2n is never excluded.
+    q_chunk_offset shifts query chunk ids to their global position (0 for full-sequence
+    passes; set during chunk-by-chunk rollout where only one chunk is present).
     """
+    assert not (tf_mask and q_chunk_offset), "tf_mask assumes a full [clean|noisy] layout; q_chunk_offset must be 0"
     B, T, H, K = q.shape
     G = group_size
 
@@ -708,6 +714,7 @@ def parallel_nsa_topk(
             exclude_sink_chunks=exclude_sink_chunks,
             progressive_exclude=progressive_exclude,
             tf_mask=tf_mask,
+            q_chunk_offset=q_chunk_offset,
             _chunk_size_k=chunk_size,
         )
 
@@ -747,6 +754,7 @@ def parallel_nsa_topk(
             exclude_sink_chunks=exclude_sink_chunks,
             progressive_exclude=progressive_exclude,
             tf_mask=tf_mask,
+            q_chunk_offset=q_chunk_offset,
         )
 
     return _topk_sparse_chunked(
@@ -756,6 +764,7 @@ def parallel_nsa_topk(
         exclude_sink_chunks=exclude_sink_chunks,
         progressive_exclude=progressive_exclude,
         tf_mask=tf_mask,
+        q_chunk_offset=q_chunk_offset,
     )
 
 

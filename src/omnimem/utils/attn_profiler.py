@@ -109,11 +109,13 @@ class TripleAttnProfiler:
 
             o_slc = None
             if self.skip_module != 'slc':
+                q_chunk_offset = int(start_id) // s
                 o_slc = _time('slc', roped_k_cmp.shape[1],
                               lambda: self.slc_attention_padded_ptr(
                                   roped_query=roped_q,
                                   roped_key_cmp=roped_k_cmp,
-                                  kv_cache=kv_cache))
+                                  kv_cache=kv_cache,
+                                  q_chunk_offset=q_chunk_offset))
 
             if self.skip_module == 'cmp':
                 x = g_slc.unsqueeze(-1) * o_slc + g_swa.unsqueeze(-1) * o_swa
@@ -136,7 +138,7 @@ class TripleAttnProfiler:
         topk_fn = M.parallel_nsa_topk_grouped_heads
         sel_attn_fn = M.selection_attention_padded_ptr_fast
 
-        def patched_slc(self, roped_query, roped_key_cmp, kv_cache):
+        def patched_slc(self, roped_query, roped_key_cmp, kv_cache, q_chunk_offset=0):
             s_arg = roped_query.shape[1]
 
             if not (self.progressive_exclude or should_use_fn(
@@ -164,6 +166,7 @@ class TripleAttnProfiler:
                 exclude_window_chunks=self.exclude_window_chunks,
                 exclude_sink_chunks=self.exclude_sink_chunks,
                 progressive_exclude=self.progressive_exclude,
+                q_chunk_offset=q_chunk_offset,
             ).to(torch.int32).contiguous()
             e_topk.record(ds)
             prof.events[(self.layer_idx, 'slc_topk')].append((s_topk, e_topk))

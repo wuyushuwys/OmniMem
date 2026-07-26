@@ -185,6 +185,7 @@ class CausalNSSelfAttention(WanSelfAttention):
         roped_query,
         roped_key_cmp,
         kv_cache: MMCache,
+        q_chunk_offset: int = 0,
     ):
         """
         Selection attention via GPU-resident chunk pointer metadata in MMCache.
@@ -211,6 +212,7 @@ class CausalNSSelfAttention(WanSelfAttention):
             exclude_window_chunks=self.exclude_window_chunks,
             exclude_sink_chunks=self.exclude_sink_chunks,
             progressive_exclude=self.progressive_exclude,
+            q_chunk_offset=q_chunk_offset,
         ).to(torch.int32).contiguous()
 
         meta_k = kv_cache.get_chunk_metadata(self.layer_idx, 'k_cache')
@@ -471,6 +473,8 @@ class CausalNSSelfAttention(WanSelfAttention):
             w = grid_sizes[0, 2].to(torch.long)
             start_frame_t = torch.as_tensor(start_frame, device=grid_sizes.device, dtype=torch.long)
             start_id = h * w * start_frame_t
+            start_id_int = int(start_id)
+            q_chunk_offset = start_id_int // s
 
             # Compressed (mean-pooled) K/V for global selection
             roped_key_cmp = kv_cache.update_cache(
@@ -509,6 +513,7 @@ class CausalNSSelfAttention(WanSelfAttention):
                         roped_query=roped_query,
                         roped_key_cmp=roped_key_cmp,
                         kv_cache=kv_cache,
+                        q_chunk_offset=q_chunk_offset,
                     )
                 else:
                     block_indices = parallel_nsa_topk_grouped_heads(
@@ -523,10 +528,9 @@ class CausalNSSelfAttention(WanSelfAttention):
                         exclude_window_chunks=self.exclude_window_chunks,
                         exclude_sink_chunks=self.exclude_sink_chunks,
                         progressive_exclude=self.progressive_exclude,
+                        q_chunk_offset=q_chunk_offset,
                     ).to(torch.int32).contiguous()
                     block_seqlen_k = kv_cache.block_seqlens['k_cache']
-                    start_id_int = (start_id.item() if isinstance(start_id, torch.Tensor)
-                                    else int(start_id))
                     n_chunks = start_id_int // block_seqlen_k + 1
                     o_slc = self._slc_train_padded_ptr(
                         roped_query=roped_query,
