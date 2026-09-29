@@ -41,6 +41,38 @@
       h2.textContent = sec.title;
       section.appendChild(h2);
     }
+    if (sec.animation) {
+      const player = el("div", "method-film-player");
+      const frame = el("iframe", "", {
+        src: sec.animation.src,
+        title: sec.animation.title || `${sec.title} animation`,
+        allow: "autoplay; fullscreen",
+        allowfullscreen: "",
+      });
+      // The embedded player reports its responsive height when its layout changes.
+      window.addEventListener("message", (event) => {
+        if (event.origin !== window.location.origin || event.source !== frame.contentWindow) return;
+        if (event.data?.kind !== "omnimem-height") return;
+        const height = Number(event.data.height);
+        if (Number.isFinite(height) && height >= 200 && height <= 4000) {
+          frame.style.height = Math.ceil(height) + "px";
+        }
+      });
+      player.appendChild(frame);
+      section.appendChild(player);
+      const links = el("div", "method-film-links");
+      (sec.animation.links || []).forEach((item) => {
+        const link = el("a", "", { href: item.href });
+        link.textContent = item.label;
+        if (item.download) link.setAttribute("download", "");
+        else {
+          link.target = "_blank";
+          link.rel = "noopener";
+        }
+        links.appendChild(link);
+      });
+      section.appendChild(links);
+    }
     const images = Array.isArray(sec.images) ? sec.images : [];
     // Default: everything in one row. `cols:` overrides; clamp to the grid's 1–4.
     const cols = Math.min(Math.max(parseInt(sec.cols, 10) || images.length || 1, 1), 4);
@@ -75,7 +107,7 @@
       grid.appendChild(fig);
     });
 
-    section.appendChild(grid);
+    if (images.length) section.appendChild(grid);
 
     // Body / description renders BELOW the images.
     if (sec.body) {
@@ -86,4 +118,8 @@
 
     mount.appendChild(section);
   });
+  // Resolve the initial fragment after the configured sections have been mounted.
+  if (window.location.hash === "#framework") {
+    document.getElementById("framework")?.scrollIntoView({ block: "start" });
+  }
 })();

@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OmniMem — the idea in motion</title>
+<link rel="icon" href="assets/omnimem-256.png">
+<style>
+:root{color-scheme:light;--ink:#25343b;--muted:#697880;--line:#dce3e6;--blue:#426da2;--teal:#21867d}*{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif}.shell{max-width:1200px;margin:auto;padding:28px}.embedded .shell{padding:0;max-width:none}.standalone-head{display:flex;align-items:center;gap:15px;margin-bottom:22px}.standalone-head img{width:50px;height:50px}.standalone-head h1{font-size:24px;margin:0}.standalone-head p{margin:4px 0 0;color:var(--muted);font-size:14px}.embedded .standalone-head{display:none}.stage{border:1px solid var(--line);border-radius:14px;overflow:hidden;background:#fff}canvas{display:block;width:100%;aspect-ratio:1200/660}.controls{display:flex;align-items:center;gap:16px;margin-top:18px}button{font:inherit;cursor:pointer;color:var(--ink);background:white;border:1px solid var(--line);border-radius:7px;transition:background .15s}button:hover{background:#eff4f6}button:focus-visible,a:focus-visible,input:focus-visible{outline:3px solid #629bb9;outline-offset:3px}.play{width:90px;min-height:39px}.icon-btn{width:39px;height:39px;font-size:22px}.scrub{flex:1;min-width:60px;accent-color:var(--blue);height:22px;cursor:pointer}.clock{font-size:13px;font-variant-numeric:tabular-nums;color:var(--muted);white-space:nowrap}.chapters{display:grid;grid-template-columns:repeat(6,1fr);gap:7px;margin:20px 0 18px}.chapter{border:0;border-radius:0;text-align:left;padding:10px 7px;border-top:3px solid #e8edef;font-size:12px;line-height:1.45}.chapter span{display:block;font-size:10px;font-weight:600;letter-spacing:.06em;color:#829197;margin-bottom:4px}.chapter[aria-current=true]{border-color:var(--teal);background:#eff7f5;color:#176b64}.transcript{display:flex;gap:14px;align-items:flex-start;border-top:1px solid #e8edef;padding-top:16px;line-height:1.6;min-height:73px;font-size:14px}.transcript b{min-width:130px;font-weight:600}.transcript p{margin:0;color:#66757d}.foot{font-size:11px;line-height:1.6;color:#879297;margin:12px 0 0}.foot a{color:#5a7689;text-decoration:underline;text-underline-offset:3px}a{color:var(--blue)}@media(max-width:650px){.shell{padding:14px}.controls{gap:8px;margin-top:12px}.play{width:76px;font-size:13px}.clock{font-size:11px}.chapters{grid-template-columns:repeat(3,1fr);gap:5px;margin-top:14px}.chapter{font-size:11px;padding:7px 5px}.transcript{display:block;font-size:13px}.transcript b{display:block;margin-bottom:4px}.foot{font-size:10px}.standalone-head h1{font-size:19px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<main class="shell">
+<header class="standalone-head"><img src="assets/omnimem-256.png" alt=""><div><h1>OmniMem · The idea in motion</h1><p>Scalable and Adaptive Memory Retrieval for Long Video Generation</p></div></header>
+<div class="stage"><canvas id="film" width="1800" height="990" role="img" aria-label="Animated walkthrough of OmniMem: a growing video history, three attention branches, adaptive window exclusion, query-shared selection, per-head scattered access, and the original framework."></canvas></div>
+<div class="controls" role="group" aria-label="Animation playback">
+<button id="play" class="play" aria-label="Pause animation">Ⅱ Pause</button><button id="replay" class="icon-btn" aria-label="Replay from the beginning">↺</button>
+<input id="seek" class="scrub" type="range" min="0" max="50" step="0.1" value="0" aria-label="Animation position in seconds">
+<output class="clock" id="clock">0:00 / 0:50</output><button id="fullscreen" class="icon-btn" aria-label="Open animation full screen">⛶</button>
+</div>
+<nav class="chapters" aria-label="Animation chapters"></nav>
+<div class="transcript" aria-live="polite"><b id="chapter-title"></b><p id="chapter-description"></p></div>
+<p class="foot">Conceptual animation · Block counts, scores and motion are illustrative. Based on <a href="https://arxiv.org/abs/2605.30519" target="_blank" rel="noopener">OmniMem, §3 and Figure 2</a>. No audio.</p>
+</main>
+<script src="explainer.js?v=paper-style-50s"></script>
+</body></html>

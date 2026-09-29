@@ -14,8 +14,13 @@ sections:
           sharing Top-K selection within query groups, and accessing per-head block slots with 
           on-demand GPU residency.
           "
-    images:
-      - { src: "framework.jpg", caption: "Overview of OmniMem." }
+    animation:
+      src: "explainer.html?embed=1"
+      title: "OmniMem animated framework: a 50-second method walkthrough"
+      links:
+        - { href: "explainer.html", label: "Open full screen ↗" }
+        - { href: "omnimem-explainer.mp4", label: "Download video ↓", download: true }
+        - { href: "omnimem-explainer.gif", label: "Download GIF ↓", download: true }
 
   - id: motivation
     title: "Motivation"
