@@ -74,6 +74,104 @@ a:hover { text-decoration: underline; }
 }
 .btn:hover { background: #000; text-decoration: none; }
 
+/* A full-width, softly blurred scene behind the project introduction. */
+.hero-video-background {
+  position: relative;
+  isolation: isolate;
+  display: grid;
+  place-items: center;
+  padding: 3rem 1.5rem 2.5rem;
+  overflow: hidden;
+  border: 0;
+  background: #102735;
+  color: #fff;
+}
+.hero-backdrop, .hero-shade { position: absolute; inset: 0; pointer-events: none; }
+.hero-backdrop { z-index: -2; }
+.hero-video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: 50% 48%;
+  filter: blur(2px);
+  transform: scale(1.025);
+}
+.hero-shade {
+  z-index: -1;
+  background: linear-gradient(180deg, rgba(5, 15, 28, .44) 0%, rgba(5, 13, 25, .62) 48%, rgba(4, 15, 26, .66) 100%);
+}
+.hero-content { width: 100%; max-width: 1100px; margin: 0 auto; }
+.hero-video-background .hero-logo {
+  width: 78px;
+  height: 78px;
+  margin-bottom: 1rem;
+  filter: drop-shadow(0 4px 14px rgba(0, 0, 0, .24));
+}
+.hero-video-background h1 {
+  color: #fff;
+  font-size: clamp(3.25rem, 6vw, 5rem);
+  line-height: 1.08;
+  letter-spacing: -.045em;
+  margin-bottom: 1.2rem;
+  text-shadow: 0 2px 22px rgba(0, 0, 0, .2);
+}
+.hero-video-background .subtitle {
+  max-width: 920px;
+  color: #fff;
+  font-size: clamp(1.35rem, 2.45vw, 2rem);
+  line-height: 1.4;
+  font-weight: 500;
+  text-wrap: balance;
+  margin-bottom: .9rem;
+}
+.hero-video-background .conference-badge {
+  display: table;
+  margin: 0 auto .9rem;
+  padding: .38rem 1rem;
+  border: 1px solid rgba(239, 205, 144, .7);
+  border-radius: 999px;
+  background: rgba(38, 29, 19, .3);
+  color: #fffaf0;
+  font-size: .85rem;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: .06em;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.hero-video-background .authors { font-size: 1.2rem; color: #fff; }
+.hero-video-background .authors a { color: #fff; text-underline-offset: 4px; }
+.hero-video-background .affiliations { color: #e9edf3; font-size: 1.05rem; }
+.hero-video-background .notes { color: #dae2ec; font-size: .95rem; margin-bottom: 2.1rem; }
+.hero-video-background .btn {
+  min-height: 48px;
+  padding: .65rem 1.3rem;
+  color: #fff;
+  border-color: rgba(255, 255, 255, .32);
+  background: rgba(255, 255, 255, .13);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+.hero-video-background .btn:hover { background: rgba(255, 255, 255, .25); }
+.hero-video-background a:focus-visible {
+  outline: 3px solid #b9e7ff;
+  outline-offset: 5px;
+}
+@media (max-width: 640px) {
+  .hero-video-background { padding: 2.5rem 1.2rem; }
+  .hero-video-background .hero-logo { width: 66px; height: 66px; }
+  .hero-video-background .subtitle { margin-bottom: .9rem; }
+  .hero-video-background .authors { font-size: 1rem; line-height: 1.9; }
+  .hero-video-background .affiliations { font-size: .9rem; margin-top: .55rem; }
+  .hero-video-background .notes { font-size: .78rem; margin-bottom: 1.5rem; }
+  .hero-video-background .links { gap: .65rem; }
+  .hero-video-background .btn { padding: .6rem 1rem; font-size: .9rem; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .hero-video-background .btn { transition: none; }
+}
+
 /* ---------- Main: full-width alternating bands ---------- */
 .band { padding: 3.5rem 1.5rem; }
 .band-alt { background: var(--panel); }
