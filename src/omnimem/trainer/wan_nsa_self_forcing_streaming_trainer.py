@@ -1,3 +1,4 @@
+import gc
 import math
 import random
 from typing import Dict, Any, Tuple, Optional
@@ -12,15 +13,21 @@ from omnimem.models.transformers.causal_wan_nsa_model import CausalWanNSAModel
 from omnimem.schedulers import RectifiedFlowScheduler
 from omnimem.utils.train_utils import pred_x0, vae_encode
 from omnimem.utils.misc import reduce_dict, unwrap_model
-from omnimem.utils.torch_utils import update_ema_fsdp
+from omnimem.utils.torch_utils import update_ema_fsdp, unsharded_param_dtype
 from omnimem.trainer.wan_nsa_self_forcing_trainer import WanNSASelfForcingTrainer
+from omnimem.trainer.streaming_checkpoint import StreamingCheckpointMixin
+from omnimem.trainer.streaming_generator_schedule import generator_update_due
+from omnimem.utils.ode_training_state import restore_rng_state
 
 
-class WanNSASelfForcingStreamingTrainer(WanNSASelfForcingTrainer):
+class WanNSASelfForcingStreamingTrainer(StreamingCheckpointMixin, WanNSASelfForcingTrainer):
     """
     Streaming long-video trainer that generates and trains one chunk at a time with a persistent KV cache.
-    Context flows through the cache; the previous chunk's tail is prepended as raw-latent overlap.
+    Re-encodes the previous window's last frames as a VAE boundary block and writes its clean KV first.
     """
+    _supports_complete_sf_resume = True
+    _sf_trainer_family = "nsa-self-forcing-streaming"
+    streaming_boundary_mode = "vae_roundtrip_block"
 
     def __init__(self, config):
         self.streaming_chunk_size = config.get("streaming_chunk_size", 21)
@@ -28,28 +35,49 @@ class WanNSASelfForcingStreamingTrainer(WanNSASelfForcingTrainer):
         self.streaming_min_new_frame = config.get("streaming_min_new_frame", 18)
         self.train_first_chunk = config.get("train_first_chunk", True)
         self.streaming_possible_max_length = config.get("streaming_possible_max_length", None)
-        # optional VAE re-encode of the loss window's first frame
-        self.vae_re_encode = config.get("vae_re_encode", False)
-
-        super().__init__(config)
+        self.streaming_generator_schedule = config.get("streaming_generator_schedule", "fixed")
+        # Validate before loading models or comparing a checkpoint recipe.
+        generator_update_due(
+            0, config.get("dfake_gen_update_ratio", 5),
+            schedule=self.streaming_generator_schedule, seed=config.get("global_seed", 42),
+        )
+        # Complete resume can defer saves until a rollout ends, omitting its KV.
+        self.streaming_checkpoint_at_rollout_boundary = config.get(
+            "streaming_checkpoint_at_rollout_boundary", False)
+        if type(self.streaming_checkpoint_at_rollout_boundary) is not bool:
+            raise ValueError("streaming_checkpoint_at_rollout_boundary must be a boolean")
 
         # Round max_length up to a whole number of chunks to avoid tail waste.
+        # Normalize before the parent compares checkpoint recipes.
         cs = self.streaming_chunk_size
-        aligned = math.ceil(self.streaming_max_length / cs) * cs
-        if aligned != self.streaming_max_length:
-            self.logger.info(
-                f"streaming_max_length {self.streaming_max_length} not a multiple of "
-                f"chunk_size {cs}; aligning up to {aligned} ({aligned // cs} chunks)."
+        fpb = config.get("frame_per_block", 3)
+        if (cs <= 0 or fpb <= 0 or cs % fpb or self.streaming_min_new_frame <= 0
+                or self.streaming_min_new_frame > cs - fpb or self.streaming_min_new_frame % fpb
+                or self.streaming_max_length <= 0):
+            raise ValueError(
+                "Streaming lengths must be positive and block-aligned, with "
+                "min_new_frame + frame_per_block <= chunk_size for the VAE boundary"
             )
-            self.streaming_max_length = aligned
+        aligned = math.ceil(self.streaming_max_length / cs) * cs
+        self.streaming_max_length = aligned
         if self.streaming_possible_max_length is not None:
+            if not self.streaming_possible_max_length or any(v <= 0 for v in self.streaming_possible_max_length):
+                raise ValueError("streaming_possible_max_length requires nonempty positive lengths")
             self.streaming_possible_max_length = [
                 math.ceil(v / cs) * cs for v in self.streaming_possible_max_length
             ]
+        allowed_lengths = self.streaming_possible_max_length or [self.streaming_max_length]
+        if not self.train_first_chunk and min(allowed_lengths) < cs + fpb + self.streaming_min_new_frame:
+            raise ValueError("Skipping the first chunk requires room for at least one subsequent training chunk")
 
         self.streaming_active = False
         self.streaming_kv_cache: Optional[MMCache] = None
         self.streaming_state: Dict[str, Any] = {}
+        self._last_streaming_eval_step = 0
+        self._pending_streaming_resume = None
+
+        super().__init__(config)
+        self._restore_streaming_runtime()
 
     def _select_max_length(self) -> int:
         if self.streaming_possible_max_length is not None:
@@ -74,12 +102,21 @@ class WanNSASelfForcingStreamingTrainer(WanNSASelfForcingTrainer):
             self.streaming_kv_cache.reset()
         self.streaming_active = False
 
+    def _streaming_kv_dtype(self) -> torch.dtype:
+        """Use the generator's forward dtype before and after FSDP reshards."""
+        return unsharded_param_dtype(self.generator)
+
     def _ensure_streaming_kv_cache(self, dummy_latents: torch.Tensor):
         """Build the persistent streaming KV cache on first call; subsequent sequences reuse it via reset()."""
         if self.streaming_kv_cache is not None:
-            return
+            if self.streaming_kv_cache.available_shape["k_cache"][0] == dummy_latents.shape[0]:
+                return
+            # Text loaders may yield a smaller final batch. Its cache capacity
+            # must follow the actual prompt batch, including after a restart.
+            self.streaming_kv_cache = None
+        kv_dtype = self._streaming_kv_dtype()
         self.streaming_kv_cache = self.build_kv_cache(
-            model=self.generator, latents=dummy_latents,
+            model=self.generator, latents=dummy_latents, dtype=kv_dtype,
         )
         if not (self.enable_kv_evict and self.enable_chunk_per_head_cache):
             return
@@ -91,12 +128,10 @@ class WanNSASelfForcingStreamingTrainer(WanNSASelfForcingTrainer):
         total_chunks = math.ceil(latent_num_frames / self.frame_per_block)
         sample = torch.empty(
             (batch_size, chunk_len_for_kv, head_dim),
-            dtype=self.generator.dtype, device=self.generator.device,
+            dtype=kv_dtype, device=self.generator.device,
         )
-        max_entries = self.generator.num_layers * 2 * self.generator.num_heads
         self.streaming_kv_cache.preallocate_offload_buffer(
             sample=sample,
-            max_entries_per_call=max_entries,
             segment_cids=total_chunks,
         )
         del sample
@@ -108,6 +143,8 @@ class WanNSASelfForcingStreamingTrainer(WanNSASelfForcingTrainer):
         try:
             batch = next(self._streaming_data_iter)
         except StopIteration:
+            if self.complete_sf_resume:
+                raise RuntimeError("Streaming prompt epochs exhausted before max_train_steps") from None
             self._streaming_data_iter = iter(self.train_dataloader)
             batch = next(self._streaming_data_iter)
         text = batch["prompts"]
@@ -123,18 +160,7 @@ class WanNSASelfForcingStreamingTrainer(WanNSASelfForcingTrainer):
         condition_dict = dict(context=text_embeddings, seq_len=sequence_length)
         uncondition_dict = dict(context=null_text_embeddings, seq_len=sequence_length)
 
-        max_length = self.streaming_max_length
-        if self.streaming_possible_max_length is not None:
-            max_length = max(self.streaming_possible_max_length)
-        dummy_latents = torch.zeros(
-            len(text),
-            self.latents_shape[0],
-            max_length,
-            latent_height,
-            latent_width,
-            device=self.device, dtype=self.dtype,
-        )
-        self._ensure_streaming_kv_cache(dummy_latents)
+        self._ensure_streaming_kv_cache(self._streaming_cache_shape_tensor(len(text)))
 
         self.streaming_state.update(
             current_length=0,
@@ -148,13 +174,16 @@ class WanNSASelfForcingStreamingTrainer(WanNSASelfForcingTrainer):
     def can_generate_more(self) -> bool:
         cur = self.streaming_state["current_length"]
         max_len = self.streaming_state["temp_max_length"]
-        return cur < max_len and (cur + self.streaming_min_new_frame) <= max_len
+        boundary_cost = self.frame_per_block if self.streaming_state["previous_frames"] is not None else 0
+        return cur < max_len and (cur + boundary_cost + self.streaming_min_new_frame) <= max_len
 
     @torch.no_grad()
-    def _vae_re_encode_first_frame(self, frames: torch.Tensor) -> torch.Tensor:
-        """Replace the loss window's first latent with a VAE decode->re-encode round-trip (loss-input only)."""
-        if frames.shape[2] <= 1:
-            return frames
+    def _vae_boundary_block(
+        self,
+        prev_chunk_latent: torch.Tensor,
+        num_boundary_latents: int,
+    ) -> torch.Tensor:
+        """Decode the previous window and re-encode its tail as a fresh VAE clip."""
         latents_mean = torch.tensor(
             self.vae.config.latents_mean,
             device=self.vae.device, dtype=self.vae.dtype,
@@ -163,13 +192,19 @@ class WanNSASelfForcingStreamingTrainer(WanNSASelfForcingTrainer):
             self.vae.config.latents_std,
             device=self.vae.device, dtype=self.vae.dtype,
         ).reshape(1, -1, 1, 1, 1)
-        z = frames[:, :, :1].to(device=self.vae.device, dtype=self.vae.dtype)
+        z = prev_chunk_latent.to(device=self.vae.device, dtype=self.vae.dtype)
         z = z * latents_std + latents_mean
 
-        pixels = self.vae.decode(z).sample  # [B, 3, 1, H_pix, W_pix]
-        anchor = vae_encode(self.vae, pixels[:, :, -1:].contiguous())  # [B, C, 1, H, W]
-        anchor = anchor.to(device=frames.device, dtype=frames.dtype)
-        return torch.cat([anchor, frames[:, :, 1:]], dim=2)
+        pixels = self.vae.decode(z).sample
+        # Wan's first latent represents one RGB frame, subsequent latents four.
+        n_pix = 4 * num_boundary_latents - 3
+        if pixels.shape[2] < n_pix:
+            raise ValueError(f"Previous window has {pixels.shape[2]} RGB frames; boundary requires {n_pix}")
+        boundary = vae_encode(self.vae, pixels[:, :, -n_pix:].contiguous())
+        expected_shape = (*prev_chunk_latent.shape[:2], num_boundary_latents, *prev_chunk_latent.shape[3:])
+        if tuple(boundary.shape) != expected_shape:
+            raise ValueError(f"Unexpected VAE boundary shape: {tuple(boundary.shape)} != {expected_shape}")
+        return boundary.detach().to(device=prev_chunk_latent.device, dtype=prev_chunk_latent.dtype)
 
     def _set_generator_reshard(self, reshard_after_forward: bool, reshard_after_backward: bool):
         """Toggle FSDP reshard flags on generator blocks.
@@ -204,7 +239,7 @@ class WanNSASelfForcingStreamingTrainer(WanNSASelfForcingTrainer):
             for name in kv.chunked_types:
                 if name not in layer_cache:
                     continue
-                if name in kv.block_level_types or name in kv.chunk_per_head_types:
+                if name in kv.chunk_per_head_types:
                     # list-of-lists: deep-copy one level so inner lists are independent
                     snap[li][name] = [list(h_list) for h_list in layer_cache[name]]
                 else:
@@ -320,11 +355,14 @@ class WanNSASelfForcingStreamingTrainer(WanNSASelfForcingTrainer):
         return output_latent, target_timestep
 
     def generate_next_chunk(self, requires_grad: bool = True):
-        """Generate the next streaming chunk; prepend the previous chunk's tail as raw-latent overlap."""
+        """Generate a window, reserving a full VAE boundary block after the first window."""
         if not self.streaming_active or not self.can_generate_more():
             self.start_new_sequence()
             if not self.train_first_chunk:
                 self.generate_next_chunk(requires_grad=False)
+                # Re-enter the switch override after warmup, so a switch at
+                # that boundary applies to the first trainable chunk too.
+                return self.generate_next_chunk(requires_grad=requires_grad)
 
         state = self.streaming_state
         current_length = state["current_length"]
@@ -332,16 +370,16 @@ class WanNSASelfForcingStreamingTrainer(WanNSASelfForcingTrainer):
         batch_size = len(state["condition_dict"]["context"])
         fpb = self.frame_per_block
         cs = self.streaming_chunk_size
+        has_boundary = previous_frames is not None
 
         if self.streaming_kv_cache is not None:
             self.streaming_kv_cache.lru_reset_stats()
 
-        # Sample how many new frames to generate; overlap fills the rest of the loss window.
-        if previous_frames is not None:
-            max_new = min(state["temp_max_length"] - current_length, cs)
+        if has_boundary:
+            max_new = min(state["temp_max_length"] - current_length - fpb, cs - fpb)
             possible = list(range(self.streaming_min_new_frame, max_new + 1, fpb))
             if not possible:
-                possible = [self.streaming_min_new_frame]
+                raise RuntimeError("Streaming window has no room for its VAE boundary and new frames")
 
             sel = torch.zeros(1, dtype=torch.int32, device=self.device)
             if not dist.is_initialized() or dist.get_rank() == 0:
@@ -350,13 +388,24 @@ class WanNSASelfForcingStreamingTrainer(WanNSASelfForcingTrainer):
                 dist.broadcast(sel, src=0)
             new_frames = possible[sel.item()]
 
-            overlap = cs - new_frames
-            if overlap <= 0 or overlap > previous_frames.shape[2]:
-                overlap = 0
-                new_frames = cs
+            boundary_latents = self._vae_boundary_block(previous_frames, num_boundary_latents=fpb)
+            # The boundary occupies new, block-aligned positions in the persistent
+            # cache. Its clean context pass is detached; new generation keeps gradients.
+            with torch.no_grad():
+                context_t = torch.zeros(
+                    batch_size, device=boundary_latents.device, dtype=boundary_latents.dtype,
+                )
+                self.generator(
+                    x=boundary_latents, t=context_t, **state["condition_dict"],
+                    start_frame=current_length, kv_cache=self.streaming_kv_cache,
+                )
+            if self.enable_kv_evict and self.streaming_kv_cache is not None:
+                self.streaming_kv_cache.flush_offload()
+            sim_start_frame = current_length + fpb
         else:
             new_frames = cs
-            overlap = 0
+            boundary_latents = None
+            sim_start_frame = current_length
 
         noise = torch.randn(
             batch_size, self.latents_shape[0], new_frames,
@@ -364,43 +413,36 @@ class WanNSASelfForcingStreamingTrainer(WanNSASelfForcingTrainer):
             device=self.device, dtype=self.dtype,
         )
 
-        # New frames generate at the current position; overlap KV is already in the cache.
         denoised_new, target_ts = self.backward_simulation_chunk(
             transformer=self.generator,
             noise_scheduler=self.noise_scheduler,
             num_inference_steps=self.max_distillation_steps,
             noise=noise,
             condition_dict=state["condition_dict"],
-            start_frame=current_length,
+            start_frame=sim_start_frame,
             kv_cache=self.streaming_kv_cache,
             requires_grad=requires_grad,
         )
 
-        if overlap > 0:
-            full_chunk = torch.cat([previous_frames[:, :, -overlap:], denoised_new], dim=2)
+        if has_boundary:
+            full_chunk = torch.cat([boundary_latents, denoised_new], dim=2)
         else:
             full_chunk = denoised_new
 
-        # Carry raw latents to the next chunk before any VAE re-encode.
         frames_to_save = full_chunk[:, :, -cs:].detach().clone()
 
-        if self.vae_re_encode and overlap > 0:
-            full_chunk = self._vae_re_encode_first_frame(full_chunk)
+        gradient_mask = torch.ones_like(full_chunk, dtype=torch.bool)
+        if has_boundary:
+            gradient_mask[:, :, :fpb] = False
 
-        if overlap > 0:
-            gradient_mask = torch.zeros_like(full_chunk, dtype=torch.bool)
-            gradient_mask[:, :, overlap:] = True
-        else:
-            gradient_mask = torch.ones_like(full_chunk, dtype=torch.bool)
-
-        state["current_length"] += new_frames
+        state["current_length"] += (fpb + new_frames) if has_boundary else new_frames
         state["previous_frames"] = frames_to_save
 
         info = dict(
             target_timestep=target_ts,
             gradient_mask=gradient_mask,
             new_frames=new_frames,
-            overlap=overlap,
+            boundary_frames=fpb if has_boundary else 0,
             chunk_start=current_length,
         )
         return full_chunk, info
@@ -488,7 +530,13 @@ class WanNSASelfForcingStreamingTrainer(WanNSASelfForcingTrainer):
         log_dict = {}
         loss_log = {}
 
-        is_gen_step = (self.global_step % self.dfake_gen_update_ratio == 0)
+        # Key the decision by optimizer step, so every accumulation microstep
+        # and every distributed rank trains the same side of the GAN.
+        is_gen_step = generator_update_due(
+            self.global_step, self.dfake_gen_update_ratio,
+            schedule=getattr(self, "streaming_generator_schedule", "fixed"),
+            seed=self.config.get("global_seed", 42),
+        )
 
         # One simulation feeds both generator and critic; critic_step detaches internally.
         if is_gen_step:
@@ -557,10 +605,17 @@ class WanNSASelfForcingStreamingTrainer(WanNSASelfForcingTrainer):
         return log_dict
 
     def evaluate_init(self):
-        # streaming_kv_cache is None on first eval; pipeline builds its own cache.
-        super().evaluate_init()
+        if self.complete_sf_resume:
+            with self._preserve_streaming_evaluation_state():
+                super().evaluate_init()
+        else:
+            super().evaluate_init()
 
     def evaluate(self):
+        if self.complete_sf_resume:
+            with self._preserve_streaming_evaluation_state():
+                super().evaluate()
+            return
         injected = self.streaming_kv_cache is not None
         if injected:
             self._eval_kwargs["_kv_cache"] = self.streaming_kv_cache
@@ -573,6 +628,8 @@ class WanNSASelfForcingStreamingTrainer(WanNSASelfForcingTrainer):
                 self.streaming_active = False
 
     def train(self):
+        if self.complete_sf_resume:
+            return self._train_with_complete_resume()
         self.logger.info("***** Running streaming training *****")
         self.logger.info(
             f"  chunk_size={self.streaming_chunk_size}, max_length={self.streaming_max_length}, "
@@ -634,3 +691,61 @@ class WanNSASelfForcingStreamingTrainer(WanNSASelfForcingTrainer):
                 if at_end:
                     self.logger.info("Finish streaming training")
                     return
+
+    def _train_with_complete_resume(self):
+        if self.global_step >= self.max_train_steps:
+            self.logger.info("Requested streaming training is already complete.")
+            return
+        if self.checkpointing_steps <= 0 or self.validation_steps <= 0:
+            raise ValueError("Streaming checkpoint/validation intervals must be positive")
+        self.logger.info("***** Running streaming training with complete resume *****")
+        self._streaming_data_iter = iter(self._sf_training_batches())
+        # Do not repeat startup evaluation after a restart. Evaluation at any
+        # point preserves both training RNG and the persistent rollout cache.
+        if self._resume_checkpoint is None:
+            self.evaluate_init()
+        if self._resume_rng_state is not None:
+            restore_rng_state(self._resume_rng_state)
+            self._resume_rng_state = None
+        self.data_timer.tic()
+        micro_step = 0
+        save_pending = False
+        while self.global_step < self.max_train_steps:
+            micro_step += 1
+            self.accumulation_index = micro_step % self.gradient_accumulation_steps
+            self.setup_ema_model()
+            self.generator.train()
+            self.fake_net.train()
+            self.data_timer.toc()
+            log_dict = self.train_step()
+            self.data_timer.tic()
+            if self.accumulation_index != 0:
+                continue
+            self.global_step += 1
+            self.setup_ema_model()
+            self._log_progress(log_dict)
+            at_end = self.global_step >= self.max_train_steps
+            at_boundary = not self.streaming_active or not self.can_generate_more()
+            eval_due = self.global_step - self._last_streaming_eval_step >= self.validation_steps
+            if (at_boundary and eval_due) or at_end:
+                if self.streaming_checkpoint_at_rollout_boundary:
+                    # Release pinned host buffers before eval allocates another long-video cache.
+                    self._reset_streaming_state()
+                    self.streaming_kv_cache = None
+                    gc.collect()
+                self.evaluate()
+                self._last_streaming_eval_step = self.global_step
+            # Save after all state-changing work for this step, including the
+            # eval cursor. The default policy preserves mid-rollout KV.
+            save_due = self.global_step % self.checkpointing_steps == 0
+            if self.streaming_checkpoint_at_rollout_boundary:
+                save_pending = save_pending or save_due
+                if at_end or (save_pending and at_boundary):
+                    # Final saves also discard any unfinished rollout. A resumed
+                    # completed run exits before attempting another training step.
+                    self._reset_streaming_state()
+                    self.save_models()
+                    save_pending = False
+            elif save_due or at_end:
+                self.save_models()
+        self.logger.info("Finish streaming training")

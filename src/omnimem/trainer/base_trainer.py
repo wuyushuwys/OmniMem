@@ -2,7 +2,7 @@ import os
 import datetime
 import wandb
 from abc import ABC, abstractmethod
-from omegaconf import OmegaConf, ListConfig
+from omegaconf import OmegaConf
 
 import torch
 import torch.distributed as dist
@@ -21,6 +21,7 @@ from omnimem.utils.meter import LossesMeter, TimerMeter
 from omnimem.utils.aws_handler import S3
 from omnimem.utils.logging_tool import get_logger
 from omnimem.utils.misc import set_seed, is_main_process, format_numel_str, get_model_numel
+from omnimem.utils.validation_prompts import prepare_validation_prompts
 
 
 class BaseTrainer(ABC):
@@ -148,14 +149,8 @@ class BaseTrainer(ABC):
 
 
     def setup_dataloader(self):
-        if 'prompt_file' in self.validation_data:
-            if isinstance(self.validation_data['prompt_file'], ListConfig):
-                self.validation_data.prompts = []
-                for pf in self.validation_data['prompt_file']:
-                    self.validation_data.prompts.extend([p.strip() for p in open(pf, 'r').readlines()])
-            else:
-                self.validation_data.prompts = [p.strip() for p in
-                                                open(self.validation_data.prompt_file, 'r').readlines()]
+        prepare_validation_prompts(
+            self.validation_data, frame_per_block=self.config.get("frame_per_block"))
 
         self.train_dataloader = prepare_dataloader(
             dataset_type=self.dataset_type,

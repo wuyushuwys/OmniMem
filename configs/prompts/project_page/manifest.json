@@ -1,0 +1,229 @@
+{
+  "schema_version": 1,
+  "source": {
+    "file": "docs/videos.yaml",
+    "sha256": "ddee1be507e743145ead8efc3f17bc24ff438692ea6fdd56b8350542d0827e4f",
+    "project_page_url": "https://wuyushuwys.github.io/OmniMem/"
+  },
+  "selection": "Each project-page \"Ours\" video exactly once; comparison rows use the right/Ours entry. Baseline videos are not included.",
+  "text_policy": "Prompt strings are reproduced exactly as published in the source file (sha256 is that of the version this manifest was generated from). Short contextual segment text is not expanded or rewritten.",
+  "timing_policy": "duration_seconds and switch_times_seconds are the published segment times, in seconds. scripts/evaluate_project_page.py converts them to block-aligned latent-frame indices; none are stored here.",
+  "generation_parameters": "The project page does not publish the seed, checkpoint or sampling settings of these videos, and none are recorded here.",
+  "examples": [
+    {
+      "id": "video_60s_vid_01",
+      "category": "standard_60s",
+      "video_url": "https://github.com/wuyushuwys/OmniMem/releases/download/assets-v1/video_60s_vid_01.mp4",
+      "duration_seconds": 60,
+      "prompts": [
+        "3D animation of a small, round, fluffy creature with big, expressive eyes explores a vibrant, enchanted forest. The creature, a whimsical blend of a rabbit and a squirrel, has soft blue fur and a bushy, striped tail. It hops along a sparkling stream, its eyes wide with wonder. The forest is alive with magical elements: flowers that glow and change colors, trees with leaves in shades of purple and silver, and small floating lights that resemble fireflies. The creature stops to interact playfully with a group of tiny, fairy-like beings dancing around a mushroom ring. The creature looks up in awe at a large, glowing tree that seems to be the heart of the forest."
+      ],
+      "switch_times_seconds": []
+    },
+    {
+      "id": "interactivate_video_60s_vid_02",
+      "category": "interactive_60s",
+      "video_url": "https://github.com/wuyushuwys/OmniMem/releases/download/assets-v1/interactivate_video_60s_vid_02.mp4",
+      "duration_seconds": 60,
+      "prompts": [
+        "A realistic video of a Texas Hold'em poker event at a casino. A male player in his late 30s sits at a well-lit poker table and tightly grips his hole cards, wearing a tense, serious expression. The table is filled with chips of various colors.",
+        "The player flicks his cards onto the felt, then leans back in the chair with arms spread wide in celebration.",
+        "The player reveals the winning hand; a nearby patron claps and cheers for the winner.",
+        "The player sits upright and begins neatly arranging the stacks of chips in front of him.",
+        "The player glances over his chips and breaks into a proud, self-assured smile.",
+        "The player shares a celebratory high-five with a nearby patron after the win, laughter and cheers rippling around the table."
+      ],
+      "switch_times_seconds": [
+        10,
+        20,
+        30,
+        40,
+        50
+      ]
+    },
+    {
+      "id": "interactivate_video_60s_vid_01",
+      "category": "interactive_60s",
+      "video_url": "https://github.com/wuyushuwys/OmniMem/releases/download/assets-v1/interactivate_video_60s_vid_01.mp4",
+      "duration_seconds": 60,
+      "prompts": [
+        "A little boy in a blue T-shirt stands on a lush green lawn, arms relaxed at his sides, smiling at the camera, natural fresh realistic style.",
+        "A little boy in a blue T-shirt starts to step forward, lightly running, with his arms swinging naturally. The grass and blue sky remain unchanged.",
+        "A little boy in a blue T-shirt runs faster, leaning slightly forward, arms swinging naturally, feet lightly off the ground. The background remains the same grassy lawn.",
+        "A little boy in a blue T-shirt jumps into the air, knees bent, arms raised, performing a light jump. The grass and sky stay consistent.",
+        "A little boy in a blue T-shirt lands and continues running forward, arms swinging naturally, smiling as he enjoys the run. The background remains the same.",
+        "A little boy in a blue T-shirt stops running, hands on his hips with a smile, body leaning slightly forward, sunlight falling on the grass, natural fresh realistic style."
+      ],
+      "switch_times_seconds": [
+        10,
+        20,
+        30,
+        40,
+        50
+      ]
+    },
+    {
+      "id": "interactivate_video_60s_vid_03",
+      "category": "interactive_60s",
+      "video_url": "https://github.com/wuyushuwys/OmniMem/releases/download/assets-v1/interactivate_video_60s_vid_03.mp4",
+      "duration_seconds": 60,
+      "prompts": [
+        "A hacker, wearing dark sunglasses and a hoodie, sits in front of multiple computer screens with flashing codes and notifications. They type rapidly on a keyboard, fingers moving quickly over the keys. The room is dimly lit with neon lights casting eerie shadows. The hacker's face shows intense concentration and determination.",
+        "They suddenly pause, leaning back in their chair to rub their eyes, while the screens continue to flicker with rapid updates. The room remains dimly lit with neon lights casting eerie shadows.",
+        "A small, blinking red light appears on one of the monitors, drawing the hacker's attention. The hacker's face still shows intense concentration and determination.",
+        "The hacker's hand reaches for a red button labeled EXECUTE, hesitating briefly before pressing it firmly. The room remains dimly lit with neon lights casting eerie shadows.",
+        "The hacker glances at a small, blinking LED on a nearby device, confirming the successful transmission. The cluttered workspace with various gadgets and wires fills the background.",
+        "A second device, previously unnoticed, starts beeping rapidly, drawing the hacker's attention. The cyberpunk aesthetic and neon lighting persist throughout."
+      ],
+      "switch_times_seconds": [
+        10,
+        20,
+        30,
+        40,
+        50
+      ]
+    },
+    {
+      "id": "interactivate_video_60s_vid_04",
+      "category": "interactive_60s",
+      "video_url": "https://github.com/wuyushuwys/OmniMem/releases/download/assets-v1/interactivate_video_60s_vid_04.mp4",
+      "duration_seconds": 60,
+      "prompts": [
+        "Medium close-up: a serene model with long pink hair in a simple white gown, partly veiled by swirling pink smoke, amid gently falling sakura petals\u2014dreamy, ethereal.",
+        "Same setup: she lifts her hand as if to caress a petal, fingertips grazing the smoke.",
+        "A soft breeze stirs; more petals flutter around her hand.",
+        "She gently closes her eyes, lashes resting; the calm holds.",
+        "She steps forward lightly; a small bird flits to a nearby branch.",
+        "The bird perches on her outstretched finger as pink\u2014and faint cyan-blue\u2014smoke thickens, softly enveloping the scene."
+      ],
+      "switch_times_seconds": [
+        10,
+        20,
+        30,
+        40,
+        50
+      ]
+    },
+    {
+      "id": "interactivate_video_60s_vid_05",
+      "category": "interactive_60s",
+      "video_url": "https://github.com/wuyushuwys/OmniMem/releases/download/assets-v1/interactivate_video_60s_vid_05.mp4",
+      "duration_seconds": 60,
+      "prompts": [
+        "Medium close-up: under a crumbling overpass, a dim, murky river churns with brown silt. A gaunt, mid-40s man with greasy black hair thrashes for air; tattered gray shirt and ripped trousers cling to his frame. Debris drifts past; the handheld lens trembles with the current.",
+        "Same scene: he reaches upward with a trembling hand, fingertips slicing the turbid flow as if seeking the surface.",
+        "He clutches his chest as a violent spasm racks his torso; bubbles burst from his mouth while the current shivers the frame.",
+        "His hollow eyes track a jagged glass shard drifting by, its edge briefly catching a faint glow.",
+        "He throws his head back, gasping; frantic chains of bubbles rise as debris wheels past.",
+        "He goes still, eyelids lowered; his clothes float slack around him while the shot hums faintly with the current."
+      ],
+      "switch_times_seconds": [
+        10,
+        20,
+        30,
+        40,
+        50
+      ]
+    },
+    {
+      "id": "video_60s_vid_02",
+      "category": "standard_60s",
+      "video_url": "https://github.com/wuyushuwys/OmniMem/releases/download/assets-v1/video_60s_vid_02.mp4",
+      "duration_seconds": 60,
+      "prompts": [
+        "A cinematic tracking shot follows a lone astronaut walking slowly across a vast, rust-colored Martian plain at sunset. The astronaut's white spacesuit is dusted with fine red sand, and the helmet visor reflects the distant horizon where two faint moons are rising. Each footstep leaves a clear print in the powdery soil, and a thin trail of dust drifts behind. The camera glides smoothly alongside, occasionally pulling back to reveal towering rock formations, deep canyons, and a pale orange sky streaked with high-altitude clouds. The lighting transitions gradually from warm amber to cool violet as the sun sinks lower, casting long, sharp shadows across the terrain. A wide cinematic shot with slow lateral motion, emphasizing solitude and scale."
+      ],
+      "switch_times_seconds": []
+    },
+    {
+      "id": "video_60s_vid_03",
+      "category": "standard_60s",
+      "video_url": "https://github.com/wuyushuwys/OmniMem/releases/download/assets-v1/video_60s_vid_03.mp4",
+      "duration_seconds": 60,
+      "prompts": [
+        "A continuous slow-motion shot of a Holi festival celebration in India, with dozens of people throwing brightly colored powder into the air. Vibrant clouds of pink, yellow, blue, green, and orange burst and swirl around laughing dancers dressed in white. The colored powder coats faces, hair, and clothing, transforming each person into a living rainbow. Drummers and musicians play in the background, their rhythms driving the celebration. The camera moves through the crowd at chest height, capturing joyful expressions, raised hands, and the chaotic beauty of the swirling colors. Sunlight backlights the powder, making each cloud glow vividly. A cinematic slow-motion handheld shot, emphasizing joy and cultural vibrancy."
+      ],
+      "switch_times_seconds": []
+    },
+    {
+      "id": "video_60s_vid_04",
+      "category": "standard_60s",
+      "video_url": "https://github.com/wuyushuwys/OmniMem/releases/download/assets-v1/video_60s_vid_04.mp4",
+      "duration_seconds": 60,
+      "prompts": [
+        "A continuous wide shot of a herd of wild horses galloping across the Mongolian steppe at golden hour. Their manes and tails flow dramatically in the wind, and dust kicks up behind their pounding hooves. The horses\u2014chestnut, black, dappled gray, and palomino\u2014move as one across endless rolling grasslands beneath a vast, cloud-streaked sky. The camera tracks alongside them at ground level, capturing the powerful musculature of their bodies and the determination in their eyes. Occasionally it pulls back into a sweeping aerial view, revealing distant snow-capped mountains on the horizon. The warm low sun bathes everything in honeyed light, and tall grasses ripple like ocean waves. A cinematic side-tracking and aerial combination, emphasizing freedom and untamed beauty."
+      ],
+      "switch_times_seconds": []
+    },
+    {
+      "id": "video_60s_vid_05",
+      "category": "standard_60s",
+      "video_url": "https://github.com/wuyushuwys/OmniMem/releases/download/assets-v1/video_60s_vid_05.mp4",
+      "duration_seconds": 60,
+      "prompts": [
+        "A continuous shot of a cherry blossom festival in Kyoto during peak bloom. Hundreds of petals drift gently through the air as a soft breeze passes through rows of pink sakura trees lining a stone-paved canal. People in traditional kimonos walk slowly along the path, holding paper umbrellas and small lanterns. A wooden bridge arches over the canal, where koi fish swim lazily in clear water reflecting the trees above. Soft golden lanterns hanging from branches begin to glow as evening approaches. The camera glides forward at walking pace, occasionally tilting up to capture the canopy of blossoms or down to follow petals landing on the water's surface. The light gradually transitions from afternoon gold to twilight pink and lavender. A cinematic dolly shot with slow forward motion, emphasizing beauty and ephemerality."
+      ],
+      "switch_times_seconds": []
+    },
+    {
+      "id": "video_20s_vid_01",
+      "category": "standard_20s",
+      "video_url": "https://github.com/wuyushuwys/OmniMem/releases/download/assets-v1/video_20s_vid_01.mp4",
+      "duration_seconds": 20,
+      "prompts": [
+        "A dynamic over-the-shoulder perspective of a chef meticulously plating a dish in a bustling kitchen. The chef, a middle-aged man with a neatly trimmed beard and focused expression, deftly arranges ingredients on a pristine white plate. His hands move with precision, each gesture deliberate and practiced. The background shows a crowded kitchen with steaming pots, whirring blenders, and the clatter of utensils. Bright lights highlight the scene, casting shadows across the busy workspace. The camera angle captures the chef's detailed work from behind, emphasizing his skill and dedication."
+      ],
+      "switch_times_seconds": []
+    },
+    {
+      "id": "video_20s_vid_02",
+      "category": "standard_20s",
+      "video_url": "https://github.com/wuyushuwys/OmniMem/releases/download/assets-v1/video_20s_vid_02.mp4",
+      "duration_seconds": 20,
+      "prompts": [
+        "A slow tracking shot following a hot air balloon ascending gracefully over the temples of Bagan, Myanmar at sunrise. The balloon, striped in deep red and gold, rises through layers of low-hanging mist that shrouds thousands of ancient stone stupas dotting the plains below. Other balloons drift in the distance, creating a fairy-tale silhouette against the warm pink and orange sky. The camera follows the balloon from a parallel position, occasionally swinging around to reveal the breathtaking view: terracotta temples emerging from the fog, flocks of birds taking flight, and the winding Irrawaddy River reflecting the morning light. A wide aerial tracking shot with slow upward drift, emphasizing serenity and timelessness."
+      ],
+      "switch_times_seconds": []
+    },
+    {
+      "id": "video_20s_vid_03",
+      "category": "standard_20s",
+      "video_url": "https://github.com/wuyushuwys/OmniMem/releases/download/assets-v1/video_20s_vid_03.mp4",
+      "duration_seconds": 20,
+      "prompts": [
+        "A continuous slow-motion shot of a cheetah sprinting across the African savanna at full speed in pursuit of prey. Every powerful muscle in its sleek body ripples visibly as it accelerates, its long tail acting as a counterbalance. Dust and dry grass kick up behind it with each thunderous bound. The cheetah's spotted coat catches the warm late-afternoon sunlight, and its golden eyes are locked forward with intense focus. Acacia trees and distant gazelles dot the rolling golden landscape. The camera tracks alongside it at ground level, then briefly lifts above to reveal the chase pattern, and finally returns low for the dramatic final lunge. A cinematic slow-motion side-tracking shot, emphasizing speed and primal power."
+      ],
+      "switch_times_seconds": []
+    },
+    {
+      "id": "video_20s_vid_04",
+      "category": "standard_20s",
+      "video_url": "https://github.com/wuyushuwys/OmniMem/releases/download/assets-v1/video_20s_vid_04.mp4",
+      "duration_seconds": 20,
+      "prompts": [
+        "A long continuous shot of a blacksmith working in a medieval-style forge at night. The smith, a broad-shouldered man with a leather apron and soot-streaked face, hammers a glowing orange piece of iron on a heavy anvil. Each strike sends a shower of bright sparks into the dim workshop, briefly illuminating tools hanging on the stone walls. He plunges the metal into a barrel of water, releasing a great hiss of steam, then returns it to the roaring forge fire to reheat. Embers float upward through the air. The camera moves smoothly from wide shots of the workshop to close-ups of the hammer striking, the sparks flying, and the smith's intense concentration. The warm orange firelight contrasts with cool blue shadows in the corners. A cinematic medium shot with shifting focus, emphasizing craftsmanship and elemental power."
+      ],
+      "switch_times_seconds": []
+    },
+    {
+      "id": "video_10s_vid_01",
+      "category": "standard_10s",
+      "video_url": "https://github.com/wuyushuwys/OmniMem/releases/download/assets-v1/video_10s_vid_01.mp4",
+      "duration_seconds": 10,
+      "prompts": [
+        "A close-up shot of a chocolatier carefully drizzling melted dark chocolate over a tray of fresh strawberries. The glossy chocolate flows in a thin, controlled ribbon, coating each strawberry in a smooth glaze. The strawberries are arranged neatly on parchment paper, their red surfaces still glistening with droplets of water. The chocolatier's hands move with practiced precision, the spoon rotating gently to create elegant zigzag patterns. Soft warm kitchen lighting highlights the rich textures of the chocolate and the vivid red of the fruit. The camera moves slowly across the tray, capturing each detail. A macro shot from a low angle, emphasizing craftsmanship and indulgence."
+      ],
+      "switch_times_seconds": []
+    },
+    {
+      "id": "video_10s_vid_02",
+      "category": "standard_10s",
+      "video_url": "https://github.com/wuyushuwys/OmniMem/releases/download/assets-v1/video_10s_vid_02.mp4",
+      "duration_seconds": 10,
+      "prompts": [
+        "A continuous shot of a street performer playing a saxophone on a rainy night in a city plaza. The musician, wearing a dark fedora and a long coat, stands beneath a flickering streetlamp, the polished brass of his saxophone reflecting the warm yellow light. Rain falls softly around him, creating ripples in the puddles at his feet. A small crowd gathers in the background, their umbrellas forming a colorful canopy. Wisps of steam rise from a nearby manhole cover. The camera slowly circles the performer, occasionally moving in for close-ups of his hands on the keys and the gleam of raindrops on the saxophone. A cinematic orbital shot with moody lighting, emphasizing soul and atmosphere."
+      ],
+      "switch_times_seconds": []
+    }
+  ]
+}

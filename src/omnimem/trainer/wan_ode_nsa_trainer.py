@@ -24,6 +24,7 @@ class WanNSAODETrainer(WanODETrainer):
         self.config = config
         self.nsa_kwargs = self._get_and_record("nsa_kwargs")
         self.train_gate_only = self._get_and_record("train_gate_only")
+        self.preserve_pretrained_gate = self._get_and_record("preserve_pretrained_gate", False)
         super().__init__(config)
 
     def build_model(self) -> CausalWanNSAModel:
@@ -34,11 +35,13 @@ class WanNSAODETrainer(WanODETrainer):
             low_cpu_mem_usage=False,
             **self.nsa_kwargs
         )
-        model.init_gate()
-        if dist.is_initialized():
-            for name, p in model.named_parameters():
-                if 'g_proj' in name:
-                    dist.broadcast(p.data.to(self.device), src=0)
+        # NSA checkpoints already contain trained gates. Keep them when finetuning.
+        if not self.preserve_pretrained_gate:
+            model.init_gate()
+            if dist.is_initialized():
+                for name, p in model.named_parameters():
+                    if 'g_proj' in name:
+                        dist.broadcast(p.data.to(self.device), src=0)
 
         if self.train_gate_only:
             for name, p in model.named_parameters():

@@ -1,5 +1,8 @@
 import os
 import math
+import json
+import posixpath
+from pathlib import Path
 import wandb
 
 import torch
@@ -14,7 +17,11 @@ from omnimem.models.flex_attention_utils import create_causal_block_mask_cached
 from omnimem.models.transformers.causal_wan_model import CausalWanModel, CausalWanAttentionBlock
 from omnimem.pipelines import CausalWanT2VPipeline
 from omnimem.schedulers import RectifiedFlowScheduler
-from omnimem.utils.torch_utils import get_fsdp_state_dict, save_fsdp_checkpoint, load_and_broadcast_diffuser, resume_model, save_sharded_safetensors
+from omnimem.utils.torch_utils import get_fsdp_state_dict, load_and_broadcast_diffuser, resume_model, save_sharded_safetensors
+from omnimem.utils.ode_checkpoint_store import ODECheckpointStore
+from omnimem.utils.ode_training_state import (
+    capture_rng_state, restore_rng_state, save_training_state, load_training_state,
+)
 from omnimem.utils.meter import TimerMeter
 from omnimem.evaluate import evaluation_wan
 from omnimem.utils.misc import (
@@ -88,9 +95,98 @@ class WanODETrainer(BaseWanTrainer):
         self.count_model_parameter(model, name="Model")
         self.model = model
 
+    def _get_resume_dir(self):
+        return self.config.get("checkpoint_dir") or os.path.join(self.output_dir, "checkpoints")
+
+    def _checkpoint_rank0_call(self, operation):
+        """Propagate coordinator I/O failures before peers enter a collective."""
+        result = [None]
+        if is_main_process():
+            try:
+                result[0] = {"value": operation(), "error": None}
+            except Exception as exc:
+                result[0] = {"value": None, "error": f"{type(exc).__name__}: {exc}"}
+        if dist.is_initialized():
+            dist.broadcast_object_list(result, src=0)
+        if result[0]["error"] is not None:
+            raise RuntimeError(f"ODE checkpoint operation failed: {result[0]['error']}")
+        return result[0]["value"]
+
+    def _checkpoint_all_ranks_call(self, operation):
+        result, error = None, None
+        try:
+            result = operation()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        errors = [error]
+        if dist.is_initialized():
+            errors = [None] * dist.get_world_size()
+            dist.all_gather_object(errors, error)
+        if any(errors):
+            raise RuntimeError(f"ODE checkpoint rank errors: {errors}")
+        return result
+
+    def resume_state(self):
+        prefix = self.config.get("checkpoint_s3_prefix")
+        client = self.s3.s3_client if self.upload else None
+        if client is not None and prefix is None:
+            if os.path.isabs(self.config.output_dir):
+                raise ValueError("An absolute output_dir requires an explicit checkpoint_s3_prefix")
+            prefix = posixpath.join(self.s3_dir, self.output_dir, "checkpoints")
+        self._checkpoint_store = ODECheckpointStore(
+            Path(self.resume_dir), s3_client=client,
+            bucket=self.s3_bucket if client is not None else None,
+            s3_prefix=prefix if client is not None else None,
+        )
+        self._resume_rng_state = None
+        keep = self.config.get("checkpoint_keep_local")
+        if keep is not None and client is not None:
+            # Free space before the first save; the newest local copy is kept for resume.
+            removed = self._checkpoint_rank0_call(
+                lambda: [str(p) for p in self._checkpoint_store.prune_local(max(keep, 1))])
+            self.logger.info(f"Pruned local checkpoints already on S3 before resume: {removed}")
+
+        def select_checkpoint():
+            checkpoint = self._checkpoint_store.latest()
+            if checkpoint is None:
+                if (Path(self.resume_dir) / "checkpoint.pth").exists() or (Path(self.resume_dir) / "model").exists():
+                    raise RuntimeError(
+                        "Legacy ODE checkpoint has no complete optimizer state. Use its model/ directory "
+                        "as model_path or model_checkpoint_path with a new run name to initialize a new run."
+                    )
+                return None
+            # latest() already verified all hashes; published directories are immutable.
+            manifest = json.loads((checkpoint / "COMPLETED.json").read_text())
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            if manifest["world_size"] != world_size:
+                raise ValueError("Full ODE resume requires the original number of training ranks")
+            return {"path": str(checkpoint), "step": manifest["global_step"]}
+
+        selected = self._checkpoint_rank0_call(select_checkpoint)
+        self._resume_checkpoint = Path(selected["path"]) if selected is not None else None
+        if selected is None:
+            self.logger.info("No completed ODE checkpoint; starting a new run.")
+            return 0
+        self.logger.info(f"Resume complete ODE checkpoint {self._resume_checkpoint}")
+        return selected["step"]
+
     def resume_from_checkpoint(self):
-        checkpoint_path = os.path.join(self.output_dir, "checkpoints")
-        resume_model(os.path.join(checkpoint_path, "model"), self.model)
+        if self._resume_checkpoint is None:
+            return
+
+        def restore_weights():
+            model_dir = self._resume_checkpoint / "model"
+            saved_config = json.loads((model_dir / "config.json").read_text())
+            current_config = json.loads(json.dumps(dict(self.model.config)))
+            different = [
+                key for key, value in saved_config.items()
+                if not key.startswith("_") and current_config.get(key) != value
+            ]
+            if different:
+                raise ValueError(f"Model configuration differs from the resume checkpoint: {different}")
+            resume_model(str(model_dir), self.model, strict=True)
+
+        self._checkpoint_all_ranks_call(restore_weights)
         self._check_model(self.model, 'after resume ckpt')
 
     def wrap_model_fsdp(self):
@@ -124,8 +220,28 @@ class WanODETrainer(BaseWanTrainer):
             **self.lr_scheduler_kwargs
         )
 
-        for _ in range(self.global_step):
-            self.lr_scheduler.step()
+        if self._resume_checkpoint is not None:
+            state = load_training_state(
+                self._resume_checkpoint, self.model, self.optimizer, self.lr_scheduler,
+                expected_step=self.global_step,
+            )
+            self._resume_rng_state = state["rng_state"]
+            saved_schedule = state["extra_state"].get("scheduler_config")
+            if saved_schedule != self._scheduler_config():
+                raise ValueError("The LR schedule configuration differs from the completed checkpoint")
+            self.logger.info("Restored optimizer and LR scheduler; ODE data stream will resample on resume.")
+
+    def _scheduler_config(self):
+        # LambdaLR restores counters, but its lambda is rebuilt from this configuration.
+        from omegaconf import OmegaConf
+        config = {
+            "type": self.lr_scheduler_type,
+            "warmup_steps": self.lr_warmup_steps,
+            "kwargs": dict(self.lr_scheduler_kwargs),
+        }
+        if self.lr_scheduler_type not in ("constant", "constant_with_warmup"):
+            config["max_train_steps"] = self.max_train_steps
+        return OmegaConf.to_container(OmegaConf.create(config), resolve=True)
 
 
     def setup_timers(self):
@@ -171,22 +287,50 @@ class WanODETrainer(BaseWanTrainer):
                              f" loss: {self.loss_meter.mavg.get('train/loss', 0):.04f}")
 
     def save_models(self):
-        output_dir = self.output_dir
+        staging = Path(self._checkpoint_rank0_call(lambda: str(self._checkpoint_store.begin(self.global_step))))
+
+        def require_shared_directory():
+            if not staging.is_dir():
+                raise FileNotFoundError(
+                    f"Checkpoint directory {staging} is not visible on this rank. "
+                    "Multi-node ODE training requires a shared checkpoint_dir."
+                )
+
+        self._checkpoint_all_ranks_call(require_shared_directory)
         model_state_dict = get_fsdp_state_dict(unwrap_model(self.model))
-        if is_main_process():
-            self.logger.info(f"saving checkpoint to {output_dir} ...")
-            save_dir = os.path.join(output_dir, "checkpoints", "model")
+
+        def save_weights():
+            save_dir = str(staging / "model")
             self.model.save_config(save_directory=save_dir)
             save_sharded_safetensors(state_dict=model_state_dict, save_dir=save_dir)
-            self.logger.info("Save model.")
 
-            save_fsdp_checkpoint(None, None, self.global_step, output_dir=os.path.join(output_dir, "checkpoints"))
-            self.logger.info("Save checkpoints.")
+        self._checkpoint_rank0_call(save_weights)
+        del model_state_dict
+        save_training_state(
+            staging, self.model, self.optimizer, self.lr_scheduler, self.global_step,
+            extra_state={
+                "scheduler_config": self._scheduler_config(),
+                "data_resume_policy": "resample_stream",
+            },
+        )
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        checkpoint = Path(self._checkpoint_rank0_call(
+            lambda: str(self._checkpoint_store.commit(staging, self.global_step, world_size))
+        ))
+        self.logger.info(f"Saved complete ODE checkpoint: {checkpoint}")
+        if self._checkpoint_store.s3 is not None:
+            self._checkpoint_rank0_call(lambda: self._checkpoint_store.upload(checkpoint))
+            keep = self.config.get("checkpoint_keep_local")
+            if keep is not None:
+                removed = self._checkpoint_rank0_call(lambda: [str(p) for p in self._checkpoint_store.prune_local(keep)])
+                self.logger.info(f"Pruned local checkpoints already on S3 (keep {keep}): {removed}")
 
-            self.s3.upload_folder(
-                folder_path=os.path.join(output_dir, "checkpoints"),
-                global_step=self.global_step,
-            )
+    def _evaluate_without_rng_change(self, initial=False):
+        state = capture_rng_state()
+        try:
+            self.evaluate_init() if initial else self.evaluate()
+        finally:
+            restore_rng_state(state)
 
     def evaluate_init(self):
         evaluation_wan(
@@ -334,7 +478,9 @@ class WanODETrainer(BaseWanTrainer):
 
         if self.accumulation_index == 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            log_dict["train/grad_norm"] = grad_norm.to_local().item()
+            log_dict["train/grad_norm"] = (
+                grad_norm.to_local() if hasattr(grad_norm, "to_local") else grad_norm
+            ).item()
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
             self.lr_scheduler.step()
@@ -349,22 +495,33 @@ class WanODETrainer(BaseWanTrainer):
         return log_dict
 
     def train(self):
+        if self.global_step >= self.max_train_steps:
+            self.logger.info(f"Training already complete at step {self.global_step}; nothing to run.")
+            return
         # evaluate initial model
-        self.evaluate_init()
+        self._evaluate_without_rng_change(initial=True)
         # main training loop
         self.logger.info("***** Running training *****")
 
         for epoch in range(self.num_train_epochs):
             self.loss_meter.reset()
             self.data_timer.tic()
-            for step, tuple_batch in enumerate(self.train_dataloader, start=1):
+            data_iterator = iter(self.train_dataloader)
+            for step, tuple_batch in enumerate(data_iterator, start=1):
+                # WebDataset starts its workers lazily on the first next(), not iter().
+                if self._resume_rng_state is not None:
+                    restore_rng_state(self._resume_rng_state)
+                    self._resume_rng_state = None
                 self.accumulation_index = step % self.gradient_accumulation_steps
 
                 # load data
                 data = dict(
-                    ode=tuple_batch['ode'].to(device=self.device, dtype=torch.float32, non_blocking=True),
-                    timesteps=tuple_batch['timesteps'].to(device=self.device, dtype=torch.float32, non_blocking=True),
-                    text_embeddings=tuple_batch['t5_embed'],
+                    ode=torch.as_tensor(tuple_batch['ode']).to(device=self.device, dtype=torch.float32, non_blocking=True),
+                    timesteps=torch.as_tensor(tuple_batch['timesteps']).to(device=self.device, dtype=torch.float32, non_blocking=True),
+                    text_embeddings=[
+                        torch.as_tensor(embedding).to(device=self.device, dtype=self.dtype, non_blocking=True)
+                        for embedding in tuple_batch['t5_embed']
+                    ],
                 )
 
                 self.data_timer.toc()
@@ -383,7 +540,7 @@ class WanODETrainer(BaseWanTrainer):
                         self.save_models()
 
                     if self.global_step % self.validation_steps == 0 or self.global_step >= self.max_train_steps:
-                        self.evaluate()
+                        self._evaluate_without_rng_change()
 
                 self.data_timer.tic()
                 if self.global_step >= self.max_train_steps:

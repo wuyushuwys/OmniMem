@@ -1,4 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import contextlib
 import math
 import time
 import gc
@@ -17,7 +18,8 @@ from omnimem.schedulers.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 from omnimem.models.cache import MMCache
 from omnimem.models.transformers.causal_wan_model import CausalWanModel
-from omnimem.models.transformers.causal_wan_nsa_model import CausalWanNSAModel
+from omnimem.models.transformers.causal_wan_nsa_model import CausalWanNSAModel, set_selection_trace_context
+from omnimem.models.transformers.wan_model import patch_embed_linear_enabled
 from omnimem.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
 from omnimem.schedulers import RectifiedFlowScheduler
 from omnimem.pipelines import WanTI2VPipeline
@@ -26,35 +28,117 @@ from omnimem.pipelines.utils import masks_like
 from omnimem.utils.train_utils import vae_encode
 from omnimem.utils.logging_tool import get_logger
 from omnimem.models.text_encoders.t5 import T5EncoderModel
+from omnimem.pipelines import compile_state
+from omnimem.pipelines.streaming_decode import (
+    LatentChunk,
+    LatentGenerationOutput,
+    decode_latents_chunked_to_cpu,
+)
+from omnimem.utils.stage_marks import StageMarks
+from omnimem.utils.torch_utils import unsharded_param_dtype
 
 logger = get_logger()
 
 
+def _hashable(value):
+    """``value`` (nested dicts / lists / sets of plain values) as a hashable tuple tree."""
+    if isinstance(value, dict):
+        return tuple(sorted((str(k), _hashable(v)) for k, v in value.items()))
+    if isinstance(value, (set, frozenset)):
+        return tuple(sorted(str(v) for v in value))
+    if isinstance(value, (list, tuple)):
+        return tuple(_hashable(v) for v in value)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)        # torch.device, torch.dtype
+
+
+def forward_positions(num_frames: int, frame_per_block: int, switch_frames,
+                      slice_last_frames: int, recache_mode: str) -> list:
+    """``(start_frame, n_frames)`` of the DiT forwards of one request, in call order."""
+    positions = []
+    switch_frames = list(switch_frames)
+    switch_idx = 0
+    for start_frame in range(0, num_frames, frame_per_block):
+        while switch_idx < len(switch_frames) and start_frame >= switch_frames[switch_idx]:
+            if recache_mode != "none":
+                num_recache = min(slice_last_frames, start_frame)
+                recache_start = start_frame - num_recache
+                positions.extend(
+                    (recache_start + blk, min(frame_per_block, num_recache - blk))
+                    for blk in range(0, num_recache, frame_per_block))
+            switch_idx += 1
+        positions.append((start_frame, min(frame_per_block, num_frames - start_frame)))
+    return positions
+
+
 def _snapshot_chunks(cache: MMCache, chunk_start: int, chunk_end: int) -> dict:
-    """Save references to cache chunks [chunk_start, chunk_end) for all layers.
-    No clone needed: update_cache replaces list entries by reference assignment,
-    so the original tensors are never modified in-place."""
+    """Save references to cache chunks [chunk_start, chunk_end) for all layers, with versions."""
     snap = {}
+    cids = range(chunk_start, chunk_end)
     for layer_idx, layer_cache in cache.cache.items():
         snap[layer_idx] = {}
         for cache_type, chunks in layer_cache.items():
             if not isinstance(chunks, list):
                 continue
-            snap[layer_idx][cache_type] = [
-                chunks[i] if i < len(chunks) else None
-                for i in range(chunk_start, chunk_end)
-            ]
+            head_major = cache_type in cache.chunk_per_head_types
+            versions = None
+            if head_major:
+                entry = [[head[i] if i < len(head) else None for i in cids]
+                         for head in chunks]
+                versions = [[cache.chunk_version(layer_idx, cache_type, h, i) for i in cids]
+                            for h in range(len(chunks))]
+            else:
+                entry = [chunks[i] if i < len(chunks) else None for i in cids]
+                if cache.window_buffer_active(cache_type):
+                    # The entry is a view the recache forward writes through, so clone it.
+                    entry = [None if t is None else t.clone() for t in entry]
+            snap[layer_idx][cache_type] = (head_major, chunk_start, entry, versions)
+    if cache.block_store is not None:
+        # 'block_lru': the store's own state; capturing it also freezes the host rows of the range.
+        snap['block_store'] = cache.block_snapshot_range(chunk_start, chunk_end)
     return snap
 
 
-def _restore_chunks(cache: MMCache, snapshot: dict, chunk_start: int):
+def _restore_chunks(cache: MMCache, snapshot: dict):
+    """Put the snapshotted chunks back and re-publish their pointers."""
+    block_snap = snapshot.get('block_store')
     for layer_idx, layer_snap in snapshot.items():
-        for cache_type, snap_chunks in layer_snap.items():
+        if layer_idx == 'block_store':
+            continue
+        ptr_entries = []
+        for cache_type, (head_major, start, entry, versions) in layer_snap.items():
             chunks = cache.cache[layer_idx][cache_type]
-            for offset, snap_chunk in enumerate(snap_chunks):
-                idx = chunk_start + offset
-                if snap_chunk is not None and idx < len(chunks):
-                    chunks[idx] = snap_chunk
+            if head_major:
+                for h, snap_head in enumerate(entry):
+                    if h >= len(chunks):
+                        continue
+                    head = chunks[h]
+                    for offset, snap_chunk in enumerate(snap_head):
+                        idx = start + offset
+                        if snap_chunk is None or idx >= len(head):
+                            continue
+                        head[idx] = snap_chunk
+                        cache.set_chunk_version(layer_idx, cache_type, h, idx,
+                                                versions[h][offset])
+                        if block_snap is None:
+                            ptr_entries.append(
+                                (cache_type, h, idx, MMCache.chunk_ptr_of(snap_chunk)))
+                            # GPU tier: recache replaced this slot with a local chunk; restore it.
+                            cache.note_tier_entry(layer_idx, cache_type, h, idx,
+                                                  snap_chunk)
+                        # Window ring goes stale for this cid; the next build falls back to cat.
+                        cache.invalidate_window_ring(layer_idx, idx, cache_type)
+            else:
+                for offset, snap_chunk in enumerate(entry):
+                    idx = start + offset
+                    if snap_chunk is not None and idx < len(chunks):
+                        cache.restore_flat_chunk(layer_idx, cache_type, idx, snap_chunk)
+        if ptr_entries:
+            cache.publish_chunk_ptrs(layer_idx, ptr_entries)
+    if block_snap is not None:
+        # 'block_lru': one call per layer restores block addresses, versions and flags.
+        cache.block_restore_range(block_snap)
 
 
 class CausalWanT2VPipeline(WanTI2VPipeline):
@@ -81,6 +165,34 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
         self._kv_cache_uncond = None
         self._cache_signature = None
 
+    def _compiled_request(self, *, dit_device, latent_shape, window_size, sink_size,
+                          image_conditioned, switch_frames, slice_last_frames, recache_mode):
+        """Context of one compiled-DiT request (``compiled_request``); no-op if not compiled."""
+        compiled_forward = getattr(self.transformer, "_compiled_call_impl", None)
+        if compiled_forward is None:
+            return contextlib.nullcontext()
+        matmul = torch.backends.cuda.matmul
+        signature = (
+            id(compiled_forward),
+            type(self.transformer).__qualname__, _hashable(dict(self.transformer.config)),
+            self.transformer.training,
+            str(self.param_dtype), str(dit_device),
+            (latent_shape[0], latent_shape[2], latent_shape[3]),
+            tuple(m.attention_schedule for m in self.transformer.modules()
+                  if hasattr(m, "attention_schedule")),
+            patch_embed_linear_enabled(),
+            _hashable(window_size), _hashable(sink_size),
+            bool(image_conditioned),
+            (torch.get_num_threads(), str(torch.get_default_dtype()),
+             matmul.allow_tf32, matmul.allow_bf16_reduced_precision_reduction,
+             matmul.allow_fp16_reduced_precision_reduction,
+             torch.are_deterministic_algorithms_enabled(),
+             torch.is_deterministic_algorithms_warn_only_enabled()),
+        )
+        return compile_state.compiled_request(signature, forward_positions(
+            latent_shape[1], self.frame_per_block, switch_frames, slice_last_frames,
+            recache_mode))
+
     def generate(
             self,
             input_prompt,
@@ -96,12 +208,9 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
             sink_size=None,
             window_size=None,
             img: Optional[PIL.Image.Image] = None,
-            enable_cpu_offload=True,
             lru_max_size=10,
-            enable_block_level_cache=False,
             enable_chunk_per_head_cache=False,
             enable_kv_evict=True,
-            kv_evict_min_gpu_chunks=None,
             switch_prompts=None,
             switch_frame_indices=None,
             slice_last_frames=21,
@@ -109,6 +218,20 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
             vae_decode_chunk_size=None,
             evict_every_k_chunks=1,
             _kv_cache: Optional[MMCache] = None,
+            on_latent_chunk=None,
+            return_latents=False,
+            marks: Optional[StageMarks] = None,
+            text_encoder_park_device=None,
+            kv_tier_device=None,
+            kv_tier_budget_bytes: int = 0,
+            kv_block_pool_bytes: int = 0,
+            kv_cache_policy: str = "chunk_lru",
+            kv_block_scratch_bytes: int = 0,
+            kv_block_resident_if_fits: bool = True,
+            kv_block_dedup: str = "device",
+            kv_window_buffer: bool = False,
+            kv_resident_fast_path: bool = False,
+            kv_exact_pinned_host: Optional[bool] = None,
     ):
         """Generate video frames from a text prompt, chunk-by-chunk with KV cache.
 
@@ -122,7 +245,69 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
             guide_scale: Classifier-free guidance scale.
             n_prompt: Negative prompt.
             offload_model: Offload models to CPU to save VRAM.
+            on_latent_chunk: optional callback receiving a LatentChunk right after each chunk's final latents.
+            return_latents: skip the final VAE decode and return a LatentGenerationOutput.
+            marks: optional StageMarks recorder for coarse per-stage CPU timestamps.
+            text_encoder_park_device: if set, park the text encoder on this device after encoding all prompts.
+            kv_tier_device: opt-in peer CUDA device holding a GPU history tier; None keeps the pinned host path.
+            kv_tier_budget_bytes: byte budget for the tier on that device.
+            kv_block_pool_bytes: 'block_lru' only, persistent block pool budget; must stay 0 under 'chunk_lru'.
+            kv_cache_policy: 'chunk_lru' (default) or 'block_lru' (block store with retirement per chunk).
+            kv_block_scratch_bytes: 'block_lru' only, budget of the shared scratch block pool.
+            kv_block_resident_if_fits: 'block_lru' only, run resident when the whole request fits. Default True.
+            kv_block_dedup: 'block_lru' only, 'device' (default) or 'unique' dedup of selected block keys.
+            evict_every_k_chunks: 'chunk_lru' only, chunks between flush_offload() drains.
+            kv_window_buffer: opt-in preallocated history and window buffers, bit-exact.
+            kv_resident_fast_path: opt-in, skip LRU touch and host sync while nothing is host-resident ('chunk_lru' only).
+            kv_exact_pinned_host: page-lock exactly the bytes of each host KV buffer; None follows OMNIMEM_EXACT_PINNED_KV.
         """
+        if kv_cache_policy not in ("chunk_lru", "block_lru"):
+            raise ValueError(
+                f"unknown kv_cache_policy {kv_cache_policy!r}; expected 'chunk_lru' or 'block_lru'")
+        block_policy = kv_cache_policy == "block_lru"
+        # kv_block_dedup is validated unconditionally, same as kv_cache_policy itself,
+        # even though it is only applied below under 'block_lru'.
+        if kv_block_dedup not in ("unique", "device"):
+            raise ValueError(
+                f"unknown kv_block_dedup {kv_block_dedup!r}; expected 'unique' or 'device'")
+        if block_policy:
+            # One policy per cache: the store owns the whole history path.
+            if kv_tier_device is not None:
+                raise ValueError(
+                    "kv_cache_policy='block_lru' and kv_tier_device are mutually exclusive: "
+                    "the GPU tier never writes the pinned host backing the block store "
+                    "fetches blocks from")
+            if int(kv_block_pool_bytes) <= 0:
+                raise ValueError(
+                    "kv_cache_policy='block_lru' needs kv_block_pool_bytes > 0 (it is the "
+                    "persistent block pool budget)")
+            if int(kv_block_scratch_bytes) < 0:
+                raise ValueError("kv_block_scratch_bytes must be >= 0")
+            if not enable_chunk_per_head_cache:
+                raise ValueError(
+                    "kv_cache_policy='block_lru' requires the chunk_per_head K/V cache "
+                    "(enable_chunk_per_head_cache=True)")
+            if not enable_kv_evict:
+                raise ValueError(
+                    "kv_cache_policy='block_lru' needs enable_kv_evict=True: history "
+                    "retirement at every generation-chunk boundary replaces the chunk LRU, "
+                    "and without it the whole history stays protected on the DiT GPU")
+        else:
+            # The chunk LRU has no block pools: reject a budget rather than ignore it.
+            for name, value, pool in (("kv_block_pool_bytes", kv_block_pool_bytes, "persistent"),
+                                      ("kv_block_scratch_bytes", kv_block_scratch_bytes, "scratch")):
+                if value:
+                    raise ValueError(
+                        f"{name}={value} needs kv_cache_policy='block_lru' (it is the block "
+                        f"store's {pool} pool budget); the chunk-level policy 'chunk_lru' "
+                        f"has no block pool")
+        if return_latents and offload_model:
+            raise ValueError("return_latents=True does not support offload_model=True "
+                             "(the streaming path never moves the VAE during generation)")
+
+        # All DiT-side placement (text context, noise, timesteps, KV cache) follows the
+        # transformer's device explicitly; the VAE may live on another device.
+        dit_device = self.transformer.device
 
         # preprocess
         F = frame_num
@@ -139,9 +324,19 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
 
-        self.text_encoder.model.to(self.device)
-        context, attn_cond = self.text_encoder(input_prompt, self.device)
-        context_null, attn_null = self.text_encoder(n_prompt, self.device)
+        if marks is not None:
+            marks.mark("text_encoder.reload.begin")
+        self.text_encoder.model.to(dit_device)
+        if marks is not None:
+            marks.mark("text_encoder.reload.end")
+            marks.mark("text_encode.begin")
+        context, attn_cond = self.text_encoder(input_prompt, dit_device)
+        if guide_scale > 1:
+            context_null, attn_null = self.text_encoder(n_prompt, dit_device)
+        else:
+            # CFG is a no-op at guide_scale<=1 (pred_image_cond is used directly in the
+            # sampler loop, see below) -- skip the negative-prompt T5 encode entirely.
+            context_null, attn_null = None, None
         _main_p = input_prompt[0] if isinstance(input_prompt, (list, tuple)) else input_prompt
         logger.info(f"[prompt] MAIN (start_frame=0): {_main_p}")
         # Encode all switch prompts upfront
@@ -150,7 +345,7 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
                 switch_prompts = [switch_prompts] * len(switch_frame_indices)
             contexts_switch = []
             for sp in switch_prompts:
-                ctx, _ = self.text_encoder(sp, self.device)
+                ctx, _ = self.text_encoder(sp, dit_device)
                 contexts_switch.append(ctx)
             _sfi_sorted = sorted(switch_frame_indices)
             for i, sp in enumerate(switch_prompts):
@@ -158,6 +353,14 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
                 logger.info(f"[prompt] SWITCH#{i} (triggers at start_frame>={_sf}): {sp}")
         else:
             contexts_switch = []
+        if marks is not None:
+            marks.mark("text_encode.end")
+        if text_encoder_park_device is not None and not offload_model:
+            # Opt-in: free the encoder's ~11 GB on the DiT device for KV residency once all
+            # prompts (incl. switch prompts) are encoded; it is moved back at the next call.
+            self.text_encoder.model.to(text_encoder_park_device)
+            gc.collect()
+            torch.cuda.empty_cache()
         if offload_model:
             self.text_encoder.model.cpu()
 
@@ -172,8 +375,8 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
             if w != target_w or h != target_h:
                 img = img.resize(size)
             img_tensor = to_tensor(img)[None, :, None] * 2 - 1
-            self.vae.encoder.to(self.device)
-            img_tensor = img_tensor.to(device=self.device, dtype=self.param_dtype)
+            self.vae.encoder.to(dit_device)
+            img_tensor = img_tensor.to(device=dit_device, dtype=self.param_dtype)
             img_latent = vae_encode(vae=self.vae, pixel_values=img_tensor)
             if offload_model:
                 self.vae.encoder.cpu()
@@ -194,7 +397,7 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
             target_shape[2],
             target_shape[3],
             dtype=torch.float32,
-            device=self.device,
+            device=dit_device,
             generator=generator)
 
         @contextmanager
@@ -203,11 +406,22 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
 
         no_sync = getattr(self.transformer, 'no_sync', noop_no_sync)
 
-        # evaluation mode
-        with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
+        assert self.frame_per_block is not None, f"got invalid {self.frame_per_block=}"
+        compiled_request = self._compiled_request(
+            dit_device=dit_device, latent_shape=target_shape, window_size=window_size,
+            sink_size=sink_size, image_conditioned=img_latent is not None,
+            switch_frames=(sorted(switch_frame_indices)[:len(contexts_switch)]
+                           if contexts_switch else ()),
+            slice_last_frames=slice_last_frames, recache_mode=recache_mode)
+
+        # The DiT device must be current: Triton launches on the current device.
+        with torch.cuda.device(dit_device), amp.autocast(dtype=self.param_dtype), \
+                torch.no_grad(), no_sync(), compiled_request:
             sample_scheduler = RectifiedFlowScheduler(num_train_timesteps=self.num_train_timesteps, shift=shift)
-            sample_scheduler.set_timesteps(num_inference_steps=sampling_steps, device=self.device, )
+            sample_scheduler.set_timesteps(num_inference_steps=sampling_steps, device=dit_device, )
             timesteps = sample_scheduler.timesteps
+            # Python floats for the trace tags; float(t) on a CUDA tensor per step would sync.
+            timesteps_list = timesteps.tolist()
 
             # sample videos
             latents = noise
@@ -220,7 +434,6 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
             arg_null = {'context': context_null, 'seq_len': seq_len}
             args_c_switch = [{'context': ctx, 'seq_len': seq_len} for ctx in contexts_switch]
 
-            assert self.frame_per_block is not None, f"got invalid {self.frame_per_block=}"
             frame_per_block = self.frame_per_block
             batch_size, _, num_frames, height, width = noise.shape
             seq_len_per_frame = height * width // (self.patch_size[1] * self.patch_size[2])
@@ -232,6 +445,7 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
                 self.transformer.dim // self.transformer.num_heads
             )
 
+            kv_dtype = unsharded_param_dtype(self.transformer)
             cache_kwargs = dict(
                 config=dict(
                     cache_type=["k_cache", 'v_cache'],
@@ -244,7 +458,7 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
                     v_cache=cache_shape,
                 ),
                 device=self.transformer.device,
-                dtype=self.transformer.dtype,
+                dtype=kv_dtype,
                 block_seqlen_config=dict(
                     k_cache=seq_len_per_frame * frame_per_block,
                     v_cache=seq_len_per_frame * frame_per_block,
@@ -258,13 +472,12 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
                     v_cache=sink_size if not isinstance(sink_size, MutableMapping) else sink_size.get("kv"),
                 ),
                 num_layers=self.transformer.num_layers,
-                per_head_types={'k_cache', 'v_cache'} if enable_block_level_cache else None,
                 chunk_per_head_types={'k_cache', 'v_cache'} if enable_chunk_per_head_cache else None,
-                num_heads=self.transformer.num_heads if (enable_block_level_cache or enable_chunk_per_head_cache) else None,
+                num_heads=self.transformer.num_heads if enable_chunk_per_head_cache else None,
                 kv_block_size=(getattr(self.transformer.config, 'pool_f', 1)
                             * self.transformer.config.pool_h
                             * self.transformer.config.pool_w)
-                            if (enable_block_level_cache or enable_chunk_per_head_cache) else 0,
+                            if enable_chunk_per_head_cache else 0,
             )
 
             if self.transformer.config.get("enable_nsa"):
@@ -285,10 +498,15 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
                     cache_kwargs["window_config"][cache_type] = window_size if not isinstance(window_size, MutableMapping) else window_size.get("kv_cmp")
                     cache_kwargs["sink_config"][cache_type] = sink_size if not isinstance(sink_size, MutableMapping) else sink_size.get("kv_cmp")
 
+            # 'block_lru' owns capacity and eviction itself: the chunk LRU must never
+            # engage, so the cache is built with capacity 0.
+            cache_lru = 0 if block_policy else lru_max_size
+            # CFG keeps a second cache for the unconditional branch.
+            needs_twin = guide_scale > 1
+            # Everything a cache is built from; a change gets new caches.
             cache_signature = (
-                batch_size, seq_len, self.transformer.num_heads,
-                self.transformer.dim, frame_per_block,
-                num_frames,  # affects total_chunks for preallocate
+                _hashable(cache_kwargs), cache_lru, needs_twin,
+                kv_cache_policy, int(kv_block_pool_bytes), int(kv_block_scratch_bytes),
             )
             if _kv_cache is not None:
                 # External cache: caller owns lifecycle; reset to wipe prior state.
@@ -298,59 +516,121 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
                     "plumbed through this kwarg."
                 )
                 _kv_cache.reset()
-                kv_cache = _kv_cache
-            elif self._kv_cache is not None and self._cache_signature == cache_signature:
-                self._kv_cache.reset()
-                kv_cache = self._kv_cache
-                if guide_scale > 1:
-                    self._kv_cache_uncond.reset()
-                    kv_cache_uncond = self._kv_cache_uncond
+                kv_cache, kv_cache_uncond = _kv_cache, None
             else:
-                if self._kv_cache is not None:
-                    logger.info("[cache] signature changed, rebuilding")
-                    del self._kv_cache
-                    if self._kv_cache_uncond is not None:
-                        del self._kv_cache_uncond
-                    torch.cuda.empty_cache()
+                if self._kv_cache is not None and self._cache_signature == cache_signature:
+                    self._kv_cache.reset()
+                    if needs_twin:
+                        self._kv_cache_uncond.reset()
+                else:
+                    if self._kv_cache is not None:
+                        logger.info("[cache] signature changed, rebuilding")
+                        # Release old caches before allocating new ones; tracer cycles need a gc.
+                        self._kv_cache = self._kv_cache_uncond = None
+                        self._cache_signature = None
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                    self._kv_cache = MMCache(**cache_kwargs, lru_max_size=cache_lru)
+                    if needs_twin:
+                        self._kv_cache_uncond = MMCache(**cache_kwargs, lru_max_size=cache_lru)
+                    self._cache_signature = cache_signature
+                kv_cache, kv_cache_uncond = self._kv_cache, self._kv_cache_uncond
+            caches = [c for c in (kv_cache, kv_cache_uncond) if c is not None]
+            # Where host KV buffers come from; an externally owned cache keeps its own setting.
+            if _kv_cache is None or kv_exact_pinned_host is not None:
+                for _c in caches:
+                    _c.configure_exact_pinned_host(kv_exact_pinned_host)
+            # ONE budget on the tier device: the two caches of a CFG request share it.
+            tier_budget_per_cache = int(kv_tier_budget_bytes) // len(caches)
 
-                kv_cache = MMCache(**cache_kwargs, lru_max_size=lru_max_size)
-                self._kv_cache = kv_cache
-                if guide_scale > 1:
-                    kv_cache_uncond = MMCache(**cache_kwargs, lru_max_size=lru_max_size)
-                    self._kv_cache_uncond = kv_cache_uncond
+            # Tier and block store are re-configured every request; disable the unwanted one first.
+            if _kv_cache is None or kv_tier_device is not None or block_policy:
+                for _c in caches:
+                    if block_policy:
+                        _c.configure_gpu_tier(None)
+                        _c.configure_block_store(
+                            int(kv_block_pool_bytes), int(kv_block_scratch_bytes),
+                            resident_if_fits=bool(kv_block_resident_if_fits),
+                            dedup=kv_block_dedup)
+                        continue
+                    _c.configure_block_store(0, 0)
+                    if kv_tier_device is None:
+                        _c.configure_gpu_tier(None)
+                    else:
+                        _c.configure_gpu_tier(kv_tier_device, tier_budget_per_cache)
+
+            # Window buffers and fast path are re-applied every request; off for block_lru.
+            if _kv_cache is None or kv_window_buffer or kv_resident_fast_path:
+                _fast = bool(kv_resident_fast_path) and not block_policy
+                for _c in caches:
+                    _c.configure_window_buffers(bool(kv_window_buffer))
+                    _c.configure_resident_fast_path(_fast)
 
             if _kv_cache is None and enable_kv_evict and enable_chunk_per_head_cache:
-                logger.info("[preallocate] === START ===")
                 total_chunks = math.ceil(num_frames / frame_per_block)
                 chunk_len_for_kv = seq_len_per_frame * frame_per_block
                 head_dim = self.transformer.dim // self.transformer.num_heads
                 _sample = torch.empty(
                     (batch_size, chunk_len_for_kv, head_dim),
-                    dtype=self.transformer.dtype,
+                    dtype=kv_dtype,
                     device=self.transformer.device,
                 )
-                _max_entries = self.transformer.num_layers * 2 * self.transformer.num_heads
-                kv_cache.preallocate_offload_buffer(
-                    sample=_sample,
-                    max_entries_per_call=_max_entries,
-                    segment_cids=total_chunks,
-                )
-                del _sample
-                logger.info(f"[preallocate] === DONE ===")
+                # KV bytes this request produces per cache, and the part held by local residency.
+                _per_head_chunk_bytes = _sample.numel() * _sample.element_size()
+                _n_names = max(1, len(kv_cache.chunk_per_head_types))
+                _est_bytes = (total_chunks * self.transformer.num_layers * _n_names
+                              * self.transformer.num_heads * _per_head_chunk_bytes)
+                _local_budget = (lru_max_size * self.transformer.num_layers
+                                 * self.transformer.num_heads * 2 * _per_head_chunk_bytes)
+                if block_policy:
+                    # 'block_lru': pinned host backing is chunk-major, one [H,1,S,D] row per cid.
+                    logger.info("[preallocate] === START (block_lru host backing) ===")
+                    for _c in caches:
+                        _c.preallocate_estimate_bytes = int(_est_bytes)
+                        _c.preallocate_local_budget_bytes = int(_local_budget)
+                        # Resident mode allocates no pool, scratch or host backing; skip prealloc.
+                        _store_cfg = _c.block_store_config()
+                        _resident = _store_cfg.get("mode") == "resident"
+                        _c.preallocate_skipped = _resident
+                        if _resident:
+                            logger.info(
+                                f"[preallocate] SKIPPED (resident mode: no pool/scratch/"
+                                f"host backing; host_backing_bytes="
+                                f"{_store_cfg.get('host_backing_bytes')})")
+                            continue
+                        _c.preallocate_block_host(sample=_sample, segment_cids=total_chunks)
+                    logger.info("[preallocate] === DONE (block_lru host backing) ===")
+                    del _sample
+                else:
+                    # If the whole KV fits the resident part plus the tier, skip the page-lock.
+                    _fits = (kv_tier_device is not None
+                             and _est_bytes <= _local_budget + tier_budget_per_cache)
+                    for _c in caches:
+                        _c.preallocate_skipped = bool(_fits)
+                        _c.preallocate_estimate_bytes = int(_est_bytes)
+                        _c.preallocate_local_budget_bytes = int(_local_budget)
+                    if _fits:
+                        logger.info(
+                            f"[preallocate] SKIPPED: KV estimate {_est_bytes / 2**30:.1f} GiB fits "
+                            f"local {_local_budget / 2**30:.1f} GiB + tier "
+                            f"{tier_budget_per_cache / 2**30:.1f} GiB on {kv_tier_device}")
+                    else:
+                        logger.info("[preallocate] === START ===")
+                        for _c in caches:
+                            _c.preallocate_offload_buffer(sample=_sample,
+                                                          segment_cids=total_chunks)
+                        logger.info("[preallocate] === DONE ===")
+                    del _sample
 
-            self._cache_signature = cache_signature
             gate_data = {}
             switch_idx = 0
             switch_frame_indices_sorted = sorted(switch_frame_indices) if switch_frame_indices else []
             chunks_since_evict_cond = 0
             chunks_since_evict_uncond = 0
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(dit_device)
             t0 = time.perf_counter()
             with self.progress_bar(total=math.ceil(num_frames / frame_per_block)) as progress_bar:
                 for start_frame in range(0, num_frames, frame_per_block):
-                    if hasattr(self.transformer, "set_start_frame"):
-                        self.transformer.set_start_frame(start_frame)
-
                     while (switch_idx < len(switch_frame_indices_sorted)
                         and switch_idx < len(args_c_switch)
                         and start_frame >= switch_frame_indices_sorted[switch_idx]):
@@ -362,10 +642,9 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
                         num_recache = min(slice_last_frames, start_frame)
                         recache_start = start_frame - num_recache
                         recache_latents = latents[:, :, recache_start:start_frame]
-                        context_t = torch.zeros(batch_size, device=self.device, dtype=self.param_dtype)
+                        context_t = torch.zeros(batch_size, device=dit_device, dtype=self.param_dtype)
 
                         snap_cond = snap_uncond = None
-                        outer_chunk_start = 0
                         if recache_mode == "none":
                             arg_c = args_c_switch[switch_idx]
                             switch_idx += 1
@@ -382,28 +661,43 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
                                 if guide_scale > 1:
                                     snap_uncond = _snapshot_chunks(kv_cache_uncond, outer_chunk_start, outer_chunk_end)
 
-                        for blk in range(0, num_recache, frame_per_block):
-                            block = recache_latents[:, :, blk:blk + frame_per_block]
-                            self.transformer(block, t=context_t, **args_c_switch[switch_idx],
-                                            start_frame=recache_start + blk, kv_cache=kv_cache)
-                            if guide_scale > 1:
-                                self.transformer(block, t=context_t, **arg_null,
-                                                start_frame=recache_start + blk, kv_cache=kv_cache_uncond)
-
+                        # The window_only recache freezes host rows; release them in finally.
+                        _pending = []
                         if snap_cond is not None:
-                            _restore_chunks(kv_cache, snap_cond, outer_chunk_start)
+                            _pending.append((kv_cache, snap_cond))
                         if snap_uncond is not None:
-                            _restore_chunks(kv_cache_uncond, snap_uncond, outer_chunk_start)
+                            _pending.append((kv_cache_uncond, snap_uncond))
+                        _done = 0
+                        try:
+                            for blk in range(0, num_recache, frame_per_block):
+                                block = recache_latents[:, :, blk:blk + frame_per_block]
+                                set_selection_trace_context(kind='recache', block=blk)
+                                self.transformer(block, t=context_t, **args_c_switch[switch_idx],
+                                                start_frame=recache_start + blk, kv_cache=kv_cache)
+                                if guide_scale > 1:
+                                    set_selection_trace_context(kind='recache', block=blk, cfg='uncond')
+                                    self.transformer(block, t=context_t, **arg_null,
+                                                    start_frame=recache_start + blk, kv_cache=kv_cache_uncond)
+
+                            while _done < len(_pending):
+                                _c, _s = _pending[_done]
+                                _restore_chunks(_c, _s)
+                                _done += 1
+                        finally:
+                            for _c, _s in _pending[_done:]:
+                                _bs = _s.get('block_store') if isinstance(_s, dict) else None
+                                if _bs is not None:
+                                    _c.block_release_snapshot(_bs)
 
                         arg_c = args_c_switch[switch_idx]
                         switch_idx += 1
 
                     noisy_input = noise[:, :, start_frame:start_frame + frame_per_block]
+                    if marks is not None:
+                        marks.mark("chunk.begin", chunk=start_frame // frame_per_block)
 
-                    if kv_cache is not None:
-                        kv_cache.lru_reset_stats()
-                    if guide_scale > 1 and kv_cache_uncond is not None:
-                        kv_cache_uncond.lru_reset_stats()
+                    for _c in caches:
+                        _c.lru_reset_stats()
 
                     for index, t in enumerate(timesteps):
                         progress_bar.set_description(f"{t=:>7.02f}")
@@ -416,7 +710,10 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
                         if img_latent is not None and start_frame == 0:
                             timestep = mask1[:, 0, :, ::self.patch_size[1], ::self.patch_size[2]] * timestep
 
-                        self.transformer.to(self.device)
+                        self.transformer.to(dit_device)
+                        set_selection_trace_context(chunk=start_frame // frame_per_block,
+                                                    start_frame=start_frame, kind='denoise',
+                                                    step=index, t=timesteps_list[index])
                         noise_pred_cond = self.transformer(
                             latent_model_input,
                             t=timestep,
@@ -427,6 +724,10 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
                         pred_image_cond = pred_x0(noise_pred_cond, timestep, noisy_input)
 
                         if guide_scale > 1:
+                            set_selection_trace_context(chunk=start_frame // frame_per_block,
+                                                        start_frame=start_frame, kind='denoise',
+                                                        step=index, t=timesteps_list[index],
+                                                        cfg='uncond')
                             noise_pred_uncond = self.transformer(
                                 latent_model_input,
                                 t=timestep,
@@ -460,7 +761,30 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
 
                     latents[:, :, start_frame:start_frame + frame_per_block] = pred_image
 
+                    if on_latent_chunk is not None:
+                        # Owned snapshot of the written latents, taken before the refresh.
+                        chunk_end = min(start_frame + frame_per_block, num_frames)
+                        snapshot = latents[:, :, start_frame:chunk_end].detach().clone(
+                            memory_format=torch.contiguous_format)
+                        ready_event = torch.cuda.Event()
+                        ready_event.record(torch.cuda.current_stream(dit_device))
+                        # Marked BEFORE the callback: in the one-GPU layout the callback
+                        # decodes the chunk synchronously.
+                        if marks is not None:
+                            marks.mark("latent.submitted", chunk=start_frame // frame_per_block)
+                        on_latent_chunk(LatentChunk(
+                            chunk_index=start_frame // frame_per_block,
+                            frame_start=start_frame,
+                            frame_end=chunk_end,
+                            latent=snapshot,
+                            ready_event=ready_event,
+                            is_last=chunk_end >= num_frames,
+                            submit_time=time.monotonic(),
+                        ))
+
                     context_timestep = torch.zeros_like(timestep)
+                    set_selection_trace_context(chunk=start_frame // frame_per_block,
+                                                start_frame=start_frame, kind='clean')
                     self.transformer(
                         pred_image_cond,
                         t=context_timestep,
@@ -468,12 +792,19 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
                         start_frame=start_frame,
                         kv_cache=kv_cache,
                     )
-                    chunks_since_evict_cond += 1
-                    if enable_kv_evict and chunks_since_evict_cond >= evict_every_k_chunks:
-                        kv_cache.flush_offload()
-                        chunks_since_evict_cond = 0
+                    if block_policy:
+                        # 'block_lru': retire completed history outside sink/window at each chunk.
+                        kv_cache.retire_completed_history()
+                    else:
+                        chunks_since_evict_cond += 1
+                        if enable_kv_evict and chunks_since_evict_cond >= evict_every_k_chunks:
+                            kv_cache.flush_offload()
+                            chunks_since_evict_cond = 0
 
                     if guide_scale > 1:
+                        set_selection_trace_context(chunk=start_frame // frame_per_block,
+                                                    start_frame=start_frame, kind='clean',
+                                                    cfg='uncond')
                         self.transformer(
                             pred_image_uncond,
                             t=context_timestep,
@@ -481,35 +812,76 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
                             start_frame=start_frame,
                             kv_cache=kv_cache_uncond,
                         )
-                        chunks_since_evict_uncond += 1
-                        if enable_kv_evict and chunks_since_evict_uncond >= evict_every_k_chunks:
-                            kv_cache_uncond.flush_offload()
-                            chunks_since_evict_uncond = 0
+                        if block_policy:
+                            kv_cache_uncond.retire_completed_history()
+                        else:
+                            chunks_since_evict_uncond += 1
+                            if enable_kv_evict and chunks_since_evict_uncond >= evict_every_k_chunks:
+                                kv_cache_uncond.flush_offload()
+                                chunks_since_evict_uncond = 0
 
-                    alloc = torch.cuda.memory_allocated() / 1e9
-                    reserved = torch.cuda.memory_reserved() / 1e9
+                    _block_rate = None
+                    if block_policy:
+                        # protected = chunk live on GPU, persistent = block already in the pool.
+                        _block_rate = kv_cache.block_hit_rate()
+                    if marks is not None:
+                        _extra = {}
+                        if block_policy:
+                            _extra.update({f"block_{k}": v for k, v in kv_cache.block_stats.items()})
+                            _extra["block_hit_rate"] = _block_rate
+                        elif enable_kv_evict:
+                            _extra["lru_hit_rate"] = kv_cache.lru_hit_rate_overall()
+                            _extra["lru_access"] = kv_cache._lru_total_access
+                            _extra["lru_hits"] = kv_cache._lru_total_hits
+                        _rs = getattr(kv_cache, "reload_stats", None)
+                        if _rs:
+                            _extra.update({f"reload_{k}": v for k, v in _rs.items()})
+                        marks.mark("chunk.end", chunk=start_frame // frame_per_block, **_extra)
+                    alloc = torch.cuda.memory_allocated(dit_device) / 1e9
+                    reserved = torch.cuda.memory_reserved(dit_device) / 1e9
                     postfix = dict(mem=f"{alloc:.1f}/{reserved:.1f}G")
-                    if enable_kv_evict:
+                    if block_policy:
+                        postfix['blk'] = "n/a" if _block_rate is None else f"{_block_rate:.1%}"
+                    elif enable_kv_evict:
                         postfix['lru'] = f"{kv_cache.lru_hit_rate_overall():.1%}"
                     progress_bar.set_postfix(**postfix, refresh=False)
                     progress_bar.update()
 
-            torch.cuda.synchronize()
+            set_selection_trace_context()
+            torch.cuda.synchronize(dit_device)
             t = time.perf_counter() - t0
             logger.info(f"Denoising Time: {t:.2f}s")
+            if marks is not None:
+                marks.mark("denoise.end", seconds=t)
+            if return_latents:
+                # Latent-only contract: no decode, no extra copy of the latent buffer.
+                return LatentGenerationOutput(
+                    latents=latents,
+                    num_latent_frames=num_frames,
+                    requested_frames=frame_num,
+                    actual_frames=1 + self.vae_stride[0] * (num_frames - 1),
+                    denoise_seconds=t,
+                    num_chunks=math.ceil(num_frames / frame_per_block),
+                )
             if offload_model:
-                self.vae.to(self.device)
+                self.vae.to(dit_device)
 
-            latents_mean = torch.tensor(self.vae.config.latents_mean,
-                                        device=self.vae.device, dtype=self.vae.dtype).reshape(1, -1, 1, 1, 1)
-            latents_std = torch.tensor(self.vae.config.latents_std,
-                                    device=self.vae.device, dtype=self.vae.dtype).reshape(1, -1, 1, 1, 1)
-            latents = latents * latents_std + latents_mean
+            # No-op when the VAE shares the DiT device.
+            latents = latents.to(self.vae.device)
 
             if vae_decode_chunk_size:
-                image = self.vae.decode_to_cpu(latents, chunk_size=vae_decode_chunk_size)
+                # Chunked decode; release reserved-but-unallocated blocks so activations fit.
+                torch.cuda.empty_cache()
+                image = decode_latents_chunked_to_cpu(
+                    self.vae, latents, chunk_size=int(vae_decode_chunk_size),
+                    autocast_dtype=self.param_dtype)
                 image = self.tensor2vid(image, self.image_processor, output_type="pil")
             else:
+                latents_mean = torch.tensor(self.vae.config.latents_mean,
+                                            device=self.vae.device, dtype=self.vae.dtype).reshape(1, -1, 1, 1, 1)
+                latents_std = torch.tensor(self.vae.config.latents_std,
+                                        device=self.vae.device, dtype=self.vae.dtype).reshape(1, -1, 1, 1, 1)
+                latents = latents * latents_std + latents_mean
                 image = self.vae.decode(latents).sample
                 image = self.tensor2vid(image.float().cpu(), self.image_processor, output_type="pil")
             if offload_model:
@@ -518,4 +890,3 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
             gc.collect()
             torch.cuda.empty_cache()
             return ImagePipelineOutput(images=image)
-

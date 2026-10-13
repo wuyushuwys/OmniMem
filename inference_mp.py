@@ -81,7 +81,7 @@ parser.add_argument('--fps', type=int, default=16, help='export video fps')
 # Sampling
 parser.add_argument('--cfg', type=float, default=7, help='classifier free guidance scale')
 parser.add_argument('--num_inference_steps', type=int, default=25, help='Number of inference steps')
-parser.add_argument('--seed', type=int, default=0, help='Random seed')
+parser.add_argument('--seed', type=int, default=42, help='Random seed')
 parser.add_argument('--shift', default=5, type=float, help='timestep shift')
 parser.add_argument('--num_samples_per_prompt', type=int, default=1,
                     help='How many videos to sample per prompt')
@@ -95,9 +95,6 @@ parser.add_argument("--enable_kv_evict", action='store_true',
                          "(only window+sink+LRU stay on GPU)")
 parser.add_argument("--lru_max_size", type=int, default=10,
                     help="LRU capacity for selection-attention chunk reuse")
-parser.add_argument("--kv_evict_min_gpu_chunks", type=int, default=None,
-                    help="floor on chunks kept on GPU during eviction "
-                         "(None = window+sink only)")
 args = parser.parse_args()
 
 # Broadcast the run name so all ranks agree (the default is a per-rank timestamp).
@@ -188,11 +185,9 @@ pipe_kwargs = dict(
     offload_model=False,
     sink_size=sink_size_dict,
     window_size=window_size_dict,
-    enable_block_level_cache=False,
     enable_chunk_per_head_cache=args.nsa,
     enable_kv_evict=args.enable_kv_evict,
     lru_max_size=args.lru_max_size,
-    kv_evict_min_gpu_chunks=args.kv_evict_min_gpu_chunks,
 )
 if rank == 0:
     logger.info(f"pipe_kwargs: {pipe_kwargs}")

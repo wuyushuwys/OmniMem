@@ -17,13 +17,10 @@ from omnimem.pipelines import CausalWanT2VPipeline
 from omnimem.schedulers import RectifiedFlowScheduler
 from omnimem.utils.torch_utils import (
     get_fsdp_state_dict, 
-    save_fsdp_checkpoint, 
     load_and_broadcast_diffuser, 
     resume_model, 
     save_sharded_safetensors,
     update_ema_fsdp,
-    resume_dcp_checkpoint,
-    save_dcp_checkpoint,
     )
 from omnimem.utils.meter import TimerMeter
 from omnimem.evaluate import evaluation_wan
@@ -35,9 +32,11 @@ from omnimem.utils.misc import (
 )
 
 from omnimem.trainer.base_wan_trainer import BaseWanTrainer
+from omnimem.trainer.causal_checkpoint import CausalCheckpointMixin
+from omnimem.utils.ode_training_state import restore_rng_state
 
 
-class WanCausalTrainer(BaseWanTrainer):
+class WanCausalTrainer(CausalCheckpointMixin, BaseWanTrainer):
     model: CausalWanModel
     ema: CausalWanModel
 
@@ -48,6 +47,7 @@ class WanCausalTrainer(BaseWanTrainer):
     backward_timer: TimerMeter
 
     checkpoint_modules = CausalWanAttentionBlock
+    ema_module_cls = CausalWanModel
 
     def __init__(self, config):
         self.config = config
@@ -55,7 +55,8 @@ class WanCausalTrainer(BaseWanTrainer):
         self.timestep_shift = self._get_and_record("timestep_shift", None)
         self.teacher_forcing = self._get_and_record("teacher_forcing", False)
         super().__init__(config)
-        self.model_compile(mode="max-autotune-no-cudagraphs")
+        if self.torch_compile:
+            self.model_compile(mode="max-autotune-no-cudagraphs")
 
     def load_noise_scheduler(self):
         self.noise_scheduler = RectifiedFlowScheduler.from_config(
@@ -86,10 +87,6 @@ class WanCausalTrainer(BaseWanTrainer):
         self.count_model_parameter(model, name="Model")
         self.model = model
 
-    def resume_from_checkpoint(self):
-        checkpoint_path = os.path.join(self.output_dir, "checkpoints")
-        resume_model(os.path.join(checkpoint_path, "model"), self.model)
-
     def wrap_model_fsdp(self):
         if dist.is_initialized():
             for block in self.model.blocks:
@@ -117,12 +114,7 @@ class WanCausalTrainer(BaseWanTrainer):
             **self.lr_scheduler_kwargs
         )
 
-        dcp_path = os.path.join(self.output_dir, "checkpoints", 'checkpoint_dcp')
-        if os.path.exists(dcp_path):
-            resume_dcp_checkpoint(model=self.model, optimizer=self.optimizer, path=dcp_path)
-
-        for _ in range(self.global_step):
-            self.lr_scheduler.step()
+        self._restore_training_state()
 
     def setup_timers(self):
         super().setup_timers()
@@ -164,36 +156,6 @@ class WanCausalTrainer(BaseWanTrainer):
                              f'time:[{time_log}]'
                              f" loss: {self.loss_meter.mavg.get('train/loss', 0):.04f}")
 
-    def save_models(self):
-        output_dir = self.output_dir
-        model_state_dict = get_fsdp_state_dict(unwrap_model(self.model))
-        if self.ema is not None:
-            ema_state_dict = get_fsdp_state_dict(unwrap_model(self.ema))
-        else:
-            ema_state_dict = None
-        save_dir = os.path.join(output_dir, "checkpoints", "checkpoint_dcp")
-        save_dcp_checkpoint(self.model, self.optimizer, global_step=self.global_step, output_dir=save_dir)
- 
-        if is_main_process():
-            self.logger.info(f"saving checkpoint to {output_dir} ...")
-            save_dir = os.path.join(output_dir, "checkpoints", "model")
-            self.model.save_config(save_directory=save_dir)
-            save_sharded_safetensors(state_dict=model_state_dict, save_dir=save_dir)
-            self.logger.info("Save model.")
-            if self.ema is not None:
-                save_dir = os.path.join(output_dir, "checkpoints", "ema")
-                self.ema.save_config(save_directory=save_dir)
-                save_sharded_safetensors(state_dict=ema_state_dict, save_dir=save_dir)
-                self.logger.info("Save EMA model.")
- 
-            save_fsdp_checkpoint(None, None, self.global_step, output_dir=os.path.join(output_dir, "checkpoints"))
-            self.logger.info("Save checkpoints.")
-
-            self.s3.upload_folder(
-                folder_path=os.path.join(output_dir, "checkpoints"),
-                global_step=self.global_step,
-            )
-
     def create_ema_model_peft(self, model, module_cls):
         if isinstance(model, PeftModel):
             ema_config = dict(model.get_base_model().config)
@@ -221,7 +183,7 @@ class WanCausalTrainer(BaseWanTrainer):
     def setup_ema_model(self, try_resume=False):
         if self.ema_model:
             self.ema, info = self.create_ema_model_peft(
-                unwrap_model(self.model), module_cls=CausalWanModel
+                unwrap_model(self.model), module_cls=self.ema_module_cls
             )
             self.logger.info(
                 f"EMA load info: missing={len(info.missing_keys)}, "
@@ -231,8 +193,9 @@ class WanCausalTrainer(BaseWanTrainer):
         else:
             self.ema = None
             return
-        if try_resume:
-            resume_model(path=os.path.join(self.output_dir, "checkpoints", 'ema'), module=self.ema)
+        if try_resume and self._resume_checkpoint is not None:
+            self._restore_checkpoint_weights("ema", self.ema)
+        self.ema.requires_grad_(False).eval()
         if dist.is_initialized():
             for block in self.ema.blocks:
                 fully_shard(block, **self.fsdp_kwargs)
@@ -375,7 +338,9 @@ class WanCausalTrainer(BaseWanTrainer):
 
         if self.accumulation_index == 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            log_dict["train/grad_norm"] = grad_norm.to_local().item()
+            log_dict["train/grad_norm"] = (
+                grad_norm.to_local() if hasattr(grad_norm, "to_local") else grad_norm
+            ).item()
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
             self.lr_scheduler.step()
@@ -392,8 +357,11 @@ class WanCausalTrainer(BaseWanTrainer):
         return log_dict
 
     def train(self):
-        # evaluate initial model
-        self.evaluate()
+        if self.global_step >= self.max_train_steps:
+            self.logger.info(f"Training already complete at step {self.global_step}; nothing to run.")
+            return
+        # Validation and lazy data-loader startup must not consume resumed RNG.
+        self._evaluate_without_rng_change()
         # main training loop
         self.logger.info("***** Running training *****")
 
@@ -401,15 +369,18 @@ class WanCausalTrainer(BaseWanTrainer):
             self.loss_meter.reset()
             self.data_timer.tic()
             for step, tuple_batch in enumerate(self.train_dataloader, start=1):
+                if self._resume_rng_state is not None:
+                    restore_rng_state(self._resume_rng_state)
+                    self._resume_rng_state = None
                 self.accumulation_index = step % self.gradient_accumulation_steps
 
                 # load data
-                ode = tuple_batch['ode'].to(
+                ode = torch.as_tensor(tuple_batch['ode']).to(
                     device=self.device, dtype=torch.float32, non_blocking=True,
                 )
                 latents = ode[:, -1]
                 text_embeddings = [
-                    t.to(device=self.device, non_blocking=True)
+                    torch.as_tensor(t).to(device=self.device, dtype=self.dtype, non_blocking=True)
                     for t in tuple_batch['t5_embed']
                 ]
                 data = dict(
@@ -433,7 +404,7 @@ class WanCausalTrainer(BaseWanTrainer):
                         self.save_models()
 
                     if self.global_step % self.validation_steps == 0 or self.global_step >= self.max_train_steps:
-                        self.evaluate()
+                        self._evaluate_without_rng_change()
 
                 self.data_timer.tic()
                 if self.global_step >= self.max_train_steps:

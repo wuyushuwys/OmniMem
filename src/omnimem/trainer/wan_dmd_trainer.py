@@ -34,6 +34,7 @@ from omnimem.utils.misc import (
 from omnimem.utils.meter import TimerMeter
 from omnimem.evaluate import evaluation_wan
 from omnimem.trainer.base_wan_trainer import BaseWanTrainer
+from omnimem.utils.ode_training_state import capture_rng_state, restore_rng_state
 
 
 class WanDMDTrainer(BaseWanTrainer):
@@ -74,7 +75,8 @@ class WanDMDTrainer(BaseWanTrainer):
         self.critic_adam_epsilon = config.get("critic_adam_epsilon", 1e-8)
 
         super().__init__(config)
-        self.model_compile(mode="max-autotune-no-cudagraphs")
+        if self.torch_compile:
+            self.model_compile(mode="max-autotune-no-cudagraphs")
 
     def load_noise_scheduler(self):
         self.noise_scheduler = RectifiedFlowScheduler.from_config(
@@ -664,10 +666,11 @@ class WanDMDTrainer(BaseWanTrainer):
 
             if self.accumulation_index == 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.generator.parameters(), self.max_grad_norm)
-                log_dict["train/g_grad_norm"] = grad_norm.to_local().item()
+                log_dict["train/g_grad_norm"] = (grad_norm.to_local() if hasattr(grad_norm, "to_local") else grad_norm).item()
                 self.generator_optimizer.step()
                 self.generator_optimizer.zero_grad(set_to_none=True)
-                self.critic_optimizer.zero_grad(set_to_none=True)
+                if not getattr(self, "complete_sf_resume", False):
+                    self.critic_optimizer.zero_grad(set_to_none=True)
                 self.generator_lr_scheduler.step()
 
             loss_log.update(g_loss_logs)
@@ -698,7 +701,7 @@ class WanDMDTrainer(BaseWanTrainer):
 
         if self.accumulation_index == 0:
             critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.fake_net.parameters(), self.max_grad_norm)
-            log_dict["train/critic_grad_norm"] = critic_grad_norm.to_local().item()
+            log_dict["train/critic_grad_norm"] = (critic_grad_norm.to_local() if hasattr(critic_grad_norm, "to_local") else critic_grad_norm).item()
             self.critic_optimizer.step()
             self.critic_optimizer.zero_grad(set_to_none=True)
             self.critic_lr_scheduler.step()
@@ -713,16 +716,34 @@ class WanDMDTrainer(BaseWanTrainer):
         return log_dict
 
     def train(self):
+        complete_resume = getattr(self, "complete_sf_resume", False)
+        if complete_resume and self.global_step >= self.max_train_steps:
+            self.logger.info("Requested self-forcing training is already complete.")
+            return
         # evaluate initial model
-        self.evaluate_init()
+        if complete_resume:
+            rng_state = capture_rng_state()
+            try:
+                self.evaluate_init()
+            finally:
+                restore_rng_state(rng_state)
+        else:
+            self.evaluate_init()
         # main training loop
         self.logger.info("***** Running training *****")
 
-        for epoch in range(self.num_train_epochs):
+        for epoch in ([None] if complete_resume else range(self.num_train_epochs)):
             self.loss_meter.reset()
             self.data_timer.tic()
-            for step, tuple_batch in enumerate(self.train_dataloader, start=1):
+            batches = self._sf_training_batches() if complete_resume else self.train_dataloader
+            for step, tuple_batch in enumerate(batches, start=1):
                 self.accumulation_index = step % self.gradient_accumulation_steps
+
+                # Lazy prompt workers may consume parent RNG while obtaining the
+                # first batch. Restore only after that startup work has finished.
+                if complete_resume and self._resume_rng_state is not None:
+                    restore_rng_state(self._resume_rng_state)
+                    self._resume_rng_state = None
 
                 self.setup_ema_model()
 
@@ -766,6 +787,10 @@ class WanDMDTrainer(BaseWanTrainer):
 
                 if self.accumulation_index == 0:
                     self.global_step += 1
+                    if complete_resume:
+                        # Publish step 200 with EMA already initialized, matching
+                        # the state used by the next training microbatch.
+                        self.setup_ema_model()
 
                     self._log_progress(log_dict)
 
@@ -773,9 +798,14 @@ class WanDMDTrainer(BaseWanTrainer):
                         self.save_models()
 
                     if self.global_step % self.validation_steps == 0 or self.global_step >= self.max_train_steps:
-                        self.evaluate()
+                        if complete_resume:
+                            self._evaluate_without_rng_change()
+                        else:
+                            self.evaluate()
 
                 self.data_timer.tic()
                 if self.global_step >= self.max_train_steps:
                     self.logger.info("Finish training")
                     return
+        if complete_resume:
+            raise RuntimeError("Self-forcing prompt epochs exhausted before max_train_steps")

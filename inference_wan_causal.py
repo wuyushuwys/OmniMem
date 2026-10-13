@@ -32,7 +32,7 @@ transformers.utils.logging.disable_progress_bar()
 
 
 @torch.no_grad()
-def generate(pipe: CausalWanT2VPipeline, prompts_path, pipe_kwargs, output_folder, tag='', n_rows=4, seed=0, fps=8):
+def generate(pipe: CausalWanT2VPipeline, prompts_path, pipe_kwargs, output_folder, tag='', n_rows=4, seed=42, fps=8):
     with open(prompts_path, 'r') as f:
         video_prompts = [line.rstrip() for line in f.readlines()]
 
@@ -59,7 +59,7 @@ parser.add_argument('--nframes', type=int, default=240, help='Number of frames o
 parser.add_argument('--nrows', type=int, default=4, help='Number of rows to save video/image')
 parser.add_argument('--cfg', type=float, default=7, help='classifier free guidance scale')
 parser.add_argument('--num_inference_steps', type=int, default=25, help='Number of inference steps')
-parser.add_argument('--seed', type=int, default=0, help='Random seed')
+parser.add_argument('--seed', type=int, default=42, help='Random seed')
 parser.add_argument('--name', type=str, default=datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
                     help='Name of the folder')
 parser.add_argument('--fps', type=int, default=16, help='export video fps')
@@ -73,9 +73,6 @@ parser.add_argument("--enable_kv_evict", action='store_true',
                          "(only window+sink+LRU stay on GPU)")
 parser.add_argument("--lru_max_size", type=int, default=10,
                     help="LRU capacity for selection-attention chunk reuse")
-parser.add_argument("--kv_evict_min_gpu_chunks", type=int, default=None,
-                    help="floor on chunks kept on GPU during eviction "
-                         "(None = window+sink only)")
 parser.add_argument("--t5_path", type=str,
                     default="wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth")
 parser.add_argument("--tokenizer_path", type=str,
@@ -149,11 +146,9 @@ pipe_kwargs = dict(
     offload_model=False,
     sink_size=sink_size_dict if args.nsa else args.sink_size,
     window_size=window_size_dict if args.nsa else args.window_size,
-    enable_block_level_cache=False,
     enable_chunk_per_head_cache=args.nsa,
     enable_kv_evict=args.enable_kv_evict,
     lru_max_size=args.lru_max_size,
-    kv_evict_min_gpu_chunks=args.kv_evict_min_gpu_chunks,
 )
 print(pipe_kwargs)
 

@@ -2,6 +2,7 @@ import gc
 import os
 import copy
 import math
+import json
 from typing import Union, Type
 from itertools import islice, cycle
 
@@ -20,6 +21,7 @@ from omnimem.utils.io import save_videos_grid_pil
 from omnimem.utils.logging_tool import get_logger
 from omnimem.utils.aws_handler import S3
 from omnimem.utils.misc import get_world_size, get_rank, wait_for_everyone, is_main_process
+from omnimem.utils.validation_prompts import evaluation_prompt_records, validation_export_frames
 
 diffusers.utils.logging.disable_progress_bar()
 transformers.utils.logging.disable_progress_bar()
@@ -46,7 +48,6 @@ def evaluation_wan(
         timestep_shift: int = 8,
         window_size=None,
         sink_size=None,
-        enable_block_level_cache=False,
         enable_chunk_per_head_cache=False,
         enable_kv_evict=True,
         lru_max_size=10,
@@ -65,6 +66,8 @@ def evaluation_wan(
     generator.manual_seed(global_seed)
 
     validation_data = copy.deepcopy(validation_data)
+    prompt_records = evaluation_prompt_records(validation_data, frame_per_block=frame_per_block)
+    export_num_frames = validation_export_frames(validation_data)
     if original_cfg is not None:
         validation_data.update({'guidance_scale': original_cfg})
 
@@ -93,7 +96,7 @@ def evaluation_wan(
 
     num_frames = validation_data.get('num_frames')
     extension = 'mp4'
-    prompts = [(i, p) for i, p in enumerate(validation_data.prompts)]
+    prompts = list(enumerate(prompt_records))
     num_prompts = len(prompts)
     extend_factor = math.ceil(len(prompts) / (world_size * n_rows))
     total_prompts = extend_factor * world_size * n_rows
@@ -107,8 +110,6 @@ def evaluation_wan(
         additional_kwargs['window_size'] = window_size
     if sink_size:
         additional_kwargs['sink_size'] = sink_size
-    if enable_block_level_cache:
-        additional_kwargs['enable_block_level_cache'] = True
     if enable_chunk_per_head_cache or isinstance(transformer, CausalWanNSAModel):
         additional_kwargs['enable_chunk_per_head_cache'] = True
     if not enable_kv_evict:
@@ -117,6 +118,21 @@ def evaluation_wan(
         additional_kwargs['lru_max_size'] = lru_max_size
     if _kv_cache is not None:
         additional_kwargs['_kv_cache'] = _kv_cache
+    if validation_data.get('vae_decode_chunk_size') is not None:
+        decode_chunk_size = validation_data['vae_decode_chunk_size']
+        if type(decode_chunk_size) is not int or decode_chunk_size <= 0:
+            raise ValueError('vae_decode_chunk_size must be a positive integer')
+        additional_kwargs['vae_decode_chunk_size'] = decode_chunk_size
+
+    if is_main_process():
+        with open(f"{output_folder}/prompt-schedule.json", 'w', encoding='utf-8') as handle:
+            json.dump({
+                'global_step': global_step, 'seed': global_seed,
+                'num_frames': num_frames, 'export_num_frames': export_num_frames,
+                'fps': fps, 'frame_per_block': frame_per_block,
+                'prompt_schedule_source': dict(validation_data.get('prompt_schedule_source', {})),
+                'prompts': prompt_records,
+            }, handle, ensure_ascii=False, indent=2, default=list)
 
     collect_gates = isinstance(transformer, CausalWanNSAModel) and hasattr(transformer, 'enable_gate_collection')
     all_gate_stats = {}
@@ -130,7 +146,16 @@ def evaluation_wan(
         end = index + n_rows if index + n_rows <= len(extended_prompts) else len(extended_prompts)
 
         logger.info(f"generate sample {index} -> {end - 1}")
-        for idx, prompt in extended_prompts[index:end]:
+        for idx, record in extended_prompts[index:end]:
+            prompt = record['prompts'][0]
+            prompt_kwargs = {}
+            if record['switch_frame_indices']:
+                prompt_kwargs = {
+                    'switch_prompts': record['prompts'][1:],
+                    'switch_frame_indices': record['switch_frame_indices'],
+                    'slice_last_frames': validation_data.get('slice_last_frames', 21),
+                    'recache_mode': validation_data.get('recache_mode', 'full'),
+                }
             if collect_gates:
                 transformer.enable_gate_collection()
 
@@ -146,9 +171,15 @@ def evaluation_wan(
                     guide_scale=guide_scale,
                     generator=generator,
                     offload_model=False,
-                    **additional_kwargs
+                    **additional_kwargs,
+                    **prompt_kwargs,
                 ).images
-                samples.append(images[0])
+                frames = images[0]
+                if export_num_frames is not None:
+                    if len(frames) < export_num_frames:
+                        raise RuntimeError(f'Expected at least {export_num_frames} decoded frames, got {len(frames)}')
+                    frames = frames[:export_num_frames]
+                samples.append(frames)
 
             if collect_gates:
                 transformer.disable_gate_collection()
@@ -161,7 +192,7 @@ def evaluation_wan(
         logger.info(f"finish sample {index} -> {end - 1}")
         if len(samples) > 0 and end <= num_prompts:
             output_video_path = f"{output_folder}/sample-{idx // n_rows:02d}.{extension}"
-            save_videos_grid_pil(samples, output_video_path, fps=fps, n_rows=4, generic=False, release=True)
+            save_videos_grid_pil(samples, output_video_path, fps=fps, n_rows=n_rows, generic=False, release=True)
 
     wait_for_everyone()
 
@@ -194,7 +225,7 @@ def evaluation_wan(
         if wandb.run is not None:
             logger.info('Upload sample to wandb')
             wandb_video_logs = {}
-            for i in range(0, len(validation_data.prompts), n_rows):
+            for i in range(0, num_prompts, n_rows):
                 output_video_path = f"{output_folder}/sample-{i // n_rows:02d}.{extension}"
                 if extension == 'mp4':
                     wandb_video_logs[f"{tag}video_{i // n_rows:02d}"] = wandb.Video(output_video_path, format="mp4")

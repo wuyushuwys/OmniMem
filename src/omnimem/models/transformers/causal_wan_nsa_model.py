@@ -1,7 +1,10 @@
 from typing import Optional, Union
-import time
+from collections import OrderedDict
+import itertools
+import weakref
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.attention.flex_attention import BlockMask
 from diffusers.configuration_utils import register_to_config
 from einops import rearrange
@@ -11,6 +14,9 @@ from omnimem.nsa.ops import (
     selection_attention,
     parallel_nsa_topk_grouped_heads,
     should_use_selection_attention,
+)
+from omnimem.nsa.ops.selection.padded_ptr.block_wrapper import (
+    selection_attention_block_store,
 )
 from omnimem.nsa.ops.selection.padded_ptr import (
     selection_attention_padded_ptr_fast,
@@ -24,6 +30,10 @@ from .wan_model import (
     WanCrossAttention,
     WanLayerNorm,
     sinusoidal_embedding_1d,
+    patch_embed_linear,
+    patch_embed_linear_enabled,
+    rope_finish,
+    rope_tail,
 )
 from .causal_wan_model import CausalWanModel
 
@@ -31,7 +41,76 @@ from .attention import attention
 
 logger = get_logger()
 
-__all__ = ['CausalWanNSAModel', 'CausalWanNSAttentionBlock']
+__all__ = ['CausalWanNSAModel', 'CausalWanNSAttentionBlock',
+           'ATTENTION_SCHEDULES', 'set_nsa_attention_schedule', 'get_nsa_attention_schedule',
+           'set_selection_trace', 'set_selection_trace_context',
+           'causal_reorder_rope_apply', 'set_rope_factor_cache',
+           'clear_rope_factor_cache', 'get_rope_factor_cache_stats']
+
+# Inference-only attention schedule: serial (default) or dual_topk_first.
+ATTENTION_SCHEDULES = ("serial", "dual_topk_first")
+_AUX_STREAMS = {}
+
+# Diagnostic only: when set to a list, every top-k result is appended to it.
+_SELECTION_TRACE = None
+
+# Diagnostic only: tags attached to every trace entry; never read by the forward path.
+_SELECTION_TRACE_CONTEXT: dict = {}
+
+
+def set_selection_trace(trace):
+    """Enable (list) or disable (None) recording of selected block indices."""
+    global _SELECTION_TRACE
+    _SELECTION_TRACE = trace
+
+
+def set_selection_trace_context(**tags):
+    """Replace the tag dict attached to subsequent selection-trace entries."""
+    global _SELECTION_TRACE_CONTEXT
+    _SELECTION_TRACE_CONTEXT = dict(tags)
+
+
+def _aux_stream_for(device: torch.device) -> torch.cuda.Stream:
+    key = (device.type, device.index)
+    stream = _AUX_STREAMS.get(key)
+    if stream is None:
+        stream = torch.cuda.Stream(device=device)
+        _AUX_STREAMS[key] = stream
+    return stream
+
+
+def set_nsa_attention_schedule(model: nn.Module, schedule: str) -> int:
+    """Set the schedule on every NSA self-attention module; returns how many were set."""
+    if schedule not in ATTENTION_SCHEDULES:
+        raise ValueError(f"invalid attention schedule {schedule!r}; expected one of {ATTENTION_SCHEDULES}")
+    n = 0
+    for m in model.modules():
+        if isinstance(m, CausalNSSelfAttention):
+            m.attention_schedule = schedule
+            n += 1
+    return n
+
+
+def get_nsa_attention_schedule(model: nn.Module) -> str:
+    seen = {m.attention_schedule for m in model.modules() if isinstance(m, CausalNSSelfAttention)}
+    if not seen:
+        return "n/a"
+    return seen.pop() if len(seen) == 1 else "mixed"
+
+
+def block_mean(x, fixed_order: bool):
+    """x.mean(2) of [b, blocks, block_size, n, d]; fixed_order pins the sum order."""
+    if not fixed_order:
+        return x.mean(2)
+    b, blocks, block_size, n, d = x.shape
+    size = 1 << max(block_size - 1, 1).bit_length()
+    y = F.pad(x.float(), (0, 0, 0, 0, 0, size - block_size))
+    y = y.view(b, blocks, 2, size // 2, n, d)
+    half = size // 2
+    while half > 1:
+        half //= 2
+        y = y[:, :, :, :half] + y[:, :, :, half:]
+    return ((y[:, :, 0, 0] + y[:, :, 1, 0]) * (1.0 / block_size)).to(x.dtype)
 
 
 def token_reorder(x, f, h, w, pool_f=1, pool_h=1, pool_w=1) -> torch.Tensor:
@@ -69,12 +148,130 @@ def token_restore_order(x, f, h, w, pool_f=1, pool_h=1, pool_w=1) -> torch.Tenso
         return x
 
 
+# RoPE position-factor cache keyed on (freqs version, c, f, h, w, start_frame, pool).
+_ROPE_FACTOR_CACHE_ENABLED = True
+_ROPE_FACTOR_CACHE_CAPACITY = 16                    # entries
+_ROPE_FACTOR_CACHE_MAX_BYTES = 128 * 1024 * 1024    # bytes
+_ROPE_FACTOR_CACHE = OrderedDict()
+_ROPE_FACTOR_CACHE_STATS = {'hits': 0, 'misses': 0, 'evictions': 0, 'skipped': 0}
+
+# id(freqs tensor) -> version, kept honest by a weakref callback that drops the
+# entry while the dying tensor is still the owner of that id.
+_FREQS_VERSIONS = {}
+_FREQS_VERSION_REFS = {}
+_FREQS_VERSION_SEQ = itertools.count(1)
+
+
+def _freqs_version(freqs: torch.Tensor) -> int:
+    """A process-unique version for this ``freqs`` tensor *object*."""
+    key = id(freqs)
+    version = _FREQS_VERSIONS.get(key)
+    if version is not None:
+        return version
+    version = next(_FREQS_VERSION_SEQ)
+    try:
+        def _drop(_ref, _key=key):
+            _FREQS_VERSIONS.pop(_key, None)
+            _FREQS_VERSION_REFS.pop(_key, None)
+        _FREQS_VERSION_REFS[key] = weakref.ref(freqs, _drop)
+    except TypeError:  # pragma: no cover - torch.Tensor is weak-referenceable
+        return version  # never memoise: every call gets a fresh, non-matching version
+    _FREQS_VERSIONS[key] = version
+    return version
+
+
+def _build_rope_position_factor(freqs, c, f, h, w, start_frame, pool_f, pool_h, pool_w):
+    """The original in-loop grid build + rearrange, unchanged."""
+    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    # Build 3D freq grid then rearrange to match reordered token layout.
+    freqs_grid = torch.cat([
+        freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+        freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+        freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+    ],
+        dim=-1)
+    return rearrange(
+        freqs_grid,
+        '(f fs) (h hs) (w ws) d -> (f h w fs hs ws) 1 d',
+        fs=pool_f,
+        hs=pool_h,
+        ws=pool_w
+    )
+
+
+def _rope_position_factor(freqs, c, f, h, w, start_frame, pool_f, pool_h, pool_w):
+    """Cached ``freqs_i`` for one sample; identical tensor on every hit."""
+    device = freqs.device
+    key = (_freqs_version(freqs), device.type, device.index, c,
+           f, h, w, start_frame, pool_f, pool_h, pool_w)
+    cached = _ROPE_FACTOR_CACHE.get(key)
+    if cached is not None:
+        _ROPE_FACTOR_CACHE.move_to_end(key)
+        _ROPE_FACTOR_CACHE_STATS['hits'] += 1
+        return cached
+    _ROPE_FACTOR_CACHE_STATS['misses'] += 1
+    value = _build_rope_position_factor(freqs, c, f, h, w, start_frame,
+                                        pool_f, pool_h, pool_w)
+    nbytes = value.numel() * value.element_size()
+    if nbytes > _ROPE_FACTOR_CACHE_MAX_BYTES:
+        # A single factor larger than the whole budget is never cached; the
+        # caller still gets a correct, freshly built tensor.
+        _ROPE_FACTOR_CACHE_STATS['skipped'] += 1
+        return value
+    _ROPE_FACTOR_CACHE[key] = value
+    total = nbytes + sum(v.numel() * v.element_size()
+                         for k, v in _ROPE_FACTOR_CACHE.items() if k != key)
+    while len(_ROPE_FACTOR_CACHE) > 1 and (
+            len(_ROPE_FACTOR_CACHE) > _ROPE_FACTOR_CACHE_CAPACITY
+            or total > _ROPE_FACTOR_CACHE_MAX_BYTES):
+        _, victim = _ROPE_FACTOR_CACHE.popitem(last=False)
+        total -= victim.numel() * victim.element_size()
+        _ROPE_FACTOR_CACHE_STATS['evictions'] += 1
+    return value
+
+
+def set_rope_factor_cache(enabled: bool, capacity: Optional[int] = None,
+                          max_bytes: Optional[int] = None) -> bool:
+    """Enable/disable the RoPE position-factor cache.  Returns the previous state."""
+    global _ROPE_FACTOR_CACHE_ENABLED, _ROPE_FACTOR_CACHE_CAPACITY
+    global _ROPE_FACTOR_CACHE_MAX_BYTES
+    previous = _ROPE_FACTOR_CACHE_ENABLED
+    _ROPE_FACTOR_CACHE_ENABLED = bool(enabled)
+    if capacity is not None:
+        _ROPE_FACTOR_CACHE_CAPACITY = int(capacity)
+    if max_bytes is not None:
+        _ROPE_FACTOR_CACHE_MAX_BYTES = int(max_bytes)
+    if not _ROPE_FACTOR_CACHE_ENABLED:
+        clear_rope_factor_cache()
+    return previous
+
+
+def clear_rope_factor_cache() -> None:
+    """Drop every cached factor (does not reset the counters)."""
+    _ROPE_FACTOR_CACHE.clear()
+
+
+def get_rope_factor_cache_stats() -> dict:
+    """``hits`` / ``misses`` / ``evictions`` / ``skipped`` plus current occupancy."""
+    return dict(
+        _ROPE_FACTOR_CACHE_STATS,
+        entries=len(_ROPE_FACTOR_CACHE),
+        bytes=sum(v.numel() * v.element_size() for v in _ROPE_FACTOR_CACHE.values()),
+        enabled=_ROPE_FACTOR_CACHE_ENABLED,
+        capacity=_ROPE_FACTOR_CACHE_CAPACITY,
+        max_bytes=_ROPE_FACTOR_CACHE_MAX_BYTES,
+    )
+
+
 @torch.compiler.disable()
 def causal_reorder_rope_apply(x, grid_sizes, freqs, start_frame=0, pool_f=1, pool_h=1, pool_w=1):
     """Apply RoPE to reordered tokens with temporal offset start_frame."""
     n, c = x.size(2), x.size(3) // 2
+    # Cache unless it is off or start_frame is not a plain int.
+    use_cache = _ROPE_FACTOR_CACHE_ENABLED and isinstance(start_frame, int)
     # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    if not use_cache:
+        freqs_split = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
     output = []
     # loop over samples
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
@@ -83,26 +280,32 @@ def causal_reorder_rope_apply(x, grid_sizes, freqs, start_frame=0, pool_f=1, poo
         x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
             seq_len, n, -1, 2))
 
-        # Build 3D freq grid then rearrange to match reordered token layout.
-        freqs_grid = torch.cat([
-            freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-            dim=-1)
-        freqs_i = rearrange(
-            freqs_grid,
-            '(f fs) (h hs) (w ws) d -> (f h w fs hs ws) 1 d',
-            fs=pool_f,
-            hs=pool_h,
-            ws=pool_w
-        )
+        if use_cache:
+            freqs_i = _rope_position_factor(freqs, c, f, h, w, start_frame,
+                                            pool_f, pool_h, pool_w)
+        else:
+            # Build 3D freq grid then rearrange to match reordered token layout.
+            freqs_grid = torch.cat([
+                freqs_split[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                freqs_split[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                freqs_split[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            ],
+                dim=-1)
+            freqs_i = rearrange(
+                freqs_grid,
+                '(f fs) (h hs) (w ws) d -> (f h w fs hs ws) 1 d',
+                fs=pool_f,
+                hs=pool_h,
+                ws=pool_w
+            )
         # apply rotary embedding
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
+        # ``rope_tail`` / ``rope_finish`` elide the empty-tail cat and the
+        # single-element stack (exact, see wan_model).
+        x_i = rope_tail(x_i, x, i, seq_len)
         # append to collection
         output.append(x_i)
-    return torch.stack(output).type_as(x)
+    return rope_finish(output, x)
 
 
 class CausalNSSelfAttention(WanSelfAttention):
@@ -153,6 +356,8 @@ class CausalNSSelfAttention(WanSelfAttention):
         self.num_kv_head_groups = num_kv_head_groups if num_kv_head_groups else self.num_heads
         self.skip_module = skip_module
         self.tf = tf
+        # inference-only schedule, see set_nsa_attention_schedule()
+        self.attention_schedule = 'serial'
 
     def initialize_gate(self):
         torch.nn.init.normal_(self.g_proj.weight, mean=0., std=1.0e-3)
@@ -191,6 +396,14 @@ class CausalNSSelfAttention(WanSelfAttention):
         Selection attention via GPU-resident chunk pointer metadata in MMCache.
         Returns zeros when sequence too short or metadata not yet populated (cold start).
         """
+        block_indices = self._slc_topk_indices(roped_query, roped_key_cmp, q_chunk_offset)
+        if block_indices is None:
+            return torch.zeros_like(roped_query)
+        return self._slc_from_indices(roped_query, block_indices, kv_cache)
+
+    @torch.compiler.disable()
+    def _slc_topk_indices(self, roped_query, roped_key_cmp, q_chunk_offset: int = 0):
+        """Grouped-head top-k block selection; None while the sequence is too short."""
         s = roped_query.shape[1]
 
         if not (self.progressive_exclude or should_use_selection_attention(
@@ -199,7 +412,7 @@ class CausalNSSelfAttention(WanSelfAttention):
             exclude_window_chunks=self.exclude_window_chunks,
             exclude_sink_chunks=self.exclude_sink_chunks,
         )):
-            return torch.zeros_like(roped_query)
+            return None
 
         block_indices = parallel_nsa_topk_grouped_heads(
             q=roped_query, k=roped_key_cmp,
@@ -214,6 +427,31 @@ class CausalNSSelfAttention(WanSelfAttention):
             progressive_exclude=self.progressive_exclude,
             q_chunk_offset=q_chunk_offset,
         ).to(torch.int32).contiguous()
+        if _SELECTION_TRACE is not None:
+            _SELECTION_TRACE.append((self.layer_idx, block_indices.to("cpu", copy=True),
+                                     dict(_SELECTION_TRACE_CONTEXT)))
+        return block_indices
+
+    @torch.compiler.disable()
+    def _slc_from_indices(self, roped_query, block_indices, kv_cache: MMCache):
+        """Pointer-table selection attention (LRU touch, host inspection, reload, SLC)."""
+        if kv_cache.block_store is not None:
+            if self.training or torch.is_grad_enabled():
+                # Block store is inference only; the chunk-LRU path would see all-zero pointers.
+                raise RuntimeError(
+                    f"L{self.layer_idx}: kv_cache_policy='block_lru' is inference-only "
+                    f"(training={self.training}, grad={torch.is_grad_enabled()}).  Use "
+                    f"torch.no_grad() + module.eval(), or configure_block_store(0, 0) "
+                    f"to fall back to the chunk-LRU policy")
+            out = selection_attention_block_store(
+                q=roped_query,
+                block_indices=block_indices,
+                block_size=self.kv_block_size,
+                group_size=self.group_q_size,
+                kv_cache=kv_cache,
+                layer_idx=self.layer_idx,
+            )
+            return out
 
         meta_k = kv_cache.get_chunk_metadata(self.layer_idx, 'k_cache')
         meta_v = kv_cache.get_chunk_metadata(self.layer_idx, 'v_cache')
@@ -223,7 +461,7 @@ class CausalNSSelfAttention(WanSelfAttention):
         ptrs_k, n_chunks_k, strides = meta_k
         ptrs_v, _, _ = meta_v
 
-        return selection_attention_padded_ptr_fast(
+        out = selection_attention_padded_ptr_fast(
             q=roped_query,
             block_indices=block_indices,
             block_size=self.kv_block_size,
@@ -237,6 +475,46 @@ class CausalNSSelfAttention(WanSelfAttention):
             kv_cache=kv_cache,
             layer_idx=self.layer_idx,
         )
+        return out
+
+    def _dual_stream_active(self, roped_query) -> bool:
+        return (self.attention_schedule != 'serial'
+                and not self.training
+                and not torch.is_grad_enabled()
+                and roped_query.is_cuda
+                and self.skip_module != 'slc')
+
+    @torch.compiler.disable()
+    def _nsa_branches_dual(self, roped_query, roped_key_cmp, v_cmp, roped_key_swa, v_swa,
+                           kv_cache: MMCache, q_chunk_offset: int):
+        """Inference-only two-stream schedule of the three NSA branches."""
+        device = roped_query.device
+        main = torch.cuda.current_stream(device)
+        aux = _aux_stream_for(device)
+
+        shared_ready = torch.cuda.Event()
+        shared_ready.record(main)
+        block_indices = self._slc_topk_indices(roped_query, roped_key_cmp, q_chunk_offset)
+
+        dense_done = torch.cuda.Event()
+        aux.wait_event(shared_ready)
+        try:
+            with torch.cuda.stream(aux):
+                o_cmp = attention(q=roped_query, k=roped_key_cmp, v=v_cmp)
+                o_swa = attention(q=roped_query, k=roped_key_swa, v=v_swa)
+
+            if block_indices is None:
+                o_slc = torch.zeros_like(roped_query)
+            else:
+                o_slc = self._slc_from_indices(roped_query, block_indices, kv_cache)
+        finally:
+            # Nothing is dispatched to the aux stream after the two attentions, so this
+            # marks the end of the dense work wherever in the block control left it.
+            dense_done.record(aux)
+            main.wait_event(dense_done)
+        o_cmp.record_stream(main)
+        o_swa.record_stream(main)
+        return o_cmp, o_swa, o_slc
 
     def _slc_train_padded_ptr(self, roped_query, block_indices, kv_cache, n_chunks):
         """
@@ -248,6 +526,12 @@ class CausalNSSelfAttention(WanSelfAttention):
         required for gradient-checkpoint metadata consistency across recompute.
         Falls back to selection_attention_padded_ptr_train on cold start (no ptr table yet).
         """
+        if getattr(kv_cache, 'block_store', None) is not None:
+            # Training never enters the block store: its chunk base table would be all zero.
+            raise RuntimeError(
+                f"L{self.layer_idx}: kv_cache_policy='block_lru' is inference-only; the "
+                f"training selection path needs the chunk-LRU ptr tables.  Call "
+                f"configure_block_store(0, 0) before training with this cache")
         k_store = kv_cache.cache[self.layer_idx]['k_cache']
         v_store = kv_cache.cache[self.layer_idx]['v_cache']
         H_n = len(k_store)
@@ -305,8 +589,13 @@ class CausalNSSelfAttention(WanSelfAttention):
                     kv_cache.lru_touch_per_head(self.layer_idx, 'v_cache', h, cid)
 
             if reloaded:
-                kv_cache.notify_chunks_reloaded(self.layer_idx, 'k_cache', reloaded)
-                kv_cache.notify_chunks_reloaded(self.layer_idx, 'v_cache', reloaded)
+                # One publish batch for K and V together (shared ring slot, H2D
+                # and scatter) instead of two per-cid staged notifications.
+                kv_cache.publish_chunk_ptrs(self.layer_idx, (
+                    (name, h, cid, MMCache.chunk_ptr_of(store[h][cid]))
+                    for name, store in (('k_cache', k_store), ('v_cache', v_store))
+                    for h, cid in reloaded
+                ))
                 ptrs_k, n_chunks_k, strides = kv_cache.get_chunk_metadata(self.layer_idx, 'k_cache')
                 ptrs_v, _, _ = kv_cache.get_chunk_metadata(self.layer_idx, 'v_cache')
 
@@ -473,20 +762,25 @@ class CausalNSSelfAttention(WanSelfAttention):
             start_frame_t = torch.as_tensor(start_frame, device=grid_sizes.device, dtype=torch.long)
             start_id = h * w * start_frame_t
             start_id_int = int(start_id)
+            cmp_start_id = start_id // self.kv_block_size
             q_chunk_offset = start_id_int // s
 
-            # Compressed (mean-pooled) K/V for global selection
+            # Compressed (mean-pooled) K/V for global selection.
+            fixed_order = (torch.compiler.is_compiling() and not self.training
+                           and not torch.is_grad_enabled())
             roped_key_cmp = kv_cache.update_cache(
                 name='k_cmp_cache',
-                hidden_state=roped_key.view(b, s // self.kv_block_size, self.kv_block_size, n, d).mean(2),
+                hidden_state=block_mean(
+                    roped_key.view(b, s // self.kv_block_size, self.kv_block_size, n, d), fixed_order),
                 layer_idx=layer_idx,
-                start_id=start_id // self.kv_block_size
+                start_id=cmp_start_id
             )
             v_cmp = kv_cache.update_cache(
                 name='v_cmp_cache',
-                hidden_state=v.view(b, s // self.kv_block_size, self.kv_block_size, n, d).mean(2),
+                hidden_state=block_mean(
+                    v.view(b, s // self.kv_block_size, self.kv_block_size, n, d), fixed_order),
                 layer_idx=layer_idx,
-                start_id=start_id // self.kv_block_size
+                start_id=cmp_start_id
             )
 
             # Full K/V for sliding-window attention
@@ -503,10 +797,16 @@ class CausalNSSelfAttention(WanSelfAttention):
                 start_id=start_id
             )
 
-            o_cmp = attention(q=roped_query, k=roped_key_cmp, v=v_cmp)
+            if self._dual_stream_active(roped_query):
+                o_cmp, o_swa, o_slc = self._nsa_branches_dual(
+                    roped_query, roped_key_cmp, v_cmp, roped_key_swa, v_swa,
+                    kv_cache, q_chunk_offset,
+                )
+            else:
+                o_cmp = attention(q=roped_query, k=roped_key_cmp, v=v_cmp)
 
-            o_swa = attention(q=roped_query, k=roped_key_swa, v=v_swa)
-            if self.skip_module != 'slc':
+                o_swa = attention(q=roped_query, k=roped_key_swa, v=v_swa)
+            if self.skip_module != 'slc' and not self._dual_stream_active(roped_query):
                 if not self.training:
                     o_slc = self.slc_attention_padded_ptr(
                         roped_query=roped_query,
@@ -791,7 +1091,10 @@ class CausalWanNSAModel(CausalWanModel):
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
         # embeddings
-        x = self.patch_embedding(x)
+        if patch_embed_linear_enabled() and x.dim() == 5:
+            x = patch_embed_linear(self.patch_embedding, x)
+        else:
+            x = self.patch_embedding(x)
         grid_sizes = torch.tensor(x.shape[2:], dtype=torch.long).expand(x.shape[0], -1)
         f, h, w = x.shape[2:]
         x = x.flatten(2).transpose(1, 2).contiguous()
@@ -810,7 +1113,10 @@ class CausalWanNSAModel(CausalWanModel):
         teacher_forcing = teacher is not None
         if teacher_forcing:
             # embed teacher
-            x_t = self.patch_embedding(teacher)
+            if patch_embed_linear_enabled() and teacher.dim() == 5:
+                x_t = patch_embed_linear(self.patch_embedding, teacher)
+            else:
+                x_t = self.patch_embedding(teacher)
             x_t = x_t.flatten(2).transpose(1, 2).contiguous()
             x_t = token_reorder(
                 x_t,

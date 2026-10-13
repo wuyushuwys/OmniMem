@@ -22,6 +22,20 @@ from torch.distributed.fsdp import FSDPModule
 logger = get_logger()
 
 
+def unsharded_param_dtype(module) -> torch.dtype:
+    """Return the forward parameter dtype; ``module.dtype`` can show FP32 master weights."""
+    if isinstance(module, FSDPModule):
+        try:
+            param_dtype = module._get_fsdp_state()._mp_policy.param_dtype
+        except AttributeError:
+            logger.warning("Cannot read the FSDP2 mixed-precision policy of %s; using module.dtype",
+                           type(module).__name__)
+            param_dtype = None
+        if param_dtype is not None:
+            return param_dtype
+    return module.dtype
+
+
 def reshard_model(model):
     """Reshard all FSDPModule submodules in model."""
     for m in model.modules():
@@ -63,12 +77,14 @@ def create_ema_model(model, module_cls: object):
     return ema, info
 
 
-def resume_model(path, module: torch.nn.Module):
+def resume_model(path, module: torch.nn.Module, strict=False):
     from safetensors.torch import load_file
     import gc
     if module is None:
         return
     if not os.path.exists(path):
+        if strict:
+            raise FileNotFoundError(f"Checkpoint model not found: {path}")
         return
 
     if os.path.isfile(path) and path.endswith('.safetensors'):
@@ -88,26 +104,39 @@ def resume_model(path, module: torch.nn.Module):
             shard_files = sorted(set(weight_map.values()))
 
             model_state = module.state_dict()
+            if strict and set(weight_map) != set(model_state):
+                raise RuntimeError(
+                    f"Checkpoint keys differ: missing={sorted(set(model_state) - set(weight_map))}, "
+                    f"unexpected={sorted(set(weight_map) - set(model_state))}"
+                )
             loaded_keys = set()
 
             for shard_file in shard_files:
                 shard_dict = load_file(os.path.join(path, shard_file), device="cpu")
                 for key, tensor in shard_dict.items():
+                    if strict and weight_map.get(key) != shard_file:
+                        raise RuntimeError(f"Tensor {key} does not match the checkpoint shard index")
                     if key in model_state:
+                        if strict and model_state[key].shape != tensor.shape:
+                            raise RuntimeError(f"Checkpoint shape mismatch for {key}")
                         model_state[key].copy_(tensor)
                         loaded_keys.add(key)
                 del shard_dict
                 gc.collect()
             missing = [k for k in model_state if k not in loaded_keys]
             unexpected = [k for k in weight_map if k not in model_state]
+            if strict and (missing or unexpected):
+                raise RuntimeError(f"Incomplete checkpoint: missing={missing}, unexpected={unexpected}")
             logger.info(f"Load ckpt from {path}")
             logger.info(f"missing key: {len(missing)}, {missing}")
             logger.info(f"unexpected_keys: {len(unexpected)}, {unexpected}")
             return
+        else:
+            raise FileNotFoundError(f"No supported model weights found in {path}")
     else:
         state_dict = module.__class__.from_pretrained(path).state_dict()
 
-    incompatible_keys = module.load_state_dict(state_dict, strict=False)
+    incompatible_keys = module.load_state_dict(state_dict, strict=strict)
     logger.info(f"Load ckpt from {path}")
     logger.info(f"missing key: {len(incompatible_keys.missing_keys)}")
     logger.info(f"missing key: {incompatible_keys.missing_keys}")
@@ -177,7 +206,7 @@ def get_fsdp_state_dict(model, dtype=torch.float32, master_only=True):
             raise RuntimeError(f"param {param_name} {type(sharded_param)} not supported")
         param_name = param_name.replace('._orig_mod.', '.').replace("._checkpoint_wrapped_module.", ".")
         if master_only:
-            if torch.distributed.get_rank() == 0:
+            if is_main_process():
                 state_dict[param_name] = full_param.to(dtype=dtype, device="cpu")
             else:
                 del full_param

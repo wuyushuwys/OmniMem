@@ -75,6 +75,7 @@ Two recipes are supported, both ending in a self-forcing stage — pick one:
 | Self-forcing | `nsa-self-forcing` | `configs/self_forcing/training_wan_nsa_self_forcing_4step_flow.yaml` |
 
 Optionally finetune for long video with `nsa-self-forcing-streaming` (`configs/self_forcing/training_wan_nsa_self_forcing_4step_flow_streaming.yaml`).
+Use `nsa-self-forcing-switch` with the same config for prompt switching. This config enables complete resume and saves every 20 optimizer steps, including the live rollout and KV cache. See the resume guides ([self-forcing](docs/SELF_FORCING_RESUME.md#streaming-and-prompt-switching), [ODE](docs/ODE_RESUME.md), [teacher-forcing](docs/TF_RESUME.md)) for restart requirements and checkpoint contents.
 
 The ODE / teacher-forcing / consistency-distillation stages train on pre-generated ODE trajectories. Download the released dataset:
 
@@ -90,11 +91,65 @@ See [`run.sh`](run.sh) for a ready-to-edit end-to-end example.
 
 ## Inference
 
+`inference_single_gpu.py` and `inference_dual_gpu.py` generate videos (T2V) and write the frames to the MP4 while the DiT is still generating. Both take the same arguments; set `args` for the model you run:
+
+```bash
+wan=(--vae_path wan_models/vae-2.1/vae
+     --t5_path wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+     --tokenizer_path wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl)
+
+# short video (5 s)
+args=("${wan[@]}" --pretrained checkpoints/self_forcing_from_ode_init --nframes 81
+      --prompt_file configs/prompts/demo.txt --output demo/short)
+
+# long video (60 s)
+args=("${wan[@]}" --pretrained checkpoints/long_rolling_plain_from_ode_init --nframes 969
+      --prompt_file configs/prompts/project_page/standard_60s.jsonl --output demo/long)
+
+# long video with prompt switching (60 s, a new prompt every 10 s)
+args=("${wan[@]}" --pretrained checkpoints/long_rolling_switch_prompt_from_ode_init --nframes 969
+      --prompt_file configs/prompts/interactive_60s.jsonl --output demo/switch)
+```
+
+`--prompt_file` writes one MP4 per line of the file into the `--output` directory. For a single video of your own, pass `--prompt "<your prompt>" --output demo/example.mp4` instead. `--pretrained` also takes your own `outputs/<exp_name>/checkpoints/ema`.
+
+### Triton kernels (default)
+
+Nothing to build.
+
+```bash
+# single GPU: DiT and VAE on cuda:0
+python inference_single_gpu.py "${args[@]}"
+
+# dual GPU: DiT on cuda:0, VAE decoding on cuda:1
+python inference_dual_gpu.py "${args[@]}"
+```
+
+### CUDA kernels
+
+Build the extension once (needs `nvcc` and `ninja`), then add `--nsa_backend cuda`:
+
+```bash
+python -m omnimem.nsa.cuda_backend.build
+
+# single GPU
+python inference_single_gpu.py "${args[@]}" --nsa_backend cuda
+
+# dual GPU
+python inference_dual_gpu.py "${args[@]}" --nsa_backend cuda
+```
+
+Training and the other entry points select the CUDA kernels with `OMNIMEM_NSA_BACKEND=cuda`. Both backends load the same checkpoints; for the same seed they give different samples.
+
+See [streaming inference](docs/STREAMING_INFERENCE.md) for the options, memory requirements and reproducibility notes.
+
+### Other entry points
+
 ```bash
 bash scripts/genv_wan_causal.sh
 ```
 
-`inference_wan_causal.py` runs single-GPU and writes a demo grid under `demo/`. `inference_mp.py` (launched with `torchrun`) batches a prompt file across ranks for long-video generation and uploads results to S3. `--lru_max_size` sets the KV-cache memory budget.
+`inference_wan_causal.py` runs single-GPU and writes a demo grid under `demo/`. `inference_mp.py` (launched with `torchrun`) batches a prompt file across ranks for long-video generation and uploads results to S3. With `--enable_kv_evict`, `--lru_max_size` bounds the KV cache on the GPU: it is the number of history chunks kept there besides the attention window.
 
 ## Citation
 

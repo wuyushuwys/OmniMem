@@ -1,5 +1,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+from collections import OrderedDict
 import math
+import os
 from typing import Optional
 import warnings
 
@@ -7,7 +9,11 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import BlockMask, flex_attention, _DEFAULT_SPARSE_BLOCK_SIZE
 
-flex_attention = torch.compile(flex_attention, dynamic=True, mode="max-autotune-no-cudagraphs")
+flex_attention = torch.compile(
+    flex_attention,
+    dynamic=True,
+    mode=os.environ.get("OMNIMEM_FLEX_COMPILE_MODE", "max-autotune-no-cudagraphs"),
+)
 
 _BLOCK_SIZE = _DEFAULT_SPARSE_BLOCK_SIZE
 
@@ -34,11 +40,37 @@ except ImportError as exc:
     FLASH_ATTN_2_AVAILABLE = False
     _fa_import_errors[2] = exc
 
-# SM120 (e.g. RTX 5090): force-disable FlashAttention; kernels aren't supported.
-if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12:
+if torch.cuda.is_available():
+    _cap = torch.cuda.get_device_capability()
+    if _cap[0] == 12:
+        # SM120 (e.g. RTX 5090): force-disable FlashAttention; kernels aren't supported.
+        FLASH_ATTN_4_AVAILABLE = False
+        FLASH_ATTN_3_AVAILABLE = False
+        FLASH_ATTN_2_AVAILABLE = False
+    elif _cap[0] < 9:
+        # FA4 (flash_attn.cute) and FA3 (flash_attn_interface) only ship SM90+ kernels;
+        # on Ampere (A100, SM80) fall back to FA2 instead of asserting inside FA4.
+        FLASH_ATTN_4_AVAILABLE = False
+        FLASH_ATTN_3_AVAILABLE = False
+    del _cap
+
+# FA2 is the default; OMNIMEM_FLASH_ATTN_VERSION=auto picks the newest available, "3" / "4" pin one.
+_flash_attn_version = os.environ.get("OMNIMEM_FLASH_ATTN_VERSION")
+if _flash_attn_version is None:
+    _flash_attn_version = "2" if FLASH_ATTN_2_AVAILABLE else "auto"
+if _flash_attn_version not in ("auto", "2", "3", "4"):
+    raise ValueError("OMNIMEM_FLASH_ATTN_VERSION must be 'auto', '2', '3' or '4'")
+if _flash_attn_version == "2":
+    if not FLASH_ATTN_2_AVAILABLE:
+        raise RuntimeError("FlashAttention 2 was requested but is unavailable on this device")
     FLASH_ATTN_4_AVAILABLE = False
     FLASH_ATTN_3_AVAILABLE = False
-    FLASH_ATTN_2_AVAILABLE = False
+elif _flash_attn_version == "3":
+    if not FLASH_ATTN_3_AVAILABLE:
+        raise RuntimeError("FlashAttention 3 was requested but is unavailable on this device")
+    FLASH_ATTN_4_AVAILABLE = False
+elif _flash_attn_version == "4" and not FLASH_ATTN_4_AVAILABLE:
+    raise RuntimeError("FlashAttention 4 was requested but is unavailable on this device")
 
 _fa_available = [
     v for v, ok in ((4, FLASH_ATTN_4_AVAILABLE),
@@ -60,6 +92,32 @@ __all__ = [
     'flash_attention',
     'attention',
 ]
+
+# Cache of the uniform-batch cu_seqlens tensor keyed (device.index, batch, length, dtype); FIFO.
+_CU_SEQLENS_CACHE_MAX = 64
+_cu_seqlens_cache: "OrderedDict[tuple, torch.Tensor]" = OrderedDict()
+
+
+def _cached_uniform_cu_seqlens(b: int, length: int, device: torch.device) -> torch.Tensor:
+    """cu_seqlens for b uniform sequences of length tokens, cached; callers must not mutate it."""
+    key = (device.index, b, length, torch.int32)
+    cached = _cu_seqlens_cache.get(key)
+    if cached is not None:
+        return cached
+
+    cu_seqlens = torch.arange(0, (b + 1) * length, length, dtype=torch.int32, device=device)
+    # Sync on first fill so a consumer on another stream never sees a partially written entry.
+    torch.cuda.current_stream(device).synchronize()
+
+    if len(_cu_seqlens_cache) >= _CU_SEQLENS_CACHE_MAX:
+        _cu_seqlens_cache.popitem(last=False)  # FIFO eviction
+    _cu_seqlens_cache[key] = cu_seqlens
+    return cu_seqlens
+
+
+def _fa4_out(x):
+    """Normalise a flash_attn.cute result to the output tensor."""
+    return x[0] if isinstance(x, tuple) else x
 
 
 def flash_attention(
@@ -101,12 +159,13 @@ def flash_attention(
     def half(x):
         return x if x.dtype in half_dtypes else x.to(dtype)
 
+    # Uniform batch (lens None) is tracked on the host to avoid an H2D copy.
+    q_lens_uniform = q_lens is None
+    k_lens_uniform = k_lens is None
+
     # preprocess query
     if q_lens is None:
         q = half(q.flatten(0, 1))
-        q_lens = torch.tensor(
-            [lq] * b, dtype=torch.int32).to(
-            device=q.device, non_blocking=True)
     else:
         q = half(torch.cat([u[:v] for u, v in zip(q, q_lens)]))
 
@@ -114,9 +173,6 @@ def flash_attention(
     if k_lens is None:
         k = half(k.flatten(0, 1))
         v = half(v.flatten(0, 1))
-        k_lens = torch.tensor(
-            [lk] * b, dtype=torch.int32).to(
-            device=k.device, non_blocking=True)
     else:
         k = half(torch.cat([u[:v] for u, v in zip(k, k_lens)]))
         v = half(torch.cat([u[:v] for u, v in zip(v, k_lens)]))
@@ -132,43 +188,63 @@ def flash_attention(
             'Flash attention 3 is not available, use flash attention 2 instead.'
         )
 
+    # Cache only when eager; under dynamo keep the original ops so the graph is unchanged.
+    tracing = torch.compiler.is_compiling()
+
+    def uniform_cu_seqlens(length):
+        if tracing:
+            lens = torch.tensor([length] * b, dtype=torch.int32).to(device=q.device, non_blocking=True)
+            return torch.cat([lens.new_zeros([1]), lens]).cumsum(
+                0, dtype=torch.int32).to(q.device, non_blocking=True)
+        return _cached_uniform_cu_seqlens(b, length, q.device)
+
+    def cu_seqlens_q():
+        if q_lens_uniform:
+            return uniform_cu_seqlens(lq)
+        return torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
+            0, dtype=torch.int32).to(q.device, non_blocking=True)
+
+    def cu_seqlens_k():
+        if k_lens_uniform:
+            return uniform_cu_seqlens(lk)
+        return torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
+            0, dtype=torch.int32).to(q.device, non_blocking=True)
+
     # apply attention
     if FLASH_ATTN_4_AVAILABLE:
-        uniform_q = bool(torch.all(q_lens == q_lens[0]).item())
-        uniform_k = bool(torch.all(k_lens == k_lens[0]).item())
+        # Uniform-by-construction when q_lens/k_lens is None; only explicit
+        # variable-length inputs need the device-side all-equal check.
+        uniform_q = True if q_lens_uniform else bool(torch.all(q_lens == q_lens[0]).item())
+        uniform_k = True if k_lens_uniform else bool(torch.all(k_lens == k_lens[0]).item())
 
         if uniform_q and uniform_k:
             q_p = q.unflatten(0, (b, lq))
             k_p = k.unflatten(0, (b, lk))
             v_p = v.unflatten(0, (b, lk))
-            x = flash_attn.cute.flash_attn_func(
+            x = _fa4_out(flash_attn.cute.flash_attn_func(
                 q=q_p, k=k_p, v=v_p,
                 softmax_scale=softmax_scale,
                 causal=causal,
-            )
+            ))
         else:
-            x = flash_attn.cute.flash_attn_varlen_func(
+            x = _fa4_out(flash_attn.cute.flash_attn_varlen_func(
                 q=q, k=k, v=v,
-                cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
-                    0, dtype=torch.int32).to(q.device, non_blocking=True),
-                cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
-                    0, dtype=torch.int32).to(q.device, non_blocking=True),
+                cu_seqlens_q=cu_seqlens_q(),
+                cu_seqlens_k=cu_seqlens_k(),
                 seqused_q=None, seqused_k=None,
                 max_seqlen_q=lq, max_seqlen_k=lk,
                 softmax_scale=softmax_scale,
                 causal=causal,
                 deterministic=deterministic,
-            ).unflatten(0, (b, lq))
+            )).unflatten(0, (b, lq))
     elif (version is None or version == 3) and FLASH_ATTN_3_AVAILABLE:
         # FA3 does not support dropout_p or window_size.
         x = flash_attn_interface.flash_attn_varlen_func(
             q=q,
             k=k,
             v=v,
-            cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
+            cu_seqlens_q=cu_seqlens_q(),
+            cu_seqlens_k=cu_seqlens_k(),
             seqused_q=None,
             seqused_k=None,
             max_seqlen_q=lq,
@@ -182,10 +258,8 @@ def flash_attention(
             q=q,
             k=k,
             v=v,
-            cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
+            cu_seqlens_q=cu_seqlens_q(),
+            cu_seqlens_k=cu_seqlens_k(),
             max_seqlen_q=lq,
             max_seqlen_k=lk,
             dropout_p=dropout_p,

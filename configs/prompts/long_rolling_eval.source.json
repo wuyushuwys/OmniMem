@@ -1,0 +1,36 @@
+{
+  "source": "An unpublished collection of 40 three-segment prompt scripts (segments A/B/C; in a 'revisit' script segment C returns to the subject and scene of segment A). The collection is not distributed with this repository: the six records used are reproduced in full in the output file, and source_sha256 identifies the version of the collection they were taken from.",
+  "source_sha256": "6aa29a9c81c5573a066422080fb5b883789ac26968f9adcfb8faf5aba59a8187",
+  "source_record_ids": [
+    "rv01",
+    "rv02",
+    "rv03",
+    "rv04",
+    "rv05",
+    "rv06"
+  ],
+  "selection": "First six revisit records, preserving their A/B/C text verbatim. C revisits A with a later action; it is not necessarily identical wording.",
+  "output_path": "configs/prompts/long_rolling_eval.jsonl",
+  "output_sha256": "71beddcc98e9d2b316fa8eea16cf0f923a875c06358eb2bc47ecbb17ed4965e8",
+  "switch_frame_indices": [
+    81,
+    162
+  ],
+  "switch_index_units": "latent frames",
+  "num_frames": 969,
+  "num_latent_frames": 243,
+  "export_num_frames": 960,
+  "fps": 16,
+  "export_duration_seconds": 60,
+  "vae_decode_chunk_size": 3,
+  "validation_config": {
+    "prompt_schedule_file": "configs/prompts/long_rolling_eval.jsonl",
+    "num_frames": 969,
+    "export_num_frames": 960,
+    "fps": 16,
+    "vae_decode_chunk_size": 3,
+    "slice_last_frames": 21,
+    "recache_mode": "full",
+    "n_rows": 1
+  }
+}

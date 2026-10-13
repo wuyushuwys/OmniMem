@@ -76,7 +76,8 @@ class WanConsistencyDistillTrainer(BaseWanTrainer):
         self._neg_embeddings_cache = None
 
         super().__init__(config)
-        self.model_compile(mode="max-autotune-no-cudagraphs")
+        if self.torch_compile:
+            self.model_compile(mode="max-autotune-no-cudagraphs")
 
     def load_noise_scheduler(self):
         self.noise_scheduler = RectifiedFlowScheduler.from_config(

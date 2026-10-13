@@ -24,25 +24,40 @@ from omnimem.utils.misc import (
 )
 from omnimem.utils.lora_utils import configure_lora_for_model, gather_lora_state_dict, load_lora_weights
 from omnimem.trainer.wan_self_forcing_trainer import WanSelfForcingTrainer
+from omnimem.trainer.self_forcing_checkpoint import SelfForcingCheckpointMixin
 from omnimem.pipelines import CausalWanT2VPipeline
 from omnimem.evaluate import evaluation_wan
 
 
-class WanNSASelfForcingTrainer(WanSelfForcingTrainer):
+class WanNSASelfForcingTrainer(SelfForcingCheckpointMixin, WanSelfForcingTrainer):
+    _supports_complete_sf_resume = True
     generator: CausalWanNSAModel
 
     ema: Union[None, CausalWanNSAModel] = None
 
     checkpoint_modules = (WanAttentionBlock, CausalWanNSAttentionBlock)
+    ema_module_cls = CausalWanNSAModel
 
     def __init__(self, config):
         self.config = config
+        self.complete_sf_resume = self._get_and_record("complete_sf_resume", False)
+        if self.complete_sf_resume and (not type(self).__dict__.get("_supports_complete_sf_resume", False)
+                                        or config.get("adapter")):
+            raise ValueError("complete_sf_resume requires a supported full-parameter NSA self-forcing trainer")
+        if self.complete_sf_resume and config.get("dataset_type") != "text_dataset":
+            raise ValueError("Complete SF data resume requires the deterministic text_dataset")
         # Read resume_ckpt_path before super().__init__ so _get_resume_dir can see it.
         self.resume_ckpt_path = self._get_and_record("resume_ckpt_path", None)
         self.nsa_kwargs = self._get_and_record("nsa_kwargs")
         self.enable_gate_init = self._get_and_record("enable_gate_init", False)
         self.kv_cache_lru_max_size = self._get_and_record("kv_cache_lru_max_size", None)
-        self.enable_block_level_cache = self._get_and_record("enable_block_level_cache", False)
+        # Compatibility: the `enable_block_level_cache` option was removed. Configs of
+        # earlier runs still carry `false`, which is accepted and ignored.
+        if config.get("enable_block_level_cache", False):
+            raise ValueError(
+                "enable_block_level_cache was removed: the per-(head, block) K/V storage it "
+                "selected no longer exists. Delete it from the config (it is unrelated to "
+                "kv_cache_policy='block_lru').")
         self.enable_chunk_per_head_cache = self._get_and_record("enable_chunk_per_head_cache", False)
         self.per_head_gather_variant = self._get_and_record("per_head_gather_variant", "grouped")
         self.adapter = self._get_and_record("adapter", None)
@@ -57,7 +72,6 @@ class WanNSASelfForcingTrainer(WanSelfForcingTrainer):
             frame_per_block=self.frame_per_block,
             sink_size=self.sink_size,
             window_size=self.window_size,
-            enable_block_level_cache=self.enable_block_level_cache,
             enable_chunk_per_head_cache=self.enable_chunk_per_head_cache,
             enable_kv_evict=self.enable_kv_evict,
             lru_max_size=self.kv_cache_lru_max_size,
@@ -77,7 +91,9 @@ class WanNSASelfForcingTrainer(WanSelfForcingTrainer):
             if dist.is_initialized():
                 for name, p in model.named_parameters():
                     if 'g_proj' in name:
-                        dist.broadcast(p.data.to(self.device), src=0)
+                        broadcast_value = p.data.to(self.device)
+                        dist.broadcast(broadcast_value, src=0)
+                        p.data.copy_(broadcast_value.to(p.device))
 
         if self.adapter and self.adapter.get("type") == "lora":
             model = configure_lora_for_model(
@@ -121,6 +137,10 @@ class WanNSASelfForcingTrainer(WanSelfForcingTrainer):
 
     def _get_resume_dir(self):
         """Prefer local checkpoint for crash-restart; fall back to resume_ckpt_path for cold start."""
+        if getattr(self, "complete_sf_resume", False):
+            if self.resume_ckpt_path:
+                raise ValueError("Use checkpoint_dir for complete SF resume and model_path for weight-only initialization")
+            return self.config.get("checkpoint_dir") or os.path.join(self.output_dir, "checkpoints")
         local = os.path.join(self.output_dir, "checkpoints")
         if os.path.exists(os.path.join(local, "checkpoint.pth")):
             if self.resume_ckpt_path:
@@ -135,6 +155,8 @@ class WanNSASelfForcingTrainer(WanSelfForcingTrainer):
         return local
 
     def resume_from_checkpoint(self):
+        if getattr(self, "complete_sf_resume", False):
+            return self._sf_restore_weights()
         checkpoint_path = self.resume_dir
         if self.is_lora_enabled:
             lora_path = self.lora_ckpt or os.path.join(checkpoint_path, "lora_weights.pt")
@@ -155,6 +177,8 @@ class WanNSASelfForcingTrainer(WanSelfForcingTrainer):
             resume_model(os.path.join(checkpoint_path, "fake_net"), self.fake_net)
 
     def save_models(self):
+        if getattr(self, "complete_sf_resume", False):
+            return self._sf_save_models()
         output_dir = self.output_dir
         checkpoint_path = os.path.join(output_dir, "checkpoints")
 
@@ -193,7 +217,7 @@ class WanNSASelfForcingTrainer(WanSelfForcingTrainer):
                 output_dir=os.path.join(checkpoint_path, "checkpoint_dcp_critic"),
             )
         else:
-            super().save_models()
+            WanSelfForcingTrainer.save_models(self)
 
     def setup_optimizers_and_lr_scheduler(self):
         # setup generator
@@ -210,7 +234,8 @@ class WanNSASelfForcingTrainer(WanSelfForcingTrainer):
             self.lr_scheduler_type,
             optimizer=self.generator_optimizer,
             num_warmup_steps=self.lr_warmup_steps // self.dfake_gen_update_ratio,
-            num_training_steps=self.max_train_steps,
+            num_training_steps=((self.max_train_steps + self.dfake_gen_update_ratio - 1) // self.dfake_gen_update_ratio
+                                if getattr(self, "complete_sf_resume", False) else self.max_train_steps),
             **self.lr_scheduler_kwargs
         )
 
@@ -233,6 +258,8 @@ class WanNSASelfForcingTrainer(WanSelfForcingTrainer):
             **self.lr_scheduler_kwargs
         )
 
+        if getattr(self, "complete_sf_resume", False):
+            return self._sf_restore_training_state()
         checkpoint_path = self.resume_dir
         resume_dcp_checkpoint(
             self.generator, self.generator_optimizer,
@@ -248,6 +275,8 @@ class WanNSASelfForcingTrainer(WanSelfForcingTrainer):
         self.fake_net.compile(mode=mode, dynamic=False)
 
     def setup_ema_model(self, try_resume=False):
+        if getattr(self, "complete_sf_resume", False):
+            return self._sf_setup_ema(try_resume=try_resume)
         if self.is_lora_enabled:
             return
         if self.ema_model and self.ema_start_step <= self.global_step and self.ema is None:
@@ -262,6 +291,7 @@ class WanNSASelfForcingTrainer(WanSelfForcingTrainer):
             self,
             model,
             latents,
+            dtype=None,
     ) -> MMCache:
         _, patch_size, _ = model.patch_size
         batch_size, num_channels, latent_num_frames, latent_height, latent_width = latents.shape
@@ -299,7 +329,7 @@ class WanNSASelfForcingTrainer(WanSelfForcingTrainer):
             ),
             num_layers=model.num_layers,
             device=model.device,
-            dtype=model.dtype,
+            dtype=model.dtype if dtype is None else dtype,
             block_seqlen_config=dict(
                 k_cache=seq_len_per_frame * self.frame_per_block,
                 v_cache=seq_len_per_frame * self.frame_per_block,
@@ -325,12 +355,11 @@ class WanNSASelfForcingTrainer(WanSelfForcingTrainer):
                     "kv_cmp"),
             ),
             lru_max_size=self.kv_cache_lru_max_size if self.kv_cache_lru_max_size is not None else 0,
-            per_head_types={'k_cache', 'v_cache'} if self.enable_block_level_cache else None,
             chunk_per_head_types={'k_cache', 'v_cache'} if self.enable_chunk_per_head_cache else None,
-            num_heads=model.num_heads if (self.enable_block_level_cache or self.enable_chunk_per_head_cache) else None,
-            kv_block_size=(getattr(model.config, 'pool_f', 1)
-                           * model.config.pool_h
-                           * model.config.pool_w) if self.enable_block_level_cache else 0,
+            num_heads=model.num_heads if self.enable_chunk_per_head_cache else None,
+            # 0, not the NSA block size, as before: the value is part of the checkpointed
+            # cache configuration, which a streaming resume must match exactly.
+            kv_block_size=0,
         )
 
         return kv_cache

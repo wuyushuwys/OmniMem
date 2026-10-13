@@ -1,0 +1,350 @@
+"""Complete checkpoints for NSA self-forcing trainers: models, EMA, schedulers, RNG, KV cache."""
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import posixpath
+
+from omegaconf import OmegaConf
+import torch
+import torch.distributed as dist
+from torch.distributed.fsdp import fully_shard
+
+from omnimem.trainer.causal_checkpoint import CausalCheckpointMixin
+from omnimem.utils.misc import unwrap_model
+from omnimem.utils.ode_checkpoint_store import ODECheckpointStore
+from omnimem.utils.ode_training_state import save_training_state, load_training_state
+from omnimem.utils.torch_utils import create_ema_model, get_fsdp_state_dict, save_sharded_safetensors
+
+
+_SF_FAMILIES = {"nsa-self-forcing", "nsa-self-forcing-streaming", "nsa-self-forcing-switch"}
+
+
+def _metadata(path):
+    value = torch.load(Path(path) / "training_state.pt", map_location="cpu", weights_only=True)
+    if not isinstance(value, dict) or value.get("format_version") != 1:
+        raise ValueError("Invalid self-forcing training metadata")
+    extra = value.get("extra_state", {})
+    if (not isinstance(extra, dict) or extra.get("trainer_family") not in _SF_FAMILIES
+            or not isinstance(extra.get("training_config"), dict)):
+        raise ValueError("Checkpoint is not complete NSA self-forcing state")
+    return value
+
+
+def _without_removed_options(recipe):
+    """Drop ``enable_block_level_cache: False`` from old recipes; ``True`` cannot be resumed."""
+    recipe = dict(recipe)
+    if recipe.pop("enable_block_level_cache", False):
+        raise ValueError("The self-forcing checkpoint was trained with enable_block_level_cache=True, "
+                         "which has been removed; it cannot resume complete training")
+    return recipe
+
+
+def _model_payload(path):
+    config = json.loads((path / "config.json").read_text())
+    if not isinstance(config, dict):
+        raise ValueError(f"Invalid model configuration: {path}")
+    index = path / "diffusion_pytorch_model.safetensors.index.json"
+    if index.exists():
+        weights = json.loads(index.read_text()).get("weight_map")
+        if not isinstance(weights, dict) or not weights:
+            raise ValueError(f"Missing model weight map: {path}")
+        for name in weights.values():
+            if (not isinstance(name, str) or not name or "\\" in name or "\x00" in name
+                    or PurePosixPath(name).is_absolute()
+                    or any(part in ("", ".", "..") for part in name.split("/"))
+                    or not name.endswith(".safetensors") or not (path / name).is_file()):
+                raise ValueError(f"Missing or unsafe model shard: {name!r}")
+    elif not (path / "diffusion_pytorch_model.safetensors").is_file():
+        raise ValueError(f"Missing model weights: {path}")
+    return {key: value for key, value in config.items() if not key.startswith("_")}
+
+
+def _check_payload_contents(path, step, world_size):
+    path = Path(path)
+    generator, critic = _metadata(path), _metadata(path / "critic_state")
+    for role, metadata in (("generator", generator), ("critic", critic)):
+        if (metadata["global_step"], metadata["world_size"]) != (step, world_size):
+            raise ValueError(f"{role} step/world size differs from the checkpoint")
+        if metadata["extra_state"].get("optimizer_role") != role:
+            raise ValueError(f"Wrong optimizer role for {role}")
+    extra = generator["extra_state"]
+    family = extra["trainer_family"]
+    if family != critic["extra_state"]["trainer_family"]:
+        raise ValueError("Generator and critic trainer families differ")
+    if extra["training_config"] != critic["extra_state"]["training_config"]:
+        raise ValueError("Generator and critic training configurations differ")
+    cursor = extra.get("data_cursor")
+    if (not isinstance(cursor, dict) or set(cursor) != {"epoch", "batches_consumed"}
+            or any(type(value) is not int or value < 0 for value in cursor.values())
+            or critic["extra_state"].get("data_cursor") != cursor):
+        raise ValueError("Missing or inconsistent SF data cursor")
+    recipe = extra["training_config"]
+    if type(recipe.get("ema_model")) is not bool or type(recipe.get("ema_start_step")) is not int:
+        raise ValueError("Missing delayed EMA policy")
+    active = recipe["ema_model"] and step >= recipe["ema_start_step"]
+    if type(extra.get("ema_active")) is not bool or extra["ema_active"] != active:
+        raise ValueError("EMA activation state disagrees with the completed step")
+    if critic["extra_state"].get("ema_active") != active:
+        raise ValueError("Critic EMA activation metadata differs")
+    generator_config = _model_payload(path / "model")
+    _model_payload(path / "fake_net")
+    if active:
+        if _model_payload(path / "ema") != generator_config:
+            raise ValueError("EMA configuration differs from the generator")
+    elif (path / "ema").exists():
+        raise ValueError("Checkpoint contains EMA before its activation boundary")
+    for state_dir in (path, path / "critic_state"):
+        if not (state_dir / "optimizer/.metadata").is_file() or not any(
+                p.is_file() and p.name != ".metadata" for p in (state_dir / "optimizer").rglob("*")):
+            raise ValueError(f"Missing optimizer metadata/shards: {state_dir}")
+        expected = {f"rank_{rank:05d}.pt" for rank in range(world_size)}
+        if {p.name for p in (state_dir / "rng").glob("*.pt")} != expected:
+            raise ValueError(f"Incomplete rank RNG payload: {state_dir}")
+        for rank in range(world_size):
+            payload = torch.load(state_dir / "rng" / f"rank_{rank:05d}.pt", map_location="cpu", weights_only=True)
+            if (payload.get("global_step"), payload.get("world_size"), payload.get("rank")) != (step, world_size, rank):
+                raise ValueError(f"RNG identity disagrees with checkpoint: {state_dir}, rank {rank}")
+            if not isinstance(payload.get("rng_state"), dict):
+                raise ValueError("Missing rank RNG state")
+    streaming_dir = path / "streaming"
+    if family == "nsa-self-forcing":
+        if streaming_dir.exists():
+            raise ValueError("Ordinary self-forcing checkpoint contains unexpected streaming state")
+    else:
+        # Keep ordinary SF independent of streaming runtime code and validate
+        # every rank before publishing or accepting the completion marker.
+        from omnimem.trainer.streaming_checkpoint import validate_streaming_checkpoint_payload
+
+        expected = {f"rank_{rank:05d}.pt" for rank in range(world_size)}
+        if {p.name for p in streaming_dir.glob("*.pt")} != expected:
+            raise ValueError("Incomplete rank streaming payload")
+        for rank in range(world_size):
+            payload = torch.load(streaming_dir / f"rank_{rank:05d}.pt", map_location="cpu", weights_only=True)
+            validate_streaming_checkpoint_payload(
+                payload, step=step, world_size=world_size, rank=rank,
+                trainer_family=family, training_config=recipe)
+
+
+def _check_payload(path, step, world_size):
+    try:
+        _check_payload_contents(path, step, world_size)
+    except Exception as exc:
+        # Convert malformed weights-only metadata to a validation failure so
+        # latest() can still select an older, complete checkpoint.
+        raise ValueError(f"Invalid self-forcing checkpoint payload: {exc}") from exc
+
+
+class SelfForcingCheckpointStore(ODECheckpointStore):
+    def commit(self, staging, step, world_size):
+        _check_payload(staging, step, world_size)
+        return super().commit(staging, step, world_size)
+
+    def validate(self, path):
+        manifest = super().validate(path)
+        _check_payload(path, manifest["global_step"], manifest["world_size"])
+        return manifest
+
+
+class SelfForcingCheckpointMixin(CausalCheckpointMixin):
+    """Opt-in complete SF state, with optional per-trainer runtime hooks."""
+
+    _sf_trainer_family = "nsa-self-forcing"
+
+    def _sf_prune_local_checkpoints(self, preserve_latest_for_resume=False):
+        keep = self.config.get("checkpoint_keep_local")
+        if keep is None:
+            return
+        if type(keep) is not int or keep < 0:
+            raise ValueError("checkpoint_keep_local must be a nonnegative integer for complete SF resume")
+        if self._checkpoint_store.s3 is None:
+            if keep == 0:
+                raise ValueError("checkpoint_keep_local=0 requires upload and an S3 checkpoint store")
+            return
+        if preserve_latest_for_resume:
+            keep = max(1, keep)
+        # Rank zero alone deletes shared files after verifying every S3 object.
+        removed = self._checkpoint_rank0_call(
+            lambda: [str(path) for path in self._checkpoint_store.prune_local(keep)])
+        self.logger.info(f"Pruned local SF checkpoints already on S3 (keep {keep}): {removed}")
+
+    def _training_config(self):
+        keys = ("frame_per_block", "same_step_across_blocks", "timestep_shift", "latents_shape",
+                "max_distillation_steps", "timestep_sample_method", "real_guidance_scale",
+                "dfake_gen_update_ratio", "critic_loss_type", "ema_model", "ema_decay", "ema_start_step",
+                "gradient_accumulation_steps", "conditioning_dropout_prob", "max_grad_norm",
+                "learning_rate", "adam_beta1", "adam_beta2", "adam_weight_decay", "adam_epsilon",
+                "critic_learning_rate", "critic_adam_beta1", "critic_adam_beta2",
+                "critic_adam_weight_decay", "critic_adam_epsilon", "window_size", "sink_size",
+                "enable_kv_evict", "enable_chunk_per_head_cache",
+                "kv_cache_lru_max_size", "per_head_gather_variant")
+        config = {key: getattr(self, key) for key in keys}
+        config.update({key: self.config.get(key) for key in
+                       ("train_data", "dtype", "real_model_path", "nsa_kwargs", "dataset_type",
+                        "null_prompt", "text_encoder_path", "tokenizer_path")})
+        config["scheduler"] = self._scheduler_config()
+        config["global_seed"] = self.config.get("global_seed", 42)
+        prompt_path = self.config.get("train_data", {}).get("prompt_path")
+        if prompt_path:
+            if not hasattr(self, "_sf_prompt_sha256"):
+                self._sf_prompt_sha256 = hashlib.sha256(Path(prompt_path).read_bytes()).hexdigest()
+            config["prompt_sha256"] = self._sf_prompt_sha256
+        return OmegaConf.to_container(OmegaConf.create(config), resolve=True)
+
+    def resume_state(self):
+        if not getattr(self, "complete_sf_resume", False):
+            # Bypass the causal mixin, preserving the legacy DMD/SF lifecycle.
+            return super(CausalCheckpointMixin, self).resume_state()
+        client = self.s3.s3_client if self.upload else None
+        prefix = self.config.get("checkpoint_s3_prefix")
+        if client is not None and prefix is None:
+            if os.path.isabs(self.config.output_dir):
+                raise ValueError("An absolute output_dir requires an explicit checkpoint_s3_prefix")
+            prefix = posixpath.join(self.s3_dir, self.output_dir, "checkpoints")
+        self._checkpoint_store = SelfForcingCheckpointStore(
+            Path(self.resume_dir), s3_client=client,
+            bucket=self.s3_bucket if client is not None else None,
+            s3_prefix=prefix if client is not None else None)
+        self._resume_rng_state = None
+        self._sf_resume_state_loaded = False
+        self._sf_data_cursor = {"epoch": 0, "batches_consumed": 0}
+        # Keep the newest local copy until all models and training state load.
+        self._sf_prune_local_checkpoints(preserve_latest_for_resume=True)
+
+        def select():
+            checkpoint = self._checkpoint_store.latest()
+            if checkpoint is None:
+                if any((Path(self.resume_dir) / name).exists() for name in
+                       ("checkpoint.pth", "generator", "fake_net", "model", "checkpoint_dcp_generator")):
+                    raise ValueError("Legacy self-forcing checkpoint cannot resume complete training; use explicit weight initialization in a new run")
+                return None
+            metadata = _metadata(checkpoint)
+            world = dist.get_world_size() if dist.is_initialized() else 1
+            if metadata["world_size"] != world:
+                raise ValueError("Full self-forcing resume requires the original number of training ranks")
+            if metadata["extra_state"]["trainer_family"] != self._sf_trainer_family:
+                raise ValueError("Trainer family differs from the completed self-forcing checkpoint")
+            if _without_removed_options(metadata["extra_state"]["training_config"]) != self._training_config():
+                raise ValueError("Training configuration differs from the completed self-forcing checkpoint")
+            return {"path": str(checkpoint), "step": metadata["global_step"]}
+
+        selected = self._checkpoint_rank0_call(select)
+        self._resume_checkpoint = Path(selected["path"]) if selected else None
+        self.logger.info(f"Resume complete self-forcing checkpoint {self._resume_checkpoint}" if selected
+                         else "No completed self-forcing checkpoint; initialize weights and start SF at step 0.")
+        return selected["step"] if selected else 0
+
+    def _sf_restore_weights(self):
+        if self._resume_checkpoint is not None:
+            self._restore_checkpoint_weights("model", self.generator)
+            self._restore_checkpoint_weights("fake_net", self.fake_net)
+
+    def _sf_restore_training_state(self):
+        if self._resume_checkpoint is None:
+            return
+        generator = load_training_state(self._resume_checkpoint, self.generator, self.generator_optimizer,
+                                        self.generator_lr_scheduler, expected_step=self.global_step)
+        load_training_state(self._resume_checkpoint / "critic_state", self.fake_net, self.critic_optimizer,
+                            self.critic_lr_scheduler, expected_step=self.global_step)
+        self._resume_rng_state = generator["rng_state"]
+        self._sf_data_cursor = generator["extra_state"]["data_cursor"]
+        restore_extra = getattr(self, "_sf_restore_extra_state", None)
+        if restore_extra is not None:
+            self._checkpoint_all_ranks_call(lambda: restore_extra(self._resume_checkpoint))
+        self._sf_resume_state_loaded = True
+        self.logger.info(f"Restored both SF optimizers/schedulers and prompt cursor {self._sf_data_cursor}.")
+
+    def _sf_training_batches(self):
+        """Rebuild deterministic prompt order without consuming training RNG."""
+        loader = self.train_dataloader
+        if len(loader) == 0:
+            raise ValueError("Self-forcing prompt loader has no batches; check corpus size and world size")
+        start_epoch = self._sf_data_cursor["epoch"]
+        consumed = self._sf_data_cursor["batches_consumed"]
+        if consumed > len(loader):
+            raise ValueError("Saved SF data cursor exceeds the current epoch length")
+        for epoch in range(start_epoch, self.num_train_epochs):
+            sampler = getattr(loader, "sampler", None)
+            if hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
+            data_generator = torch.Generator().manual_seed(self.config.get("global_seed", 42) + epoch)
+            # TextDataset itself is deterministic. Isolate worker base seeds and
+            # the single-rank RandomSampler from model/noise RNG streams.
+            loader.generator = data_generator
+            if isinstance(sampler, torch.utils.data.RandomSampler):
+                sampler.generator = data_generator
+            for index, batch in enumerate(loader):
+                if epoch == start_epoch and index < consumed:
+                    continue
+                self._sf_data_cursor = {"epoch": epoch, "batches_consumed": index + 1}
+                yield batch
+            self._sf_data_cursor = {"epoch": epoch + 1, "batches_consumed": 0}
+
+    def _sf_setup_ema(self, try_resume=False):
+        if self.ema_model and self.global_step >= self.ema_start_step and self.ema is None:
+            self.ema, _ = create_ema_model(unwrap_model(self.generator), module_cls=self.ema_module_cls)
+            if try_resume and self._resume_checkpoint is not None:
+                self._restore_checkpoint_weights("ema", self.ema)
+            self.ema.requires_grad_(False).eval()
+            if dist.is_initialized():
+                for block in self.ema.blocks:
+                    fully_shard(block, **self.fsdp_kwargs)
+                fully_shard(self.ema, **self.fsdp_kwargs.root_kwargs)
+            else:
+                self.ema.to(self.device)
+        if (try_resume and self._resume_checkpoint is not None
+                and getattr(self, "_sf_resume_state_loaded", False)
+                and self.config.get("checkpoint_keep_local") == 0):
+            # Streaming payloads are already loaded in memory; EMA is the last
+            # checkpoint reader. Wait for every rank before removing shared files.
+            self._checkpoint_all_ranks_call(lambda: None)
+            self._sf_prune_local_checkpoints()
+
+    def _sf_save_models(self):
+        if getattr(self, "accumulation_index", 0) != 0:
+            raise ValueError("SF checkpoints require a completed gradient accumulation boundary")
+        self._sf_setup_ema()
+        staging = Path(self._checkpoint_rank0_call(lambda: str(self._checkpoint_store.begin(self.global_step))))
+
+        def require_shared():
+            if not staging.is_dir():
+                raise FileNotFoundError(f"Checkpoint staging {staging} must be shared by all training ranks")
+            if (self.ema is not None) != (self.ema_model and self.global_step >= self.ema_start_step):
+                raise ValueError("SF EMA state differs from the configured activation boundary")
+        self._checkpoint_all_ranks_call(require_shared)
+        for role, module in (("model", self.generator), ("fake_net", self.fake_net), ("ema", self.ema)):
+            if module is None:
+                continue
+            self.logger.info(f"SF checkpoint step {self.global_step}: gathering {role} weights.")
+            state = get_fsdp_state_dict(unwrap_model(module))
+
+            def save_weights():
+                directory = str(staging / role)
+                self.logger.info(f"SF checkpoint step {self.global_step}: writing {role} weights to {directory}.")
+                module.save_config(save_directory=directory)
+                save_sharded_safetensors(state_dict=state, save_dir=directory)
+            self._checkpoint_rank0_call(save_weights)
+            del state
+        extra = {"trainer_family": self._sf_trainer_family, "training_config": self._training_config(),
+                 "ema_active": self.ema is not None, "data_resume_policy": "deterministic_epoch_cursor",
+                 "data_cursor": self._sf_data_cursor.copy()}
+        self.logger.info(f"SF checkpoint step {self.global_step}: saving generator optimizer/scheduler/RNG state.")
+        save_training_state(staging, self.generator, self.generator_optimizer, self.generator_lr_scheduler,
+                            self.global_step, extra_state={**extra, "optimizer_role": "generator"})
+        self.logger.info(f"SF checkpoint step {self.global_step}: saving critic optimizer/scheduler/RNG state.")
+        save_training_state(staging / "critic_state", self.fake_net, self.critic_optimizer,
+                            self.critic_lr_scheduler, self.global_step,
+                            extra_state={**extra, "optimizer_role": "critic"})
+        save_extra = getattr(self, "_sf_save_extra_state", None)
+        if save_extra is not None:
+            self._checkpoint_all_ranks_call(lambda: save_extra(staging))
+        world = dist.get_world_size() if dist.is_initialized() else 1
+        self.logger.info(f"SF checkpoint step {self.global_step}: validating, hashing and finalizing {staging}.")
+        checkpoint = Path(self._checkpoint_rank0_call(
+            lambda: str(self._checkpoint_store.commit(staging, self.global_step, world))))
+        self.logger.info(f"Saved complete self-forcing checkpoint: {checkpoint}")
+        if self._checkpoint_store.s3 is not None:
+            self.logger.info(f"SF checkpoint step {self.global_step}: starting S3 upload of {checkpoint}.")
+            self._checkpoint_rank0_call(lambda: self._checkpoint_store.upload(checkpoint))
+            self.logger.info(f"SF checkpoint step {self.global_step}: S3 upload complete.")
+            self._sf_prune_local_checkpoints()

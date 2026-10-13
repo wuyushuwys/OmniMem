@@ -11,7 +11,7 @@ python inference_wan_causal.py \
     --height 480 --width 832 --nframes 81 \
     --fps 16 --cfg 1 --num_inference_steps 4 --shift 5 \
     --frame_per_block 3 --window_size 3 --nrows 1 --nsa \
-    --enable_kv_evict --lru_max_size 7 --kv_evict_min_gpu_chunks 4 \
+    --enable_kv_evict --lru_max_size 7 \
     --name genv
 
 # --- Multi-GPU batched inference over a prompt file (e.g. long video) ---
@@ -25,4 +25,4 @@ python inference_wan_causal.py \
 #     --height 480 --width 832 --nframes 960 \
 #     --fps 16 --cfg 1 --num_inference_steps 4 --shift 5 \
 #     --frame_per_block 3 --window_size 3 --nsa \
-#     --enable_kv_evict --lru_max_size 7 --kv_evict_min_gpu_chunks 4
+#     --enable_kv_evict --lru_max_size 7

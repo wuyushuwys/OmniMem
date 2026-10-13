@@ -78,3 +78,16 @@ dmypy.json
 .idea/
 .vscode/
 *.swp
+
+# Local credentials / storage settings sourced by run.sh (see README)
+run.local.sh
+
+# Generated or downloaded at the repository root (see README): training outputs,
+# inference results, the Wan base weights, W&B run files and the ODE dataset.
+# Anchored with a leading slash so that package directories such as
+# src/omnimem/data/ are not affected.
+/outputs/
+/demo/
+/wan_models/
+/wandb/
+/data/
