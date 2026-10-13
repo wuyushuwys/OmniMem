@@ -3,17 +3,17 @@ Selection attention via gather-to-varlen-dense (streaming trainer with LRU offlo
 
 Avoids saving live cache refs in save_for_backward (which trips on device equality under AC).
 Steps: 1) gather unique (h, cid) chunks to dense K_gather/V_gather; build remapped ptr table.
-       2) run existing Triton fwd with remapped indices; save only small stable tensors.
+       2) run the pointer fwd (active backend) with remapped indices; save only small stable tensors.
        3) backward re-gathers K/V from cache (cache content is stable across fwd and bwd); returns dq only.
 """
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import triton
 
-from .kernels.select_fwd import _sel_attn_fwd_padded_ptr_kernel, _compute_tile_n
-from .kernels.select_bwd import selection_attention_padded_ptr_bwd
+from omnimem.nsa.backend import get_backend
+
+from ._dispatch import launch_ptr_fwd, launch_ptr_bwd, build_ptr_table_dispatch
 from .ptr_builder import build_ptr_table
 
 
@@ -170,6 +170,9 @@ class _SelectionAttentionVarlenDense(torch.autograd.Function):
 
         n_global_blocks = n_chunks_per_head * blocks_per_chunk  # bound for remapped block indices
 
+        # Backend captured once, for the ptr build and the forward of this call, and
+        # reused by backward.
+        backend = get_backend()
         ptr_table_k, ptr_table_v = build_ptr_table(
             block_indices=block_indices_remapped,
             block_base_ptrs_k=chunk_base_ptrs_k,
@@ -178,33 +181,16 @@ class _SelectionAttentionVarlenDense(torch.autograd.Function):
             batch_stride=batch_stride_bytes,
             blocks_per_chunk=blocks_per_chunk,
             in_chunk_block_bytes=in_chunk_block_bytes,
+            backend=backend,
         )
 
-        out = torch.empty_like(q)
-        lse = torch.empty(B, H, M, dtype=torch.float32, device=device)
-
-        DP = max(16, triton.next_power_of_2(D))
-        PADDED_BLOCK_SIZE = max(16, triton.next_power_of_2(block_size))
-        PADDED_GROUP_SIZE = max(16, triton.next_power_of_2(G))
-        TILE_N = _compute_tile_n(block_size)
-
-        _sel_attn_fwd_padded_ptr_kernel[(B, MG, H)](
-            q, ptr_table_k, ptr_table_v, out, lse,
-            softmax_scale,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-            ptr_table_k.stride(0), ptr_table_k.stride(1),
-            ptr_table_k.stride(2), ptr_table_k.stride(3),
-            lse.stride(0), lse.stride(1), lse.stride(2),
-            stride_bn, stride_bd,
-            H=H, M=M, D=D, T=T, DP=DP,
-            BLOCK_SIZE=block_size,
-            PADDED_BLOCK_SIZE=PADDED_BLOCK_SIZE,
-            GROUP_SIZE=G,
-            PADDED_GROUP_SIZE=PADDED_GROUP_SIZE,
-            TILE_N=TILE_N,
-            RETURN_LSE=True,
-            INPUT_PRECISION=input_precision,
+        out, lse = launch_ptr_fwd(
+            q, ptr_table_k, ptr_table_v,
+            block_size=block_size, group_size=G,
+            stride_bn=stride_bn, stride_bd=stride_bd,
+            softmax_scale=softmax_scale, return_lse=True,
+            input_precision=input_precision,
+            owners=(K_gather, V_gather), backend=backend,
         )
 
         ctx.save_for_backward(
@@ -218,6 +204,7 @@ class _SelectionAttentionVarlenDense(torch.autograd.Function):
         ctx.head_offsets = head_offsets
         ctx.n_chunks_per_head_list = n_chunks_per_head_list
         ctx.meta = meta
+        ctx.backend = backend
         ctx.batch_size = B
         ctx.head_dim = D
         ctx.dtype = q.dtype
@@ -264,45 +251,53 @@ class _SelectionAttentionVarlenDense(torch.autograd.Function):
 
         n_global_blocks = n_chunks_per_head * blocks_per_chunk
 
-        # rebuild ptr table from fresh K_gather addresses
-        ptr_table_k, ptr_table_v = build_ptr_table(
-            block_indices=block_indices_remapped,
-            block_base_ptrs_k=chunk_base_ptrs_k,
-            block_base_ptrs_v=chunk_base_ptrs_v,
-            n_blocks_per_head=n_global_blocks,
-            batch_stride=batch_stride_kv_bytes,
-            blocks_per_chunk=blocks_per_chunk,
-            in_chunk_block_bytes=in_chunk_block_bytes_kv,
+        # rebuild ptr table from fresh K_gather addresses (with the backend captured at forward)
+        ptr_table_k, ptr_table_v = build_ptr_table_dispatch(
+            block_indices_remapped, chunk_base_ptrs_k, chunk_base_ptrs_v, n_global_blocks,
+            batch_stride_kv_bytes, blocks_per_chunk, in_chunk_block_bytes_kv,
+            backend=ctx.backend,
         )
 
-        # allocate fp32 dK/dV scratch buffers (same layout as K_gather)
-        dk_scratch = torch.zeros_like(K_gather, dtype=torch.float32)
-        dv_scratch = torch.zeros_like(V_gather, dtype=torch.float32)
-        elem_fp32 = dk_scratch.element_size()
+        backend = ctx.backend
+        H_n = len(ctx.head_cid_lists)
+        max_chunks = chunk_base_ptrs_k.shape[1]
+        elem_fp32 = 4
         batch_stride_dkv_bytes = n_chunks_in_gather * chunk_len * D * elem_fp32
         token_stride_dkv_bytes = D * elem_fp32
         in_chunk_block_bytes_dkv = block_size * token_stride_dkv_bytes
         stride_dbn = D  # in fp32 elements
         stride_dbd = 1
 
-        # build dK/dV base ptr table (CPU to GPU)
-        H_n = len(ctx.head_cid_lists)
-        max_chunks = chunk_base_ptrs_k.shape[1]
-        dk_base = dk_scratch.data_ptr()
-        dv_base = dv_scratch.data_ptr()
-        dk_chunk_bytes = chunk_len * D * elem_fp32
-        base_dk_cpu = torch.zeros((H_n, max_chunks), dtype=torch.int64)
-        base_dv_cpu = torch.zeros_like(base_dk_cpu)
-        for h, cids in enumerate(ctx.head_cid_lists):
-            head_start = ctx.head_offsets[h]
-            for local_pos in range(len(cids)):
-                slot = head_start + local_pos
-                base_dk_cpu[h, local_pos] = dk_base + slot * dk_chunk_bytes
-                base_dv_cpu[h, local_pos] = dv_base + slot * dk_chunk_bytes
-        base_dk = base_dk_cpu.to(device, non_blocking=True)
-        base_dv = base_dv_cpu.to(device, non_blocking=True)
+        if backend == "cuda":
+            # This path only returns dQ (cached KV receive no gradient); the CUDA backward
+            # skips dK/dV entirely, so no fp32 scratch is allocated.
+            dk_scratch = dv_scratch = None
+            base_dk = torch.zeros((H_n, max_chunks), dtype=torch.int64, device=device)
+            base_dv = torch.zeros_like(base_dk)
+            compute_dkv = False
+            grad_buffers = ()
+        else:
+            # allocate fp32 dK/dV scratch buffers (same layout as K_gather)
+            dk_scratch = torch.zeros_like(K_gather, dtype=torch.float32)
+            dv_scratch = torch.zeros_like(V_gather, dtype=torch.float32)
+            dk_base = dk_scratch.data_ptr()
+            dv_base = dv_scratch.data_ptr()
+            dk_chunk_bytes = chunk_len * D * elem_fp32
+            base_dk_cpu = torch.zeros((H_n, max_chunks), dtype=torch.int64)
+            base_dv_cpu = torch.zeros_like(base_dk_cpu)
+            for h, cids in enumerate(ctx.head_cid_lists):
+                head_start = ctx.head_offsets[h]
+                for local_pos in range(len(cids)):
+                    slot = head_start + local_pos
+                    base_dk_cpu[h, local_pos] = dk_base + slot * dk_chunk_bytes
+                    base_dv_cpu[h, local_pos] = dv_base + slot * dk_chunk_bytes
+            base_dk = base_dk_cpu.to(device, non_blocking=True)
+            base_dv = base_dv_cpu.to(device, non_blocking=True)
+            compute_dkv = True
+            grad_buffers = (dk_scratch, dv_scratch)
 
-        dq, _ = selection_attention_padded_ptr_bwd(
+        dq, _ = launch_ptr_bwd(
+            backend=backend,
             q=q, out=out, lse=lse, d_out=d_out,
             block_indices=block_indices_remapped,
             ptr_table_k=ptr_table_k, ptr_table_v=ptr_table_v,
@@ -324,6 +319,9 @@ class _SelectionAttentionVarlenDense(torch.autograd.Function):
             in_chunk_block_bytes_dkv=in_chunk_block_bytes_dkv,
             softmax_scale=softmax_scale,
             input_precision=input_precision,
+            compute_dkv=compute_dkv,
+            owners=(K_gather, V_gather),
+            grad_buffers=grad_buffers,
         )
 
         # All non-q inputs are non-differentiable (non-grad tensors or non-Tensors)
@@ -356,8 +354,7 @@ def selection_attention_varlen_dense(
     softmax_scale: Optional[float] = None,
     input_precision: str = "tf32",
 ) -> torch.Tensor:
-    """Gather selected (h, cid) chunks, run padded_ptr Triton fwd/bwd, return per-query output.
-    For streaming trainer's LRU grad path; cache content is stable within one train_step."""
+    """Gather selected (h, cid) chunks, run the padded_ptr fwd/bwd, return per-query output."""
     blocks_per_chunk = chunk_len // block_size
 
     head_cid_lists, block_indices_remapped, head_offsets, n_chunks_per_head_list, n_total = \

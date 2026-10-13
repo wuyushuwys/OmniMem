@@ -5,11 +5,21 @@ stride_bn/bd in ELEMENTS (Triton scales by element size on typed ptrs).
 """
 from typing import List, Optional, Dict, Any
 from collections import defaultdict
-import torch
-import triton
 
-from .kernels.select_fwd import _sel_attn_fwd_padded_ptr_kernel, _compute_tile_n
+import torch
+
+from omnimem.nsa.backend import get_backend
+from ._dispatch import launch_ptr_fwd
 from .ptr_builder import build_ptr_table
+
+
+def _check_bf16_storage(k_t: torch.Tensor, v_t: torch.Tensor, h: int, idx: int) -> None:
+    """Refuse any storage dtype but bf16: the pointer kernels reinterpret raw addresses as bf16."""
+    if k_t.dtype != torch.bfloat16 or v_t.dtype != torch.bfloat16:
+        raise TypeError(
+            f"pointer selection attention requires bf16 K/V storage; "
+            f"k/v[{h}][{idx}] have {k_t.dtype}/{v_t.dtype}"
+        )
 
 
 def _compute_needed_bids_per_head(block_indices: torch.Tensor) -> List[List[int]]:
@@ -66,6 +76,7 @@ def _build_block_base_ptrs_block_level(
                         f"or pass strict=False to silently skip."
                     )
                 continue
+            _check_bf16_storage(k_t, v_t, h, bid)
             valid_bids.append(bid)
             k_ptrs.append(k_t.data_ptr())
             v_ptrs.append(v_t.data_ptr())
@@ -151,6 +162,7 @@ def _build_block_base_ptrs_chunk_level(
                         f"or pass strict=False to silently skip."
                     )
                 continue
+            _check_bf16_storage(k_chunk, v_chunk, h, cid)
             if sample is None:
                 sample = k_chunk
                 elem = sample.element_size()
@@ -408,6 +420,8 @@ def selection_attention_padded_ptr(
             return out, lse
         return out
 
+    # Capture the NSA backend once so the ptr build and the forward of ONE call agree.
+    backend = get_backend()
     ptr_table_k, ptr_table_v = build_ptr_table(
         block_indices=block_indices,
         block_base_ptrs_k=base_k,
@@ -416,6 +430,7 @@ def selection_attention_padded_ptr(
         batch_stride=batch_stride,
         blocks_per_chunk=blocks_per_chunk,
         in_chunk_block_bytes=in_chunk_block_bytes,
+        backend=backend,
     )
 
     sample = _find_sample_block(k_blocks, needed_bids_per_head, chunk_len, block_size)
@@ -427,35 +442,13 @@ def selection_attention_padded_ptr(
     stride_bn = sample.stride(1)   # token stride (elements)
     stride_bd = sample.stride(2)   # dim stride (elements, typically 1)
 
-    out = torch.empty_like(q)
-    lse = torch.empty(B, H, M, dtype=torch.float32, device=device) if return_lse else q
-
-    DP = max(16, triton.next_power_of_2(D))
-    PADDED_BLOCK_SIZE = max(16, triton.next_power_of_2(block_size))
-    PADDED_GROUP_SIZE = max(16, triton.next_power_of_2(G))
-    TILE_N = _compute_tile_n(block_size)
-
-    grid = (B, MG, H)
-
-    _sel_attn_fwd_padded_ptr_kernel[grid](
-        q, ptr_table_k, ptr_table_v, out, lse,
-        softmax_scale,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-        ptr_table_k.stride(0), ptr_table_k.stride(1),
-        ptr_table_k.stride(2), ptr_table_k.stride(3),
-        lse.stride(0) if return_lse else 0,
-        lse.stride(1) if return_lse else 0,
-        lse.stride(2) if return_lse else 0,
-        stride_bn, stride_bd,
-        H=H, M=M, D=D, T=T, DP=DP,
-        BLOCK_SIZE=block_size,
-        PADDED_BLOCK_SIZE=PADDED_BLOCK_SIZE,
-        GROUP_SIZE=G,
-        PADDED_GROUP_SIZE=PADDED_GROUP_SIZE,
-        TILE_N=TILE_N,
-        RETURN_LSE=return_lse,
-        INPUT_PRECISION=input_precision,
+    out, lse = launch_ptr_fwd(
+        q, ptr_table_k, ptr_table_v,
+        block_size=block_size, group_size=G,
+        stride_bn=stride_bn, stride_bd=stride_bd,
+        softmax_scale=softmax_scale, return_lse=return_lse,
+        input_precision=input_precision,
+        backend=backend,
     )
 
     if return_lse:
@@ -515,6 +508,9 @@ def selection_attention_padded_ptr_fast(
             chunk_base_ptrs_k, chunk_base_ptrs_v, kv_cache, layer_idx, device,
         )
 
+    # Capture the NSA backend once so the ptr build and the forward of ONE call agree
+    # even if the process default is switched concurrently (same rule as block_wrapper).
+    backend = get_backend()
     ptr_table_k, ptr_table_v = build_ptr_table(
         block_indices=block_indices,
         block_base_ptrs_k=chunk_base_ptrs_k,
@@ -523,6 +519,7 @@ def selection_attention_padded_ptr_fast(
         batch_stride=batch_stride_bytes,
         blocks_per_chunk=blocks_per_chunk,
         in_chunk_block_bytes=in_chunk_block_bytes,
+        backend=backend,
     )
 
     if kv_cache is not None and layer_idx is not None:
@@ -540,36 +537,16 @@ def selection_attention_padded_ptr_fast(
                 batch_stride=batch_stride_bytes,
                 blocks_per_chunk=blocks_per_chunk,
                 in_chunk_block_bytes=in_chunk_block_bytes,
+                backend=backend,
             )
 
-    out = torch.empty_like(q)
-    lse = torch.empty(B, H, M, dtype=torch.float32, device=device) if return_lse else q
-
-    DP = max(16, triton.next_power_of_2(D))
-    PADDED_BLOCK_SIZE = max(16, triton.next_power_of_2(block_size))
-    PADDED_GROUP_SIZE = max(16, triton.next_power_of_2(G))
-    TILE_N = _compute_tile_n(block_size)
-
-    grid = (B, MG, H)
-    _sel_attn_fwd_padded_ptr_kernel[grid](
-        q, ptr_table_k, ptr_table_v, out, lse,
-        softmax_scale,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-        ptr_table_k.stride(0), ptr_table_k.stride(1),
-        ptr_table_k.stride(2), ptr_table_k.stride(3),
-        lse.stride(0) if return_lse else 0,
-        lse.stride(1) if return_lse else 0,
-        lse.stride(2) if return_lse else 0,
-        stride_bn, stride_bd,
-        H=H, M=M, D=D, T=T, DP=DP,
-        BLOCK_SIZE=block_size,
-        PADDED_BLOCK_SIZE=PADDED_BLOCK_SIZE,
-        GROUP_SIZE=G,
-        PADDED_GROUP_SIZE=PADDED_GROUP_SIZE,
-        TILE_N=TILE_N,
-        RETURN_LSE=return_lse,
-        INPUT_PRECISION=input_precision,
+    out, lse = launch_ptr_fwd(
+        q, ptr_table_k, ptr_table_v,
+        block_size=block_size, group_size=G,
+        stride_bn=stride_bn, stride_bd=stride_bd,
+        softmax_scale=softmax_scale, return_lse=return_lse,
+        input_precision=input_precision,
+        backend=backend,
     )
 
     if return_lse:

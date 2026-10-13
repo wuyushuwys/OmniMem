@@ -7,10 +7,10 @@ Training assumes all chunks are GPU-resident.
 from typing import Dict, Any, List, Optional, Tuple
 
 import torch
-import triton
 
-from .kernels.select_fwd import _sel_attn_fwd_padded_ptr_kernel, _compute_tile_n
-from .kernels.select_bwd import selection_attention_padded_ptr_bwd
+from omnimem.nsa.backend import get_backend
+
+from ._dispatch import launch_ptr_fwd, launch_ptr_bwd
 from .ptr_builder import build_ptr_table
 from .wrapper import (
     _compute_needed_bids_per_head,
@@ -42,10 +42,8 @@ class _SelectionAttentionPaddedPtr(torch.autograd.Function):
         ctx,
         q,               # [B, M, H, D] bf16
         block_indices,   # [B, MG, H, T] int32
-        chunk_base_ptrs_k,   # [H, max_chunks] int64
-        chunk_base_ptrs_v,   # [H, max_chunks] int64
         n_chunks_per_head,   # [H] int32
-        meta,                # dict: kernel params + strides
+        meta,                # dict: kernel params + strides + max_chunks
         *chunks,             # (k_flat..., v_flat...) head-major bf16 tensors
     ):
         block_size = meta['block_size']
@@ -70,11 +68,10 @@ class _SelectionAttentionPaddedPtr(torch.autograd.Function):
 
         n_global_blocks = n_chunks_per_head * blocks_per_chunk
 
-        # Rebuild from live `chunks` refs (race-free) rather than trust the cache's async H2D ptr table.
-        # MMCache uses a shared pinned buffer; a subsequent CPU write can overwrite in-flight H2D data.
+        # Base tables come from this call's chunks, not the cache, which later writes rewrite.
         n_chunks_per_head_list = meta['n_chunks_per_head_list']
         n_total_k = sum(n_chunks_per_head_list)
-        max_n_chunks = chunk_base_ptrs_k.shape[1]
+        max_n_chunks = meta['max_chunks']
         chunk_base_ptrs_k = _build_scratch_base_ptrs(
             chunks[:n_total_k], n_chunks_per_head_list, max_n_chunks, device,
         )
@@ -82,6 +79,9 @@ class _SelectionAttentionPaddedPtr(torch.autograd.Function):
             chunks[n_total_k:], n_chunks_per_head_list, max_n_chunks, device,
         )
 
+        # Backend captured here, for the ptr build and the forward of this call, and
+        # reused by backward (never re-read from the environment).
+        backend = get_backend()
         ptr_table_k, ptr_table_v = build_ptr_table(
             block_indices=block_indices,
             block_base_ptrs_k=chunk_base_ptrs_k,
@@ -90,37 +90,20 @@ class _SelectionAttentionPaddedPtr(torch.autograd.Function):
             batch_stride=batch_stride_bytes,
             blocks_per_chunk=blocks_per_chunk,
             in_chunk_block_bytes=in_chunk_block_bytes,
+            backend=backend,
         )
 
-        out = torch.empty_like(q)
-        lse = torch.empty(B, H, M, dtype=torch.float32, device=device)
-
-        DP = max(16, triton.next_power_of_2(D))
-        PADDED_BLOCK_SIZE = max(16, triton.next_power_of_2(block_size))
-        PADDED_GROUP_SIZE = max(16, triton.next_power_of_2(G))
-        TILE_N = _compute_tile_n(block_size)
-
-        _sel_attn_fwd_padded_ptr_kernel[(B, MG, H)](
-            q, ptr_table_k, ptr_table_v, out, lse,
-            softmax_scale,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-            ptr_table_k.stride(0), ptr_table_k.stride(1),
-            ptr_table_k.stride(2), ptr_table_k.stride(3),
-            lse.stride(0), lse.stride(1), lse.stride(2),
-            stride_bn, stride_bd,
-            H=H, M=M, D=D, T=T, DP=DP,
-            BLOCK_SIZE=block_size,
-            PADDED_BLOCK_SIZE=PADDED_BLOCK_SIZE,
-            GROUP_SIZE=G,
-            PADDED_GROUP_SIZE=PADDED_GROUP_SIZE,
-            TILE_N=TILE_N,
-            RETURN_LSE=True,
-            INPUT_PRECISION=input_precision,
+        out, lse = launch_ptr_fwd(
+            q, ptr_table_k, ptr_table_v,
+            block_size=block_size, group_size=G,
+            stride_bn=stride_bn, stride_bd=stride_bd,
+            softmax_scale=softmax_scale, return_lse=True,
+            input_precision=input_precision,
+            owners=chunks, backend=backend,
         )
 
-        # chunk_base_ptrs_{k,v} are the rebuilt (private) ones; n_chunks_per_head cloned to avoid
-        # autograd version check failing (cache mutates it via clamp_min_ in update_cache).
+        # n_chunks_per_head is cloned to avoid autograd's version check failing (the cache
+        # mutates it via clamp_min_ in update_cache).
         ctx.save_for_backward(
             q, out, lse, block_indices,
             ptr_table_k, ptr_table_v,
@@ -129,6 +112,7 @@ class _SelectionAttentionPaddedPtr(torch.autograd.Function):
             *chunks,
         )
         ctx.meta = meta
+        ctx.backend = backend
 
         return out
 
@@ -183,7 +167,8 @@ class _SelectionAttentionPaddedPtr(torch.autograd.Function):
         stride_dbn = dk_sample.stride(1)   # elements
         stride_dbd = dk_sample.stride(2)   # elements
 
-        dq, _ = selection_attention_padded_ptr_bwd(
+        dq, _ = launch_ptr_bwd(
+            backend=ctx.backend,
             q=q, out=out, lse=lse, d_out=d_out,
             block_indices=block_indices,
             ptr_table_k=ptr_table_k, ptr_table_v=ptr_table_v,
@@ -205,12 +190,15 @@ class _SelectionAttentionPaddedPtr(torch.autograd.Function):
             in_chunk_block_bytes_dkv=in_chunk_block_bytes_dkv,
             softmax_scale=softmax_scale,
             input_precision=input_precision,
+            compute_dkv=True,
+            owners=chunks,
+            grad_buffers=tuple(dk_scratch) + tuple(dv_scratch),
         )
 
         dk_out = tuple(dk.to(k_chunks[i].dtype) for i, dk in enumerate(dk_scratch))
         dv_out = tuple(dv.to(v_chunks[i].dtype) for i, dv in enumerate(dv_scratch))
 
-        return (dq, None, None, None, None, None, *dk_out, *dv_out)
+        return (dq, None, None, None, *dk_out, *dv_out)
 
 
 def selection_attention_padded_ptr_train_fast(
@@ -219,8 +207,7 @@ def selection_attention_padded_ptr_train_fast(
     block_size: int,
     group_size: int,
     chunk_len: int,
-    chunk_base_ptrs_k: torch.Tensor,
-    chunk_base_ptrs_v: torch.Tensor,
+    max_chunks: int,
     n_chunks_per_head: torch.Tensor,
     chunk_strides: Dict[str, Any],
     k_chunks_flat: Tuple[torch.Tensor, ...],
@@ -229,8 +216,7 @@ def selection_attention_padded_ptr_train_fast(
     softmax_scale: Optional[float] = None,
     input_precision: str = "tf32",
 ) -> torch.Tensor:
-    """Training forward; gradients flow to q and each k/v_chunks_flat tensor.
-    Caller must ensure k_chunks_flat[flat_idx].data_ptr() == chunk_base_ptrs_k[h, cid]."""
+    """Training forward; gradients flow to q and each k/v_chunks_flat tensor."""
     B, M, H, D = q.shape
     if softmax_scale is None:
         softmax_scale = D ** -0.5
@@ -246,12 +232,11 @@ def selection_attention_padded_ptr_train_fast(
         'input_precision':       input_precision,
         'blocks_per_chunk':      blocks_per_chunk,
         'n_chunks_per_head_list': n_chunks_per_head_list,
+        'max_chunks':            int(max_chunks),
     }
 
     return _SelectionAttentionPaddedPtr.apply(
-        q, block_indices,
-        chunk_base_ptrs_k, chunk_base_ptrs_v, n_chunks_per_head,
-        meta,
+        q, block_indices, n_chunks_per_head, meta,
         *k_chunks_flat, *v_chunks_flat,
     )
 
@@ -305,8 +290,7 @@ def selection_attention_padded_ptr_train(
         block_size=block_size,
         group_size=group_size,
         chunk_len=chunk_len,
-        chunk_base_ptrs_k=base_k,
-        chunk_base_ptrs_v=base_v,
+        max_chunks=base_k.shape[1],
         n_chunks_per_head=n_chunks_per_head,
         chunk_strides=chunk_strides,
         k_chunks_flat=k_flat,
