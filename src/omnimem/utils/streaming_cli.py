@@ -87,12 +87,9 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     p.add_argument("--nframes", type=int, default=969,
                    help="requested frames; actual = 1 + 4 * ((nframes - 1) // 4)")
     p.add_argument("--fps", type=int, default=16)
-    p.add_argument("--cfg", type=float, default=1.0, help="must be 1 for this entry point")
     p.add_argument("--num_inference_steps", type=int, default=4)
     p.add_argument("--shift", type=float, default=5.0)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--n_prompt", default=None,
-                   help="negative prompt (unused with CFG=1, kept for parity)")
     # causal / NSA runtime
     p.add_argument("--nsa_backend", default=None, choices=["triton", "cuda"],
                    help="kernel backend, triton or cuda (unset: $OMNIMEM_NSA_BACKEND, else triton)")
@@ -166,7 +163,7 @@ def run(args, dit_device, decode_device=None, **tier) -> int:
     # Imported after the NUMA binding, so that the threads torch starts inherit it.
     from omnimem.pipelines.compile_state import filter_expected_dynamo_warnings
     from omnimem.pipelines.streaming_inference import (
-        DEFAULT_PROMPT, NEG_PROMPT, ModelPaths, Recipe, StreamingRuntime, git_info,
+        DEFAULT_PROMPT, ModelPaths, Recipe, StreamingRuntime, git_info,
         validate_request, actual_frames, check_output_target, check_layout)
 
     # Everything that can be refused without the weights is refused here, before the
@@ -182,7 +179,7 @@ def run(args, dit_device, decode_device=None, **tier) -> int:
         else:
             requests = load_prompt_file(args.prompt_file)
         for _, _, switch_prompts, switch_frame_indices in requests:
-            validate_request(args.nframes, args.frame_per_block, args.cfg,
+            validate_request(args.nframes, args.frame_per_block,
                              switch_prompts=switch_prompts,
                              switch_frame_indices=switch_frame_indices,
                              queue_depth=args.queue_depth)
@@ -196,12 +193,12 @@ def run(args, dit_device, decode_device=None, **tier) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    recipe = Recipe(height=args.height, width=args.width, fps=args.fps, cfg=args.cfg,
+    recipe = Recipe(height=args.height, width=args.width, fps=args.fps,
                     num_inference_steps=args.num_inference_steps, shift=args.shift,
                     frame_per_block=args.frame_per_block, window_size=args.window_size,
                     sink_size=args.sink_size, enable_kv_evict=args.enable_kv_evict,
                     lru_max_size=args.lru_max_size,
-                    n_prompt=args.n_prompt or NEG_PROMPT, compile=not args.no_compile,
+                    compile=not args.no_compile,
                     compile_mode=args.compile_mode, crf=args.crf, preset=args.preset,
                     slice_last_frames=args.slice_last_frames, recache_mode=args.recache_mode,
                     park_t5=args.park_t5,

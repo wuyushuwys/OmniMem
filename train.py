@@ -6,7 +6,6 @@ import wandb
 from omegaconf import OmegaConf
 import torch.distributed as dist
 from omnimem.trainer import TRAINER_CLS
-from omnimem.utils.cuda_resume_diagnostics import enable_cuda_resume_diagnostics
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -31,7 +30,6 @@ if __name__ == "__main__":
         if args.evaluate:
             trainer.evaluate()
         else:
-            enable_cuda_resume_diagnostics(trainer)
             trainer.train()
     except Exception as e:
         trainer.logger.error(e, exc_info=True)

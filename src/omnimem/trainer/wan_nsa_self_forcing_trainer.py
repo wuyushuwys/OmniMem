@@ -30,7 +30,6 @@ from omnimem.evaluate import evaluation_wan
 
 
 class WanNSASelfForcingTrainer(SelfForcingCheckpointMixin, WanSelfForcingTrainer):
-    _supports_complete_sf_resume = True
     generator: CausalWanNSAModel
 
     ema: Union[None, CausalWanNSAModel] = None
@@ -41,8 +40,7 @@ class WanNSASelfForcingTrainer(SelfForcingCheckpointMixin, WanSelfForcingTrainer
     def __init__(self, config):
         self.config = config
         self.complete_sf_resume = self._get_and_record("complete_sf_resume", False)
-        if self.complete_sf_resume and (not type(self).__dict__.get("_supports_complete_sf_resume", False)
-                                        or config.get("adapter")):
+        if self.complete_sf_resume and config.get("adapter"):
             raise ValueError("complete_sf_resume requires a supported full-parameter NSA self-forcing trainer")
         if self.complete_sf_resume and config.get("dataset_type") != "text_dataset":
             raise ValueError("Complete SF data resume requires the deterministic text_dataset")

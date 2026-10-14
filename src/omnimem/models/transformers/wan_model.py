@@ -15,9 +15,6 @@ __all__ = [
     'rope_apply',
     'build_rope_table',
     'build_rope_table_uncached',
-    'set_rope_table_cache',
-    'clear_rope_table_cache',
-    'get_rope_table_cache_stats',
     'sinusoidal_embedding_1d',
     'WanSelfAttention',
     'WanCrossAttention',
@@ -51,7 +48,6 @@ def rope_params(max_seq_len, dim, theta=10000):
 # RoPE frequency table is memoised per (dim, num_heads, device) so caches can key on identity.
 _ROPE_TABLE_CACHE = {}
 _ROPE_TABLE_CACHE_ENABLED = True
-_ROPE_TABLE_CACHE_STATS = {'hits': 0, 'misses': 0}
 
 
 def _normalized_device_key(device):
@@ -77,9 +73,7 @@ def build_rope_table(dim: int, num_heads: int, device) -> torch.Tensor:
     key = (int(dim), int(num_heads)) + _normalized_device_key(device)
     cached = _ROPE_TABLE_CACHE.get(key)
     if cached is not None:
-        _ROPE_TABLE_CACHE_STATS['hits'] += 1
         return cached
-    _ROPE_TABLE_CACHE_STATS['misses'] += 1
     table = build_rope_table_uncached(dim, num_heads, device)
     _ROPE_TABLE_CACHE[key] = table
     return table
@@ -126,25 +120,6 @@ def patch_embed_linear(conv, x):
              .reshape(b * nf * nh * nw, c * pf * ph * pw))
     out = F.linear(cols, conv.weight.reshape(conv.out_channels, -1), conv.bias)
     return out.view(b, nf, nh, nw, conv.out_channels).permute(0, 4, 1, 2, 3).contiguous()
-
-
-def set_rope_table_cache(enabled: bool) -> bool:
-    """Enable/disable RoPE table memoisation.  Returns the previous state."""
-    global _ROPE_TABLE_CACHE_ENABLED
-    previous = _ROPE_TABLE_CACHE_ENABLED
-    _ROPE_TABLE_CACHE_ENABLED = bool(enabled)
-    if not _ROPE_TABLE_CACHE_ENABLED:
-        clear_rope_table_cache()
-    return previous
-
-
-def clear_rope_table_cache() -> None:
-    _ROPE_TABLE_CACHE.clear()
-
-
-def get_rope_table_cache_stats() -> dict:
-    return dict(_ROPE_TABLE_CACHE_STATS, entries=len(_ROPE_TABLE_CACHE),
-                enabled=_ROPE_TABLE_CACHE_ENABLED)
 
 
 # rope_tail / rope_finish skip the empty-tail cat; the cat stays while grads reach x.

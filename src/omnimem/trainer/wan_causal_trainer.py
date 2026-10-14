@@ -1,4 +1,3 @@
-import os
 import math
 import wandb
 
@@ -18,14 +17,11 @@ from omnimem.schedulers import RectifiedFlowScheduler
 from omnimem.utils.torch_utils import (
     get_fsdp_state_dict, 
     load_and_broadcast_diffuser, 
-    resume_model, 
-    save_sharded_safetensors,
     update_ema_fsdp,
     )
 from omnimem.utils.meter import TimerMeter
 from omnimem.evaluate import evaluation_wan
 from omnimem.utils.misc import (
-    is_main_process,
     wait_for_everyone,
     reduce_dict,
     unwrap_model,

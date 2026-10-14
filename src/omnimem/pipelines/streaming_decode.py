@@ -7,7 +7,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 import torch
@@ -44,38 +44,22 @@ class LatentChunk:
     """One finished latent chunk: an owned snapshot plus a ``ready_event`` to wait on."""
 
     chunk_index: int
-    frame_start: int
-    frame_end: int
     latent: torch.Tensor
     ready_event: Optional[torch.cuda.Event]
-    is_last: bool
     submit_time: float
-    video_id: int = 0
-
-    @property
-    def num_latent_frames(self) -> int:
-        return self.frame_end - self.frame_start
 
 
 @dataclass
 class LatentGenerationOutput:
     """Result of ``generate(..., return_latents=True)`` (no VAE decode performed)."""
 
-    latents: torch.Tensor
-    num_latent_frames: int
-    requested_frames: int
-    actual_frames: int
-    denoise_seconds: float
     num_chunks: int
 
 
 @dataclass
 class DecodedChunk:
     chunk_index: int
-    frame_start: int
     frames: torch.Tensor  # CPU uint8 [T, H, W, 3]
-    decode_done_time: float
-    d2h_done_time: float
     release: Optional[Callable[[], None]] = None
 
 
@@ -108,26 +92,21 @@ class WanChunkDecoder:
     """Request-scoped stateful decode of consecutive latent chunks with the Wan VAE."""
 
     def __init__(self, vae, device: torch.device, autocast_dtype: torch.dtype = torch.bfloat16,
-                 fast: Optional[bool] = False, **fast_opts):
+                 fast: Optional[bool] = False):
         self.vae = vae
         self.device = indexed_device(device)
         self.autocast_dtype = autocast_dtype
         self.fast = None if fast is None else bool(fast)
-        # Forwarded verbatim to ``AutoencoderKLWan.enable_fast_decode``, which validates
-        # the names (channels_last / group_temporal / upsample_bf16 / fuse_norm).
-        self.fast_opts = dict(fast_opts)
         self._latents_mean: Optional[torch.Tensor] = None
         self._latents_std: Optional[torch.Tensor] = None
         self.started = False
-        self.latent_frames_seen = 0
-        self.chunks_seen = 0
 
     def start(self) -> None:
         vae = self.vae
         assert vae.device == self.device, f"VAE is on {vae.device}, session expects {self.device}"
         if self.fast is not None:
             if hasattr(vae, "enable_fast_decode"):
-                vae.enable_fast_decode(self.fast, **self.fast_opts)
+                vae.enable_fast_decode(self.fast)
                 if self.device.type == "cuda":
                     # Re-laid weights must be final before start returns.
                     torch.cuda.current_stream(self.device).synchronize()
@@ -140,8 +119,6 @@ class WanChunkDecoder:
         self._latents_std = torch.tensor(
             vae.config.latents_std, device=vae.device, dtype=vae.dtype).reshape(1, -1, 1, 1, 1)
         self.started = True
-        self.latent_frames_seen = 0
-        self.chunks_seen = 0
 
     def decode(self, z_normalized: torch.Tensor) -> torch.Tensor:
         """``[1, C, f, h, w]`` normalised latents -> ``[1, 3, T, H, W]`` in [-1, 1]."""
@@ -150,8 +127,6 @@ class WanChunkDecoder:
         z = z_normalized * self._latents_std + self._latents_mean
         with torch.autocast("cuda", dtype=self.autocast_dtype):
             out = self.vae.streaming_decode(z).sample
-        self.latent_frames_seen += z.shape[2]
-        self.chunks_seen += 1
         return out
 
     def finish(self) -> None:
@@ -301,13 +276,11 @@ def decoder_thread_streams(decode_device, dit_device) -> Tuple[torch.cuda.Stream
 @dataclass
 class SessionResult:
     frames_delivered: int
-    chunks: int
     sink_result: Any
     timeline: Dict[str, Any]
     chunk_records: List[Dict[str, float]]
     queue_stats: Dict[str, Dict[str, float]]
     d2h_pool_bytes: int
-    extra: Dict[str, Any] = field(default_factory=dict)
 
 
 class StreamingSession:
@@ -315,11 +288,10 @@ class StreamingSession:
 
     def __init__(self, *, decoder, decode_device, dit_device, sink: FrameSink,
                  frame_hw, max_frames_per_chunk: int, queue_depth: int = 2,
-                 d2h_slots: Optional[int] = None,
                  decoder_streams: Optional[Tuple[torch.cuda.Stream, torch.cuda.Stream]] = None,
                  put_timeout: float = 900.0, get_timeout: float = 900.0,
                  join_timeout: float = 900.0, marks: Optional[StageMarks] = None,
-                 video_id: int = 0, autocast_dtype: torch.dtype = torch.bfloat16):
+                 autocast_dtype: torch.dtype = torch.bfloat16):
         self.decoder = decoder
         self.decode_device = indexed_device(decode_device)
         self.dit_device = indexed_device(dit_device)
@@ -343,13 +315,12 @@ class StreamingSession:
         self.get_timeout = get_timeout
         self.join_timeout = join_timeout
         self.marks = marks
-        self.video_id = video_id
         self.autocast_dtype = autocast_dtype
 
         self._failure = _FailureState()
         self._latent_q = _BoundedQueue("latent_queue", self.queue_depth, self._failure)
         self._frame_q = _BoundedQueue("frame_queue", self.queue_depth, self._failure)
-        n_slots = d2h_slots if d2h_slots is not None else self.queue_depth + 2
+        n_slots = self.queue_depth + 2
         self._pool = _PinnedSlotPool(
             n_slots, (self.max_frames_per_chunk, *self.frame_hw, 3), torch.uint8, self._failure)
         self._decoder_thread: Optional[threading.Thread] = None
@@ -378,13 +349,6 @@ class StreamingSession:
         with self._records_lock:
             self._chunk_records.setdefault(idx, {"chunk_index": idx}).update(kv)
 
-    @property
-    def failed(self) -> bool:
-        return self._failure.failed
-
-    def check(self) -> None:
-        self._failure.check()
-
     # ------------------------------------------------------------------ lifecycle
     def start(self, ready_timeout: float = 120.0) -> None:
         assert not self._started, "session already started"
@@ -410,7 +374,6 @@ class StreamingSession:
                 self._failure.fail("start", exc)
             self._abort_workers()
             self._failure.check()
-            raise
         self._timeline["workers_ready"] = time.monotonic()
 
     def submit(self, chunk: LatentChunk) -> None:
@@ -432,7 +395,6 @@ class StreamingSession:
             if isinstance(exc, SessionError):
                 raise
             self._failure.check()
-            raise
 
     def finish(self) -> SessionResult:
         """Send EOS, drain both workers, finalise the sink.  Raises SessionError on failure."""
@@ -460,7 +422,6 @@ class StreamingSession:
         records = [self._chunk_records[k] for k in sorted(self._chunk_records)]
         return SessionResult(
             frames_delivered=self._frames_delivered,
-            chunks=len(records),
             sink_result=self._sink_result,
             timeline=dict(self._timeline),
             chunk_records=records,
@@ -568,8 +529,7 @@ class StreamingSession:
         del u8
         self._record(idx, decode_done=t_dec, d2h_done=t_d2h, frames=float(dst.shape[0]))
         pool = self._pool
-        item = DecodedChunk(chunk_index=idx, frame_start=-1, frames=dst,
-                            decode_done_time=t_dec, d2h_done_time=t_d2h,
+        item = DecodedChunk(chunk_index=idx, frames=dst,
                             release=lambda s=slot: pool.release(s))
         self._frame_q.put(item, self.put_timeout)
 

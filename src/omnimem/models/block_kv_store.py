@@ -19,14 +19,13 @@ from omnimem.nsa.ops.selection.padded_ptr.kernels.block_kv_kernels import (
 )
 
 __all__ = ["BlockKVStore", "BlockSelectionLease", "fresh_block_stats",
-           "BLOCK_STAT_KEYS", "fresh_per_layer_stats", "PER_LAYER_STAT_KEYS"]
+           "fresh_per_layer_stats", "PER_LAYER_STAT_KEYS"]
 
 
 # ``k``/``v`` are the store's internal names; ``k_cache``/``v_cache`` are MMCache's.
 NAMES: Tuple[str, str] = ("k", "v")
 CACHE_NAME: Dict[str, str] = {"k": "k_cache", "v": "v_cache"}
 STORE_NAME: Dict[str, str] = {"k_cache": "k", "v_cache": "v"}
-_ROW: Dict[str, int] = {"k": 0, "v": 1}
 
 _EMPTY_I64 = np.empty(0, dtype=np.int64)
 _EMPTY_I32 = np.empty(0, dtype=np.int32)
@@ -57,8 +56,6 @@ def fresh_block_stats() -> Dict[str, float]:
         host_backing_bytes=0,
     )
 
-
-BLOCK_STAT_KEYS: Tuple[str, ...] = tuple(sorted(fresh_block_stats()))
 
 # Per-layer counters; an eviction is charged to the layer that caused it and lost the slot.
 PER_LAYER_STAT_KEYS: Tuple[str, ...] = (
@@ -99,8 +96,6 @@ class BlockKVStore:
     def __init__(self, *, layers: Sequence[int], num_heads: int, block_tokens: int,
                  head_dim: int, chunk_len: int, max_chunks: int, batch: int,
                  device, dtype, persistent_bytes: int, scratch_bytes: int,
-                 ring_slots: int = 8, ring_capacity: int = 4096,
-                 fused_gather: bool = True,
                  resident_if_fits: bool = True, history_bytes: int = 0,
                  dedup: str = 'device',
                  block_kv_backend: str | None = None):
@@ -113,7 +108,7 @@ class BlockKVStore:
         self.block_tokens = self.bt = int(block_tokens)
         self.head_dim = self.D = int(head_dim)
         self.chunk_len = self.S_max = int(chunk_len)
-        self.max_chunks = self.MC = int(max_chunks)
+        self.MC = int(max_chunks)
         self.batch = self.B = int(batch)
         if self.B != 1:
             raise ValueError(f"the block KV store requires batch size 1, got {self.B}")
@@ -121,8 +116,8 @@ class BlockKVStore:
             raise ValueError(
                 f"chunk length {self.S_max} must be a positive multiple of "
                 f"kv_block_size {self.bt}")
-        self.blocks_per_chunk = self.bpc = self.S_max // self.bt
-        self.max_blocks = self.MB = self.MC * self.bpc
+        self.bpc = self.S_max // self.bt
+        self.MB = self.MC * self.bpc
         if self.MB <= 0:
             raise ValueError("the block KV store needs a positive block count")
 
@@ -134,8 +129,6 @@ class BlockKVStore:
                 f"the block KV store supports 16-bit KV dtypes only, got {dtype}")
         self.block_bytes = self.bt * self.D * self.elem
         self.host_head_stride = self.B * self.S_max * self.D * self.elem
-        # ``False`` issues the table clears as a separate K1 launch before gather+publish.
-        self.fused_gather = bool(fused_gather)
         #: Request generation; bumped by every ``reset()``.
         self.generation = 0
 
@@ -208,7 +201,7 @@ class BlockKVStore:
         self._mask_a = np.empty(max(1, self.C), dtype=bool)
         self._mask_b = np.empty(max(1, self.C), dtype=bool)
 
-        self._ring = _PtrStagingRing(int(ring_slots), int(ring_capacity))
+        self._ring = _PtrStagingRing()
         # Keyed deferred clears: parallel (layer, name_row, key) arrays.
         self._pc_layer: np.ndarray = _EMPTY_I32
         self._pc_row: np.ndarray = _EMPTY_I8
@@ -266,16 +259,8 @@ class BlockKVStore:
         self._n_valid_val[L] = 0
         self._host_active[L] = False
 
-    def key_of(self, h, bid):
-        """``key = (cid * H + h) * bpc + loc`` where ``cid, loc = divmod(bid, bpc)``."""
-        h = np.asarray(h, dtype=np.int64)
-        bid = np.asarray(bid, dtype=np.int64)
-        cid, loc = np.divmod(bid, self.bpc)
-        out = (cid * self.H + h) * self.bpc + loc
-        return out if out.ndim else int(out)
-
     def decode_key(self, keys):
-        """Inverse of :meth:`key_of`: ``keys -> (h, cid, loc, bid)`` as int64 arrays."""
+        """``keys = (cid * H + h) * bpc + loc`` -> ``(h, cid, loc, bid)`` as int64 arrays."""
         keys = np.asarray(keys, dtype=np.int64)
         rest = keys // self.bpc
         loc = keys - rest * self.bpc
@@ -335,7 +320,6 @@ class BlockKVStore:
                                 if self._dedup is not None else 0),
             max_blocks=self.MB,
             block_bytes=self.block_bytes,
-            fused_gather=bool(self.fused_gather),
             generation=self.generation,
         )
 
@@ -529,10 +513,6 @@ class BlockKVStore:
                 f"(n_fetch={n_fetch}, n_clear={n_clear})")
         # The previous call's kernels may still read the buffer and slots written below.
         self._wait_prev_consumer()
-        if not self.fused_gather and n_fetch and n_clear:
-            self._stage_one((), 0, clear)
-            self._stage_one(rows, n_fetch, _EMPTY_I64)
-            return
         self._stage_one(rows, n_fetch, clear)
 
     def _stage_one(self, rows: Sequence[np.ndarray], n_fetch: int,
@@ -1410,89 +1390,6 @@ class BlockKVStore:
                 self._clear_range(L, lo, nb, which=n)
         if nb < self.bpc:
             self._clear_range(L, lo + nb, self.bpc - nb)
-
-    def check_table(self, layer_idx: int,
-                    block_indices: Optional[torch.Tensor] = None,
-                    cache=None) -> List[str]:
-        """Compare the device table against the CPU truth; synchronises, diagnostic only."""
-        L = layer_idx
-        # Two reads on purpose: ``live`` is the table the kernel used, ``got`` is after the clears.
-        torch.cuda.synchronize(self.device)
-        live = self.table[L].detach().cpu().numpy()
-        self.flush_pending_clears()
-        torch.cuda.synchronize(self.device)
-        got = self.table[L].detach().cpu().numpy()
-        nvg = self.n_valid[L].detach().cpu().numpy()
-        problems: List[str] = []
-        nvv = self._n_valid_val[L]
-        if not np.all(nvg == nvv):
-            problems.append(f"n_valid {nvg.tolist()} != {nvv}")
-
-        truth = np.zeros((2, self.H, self.MB), dtype=np.int64)
-        h_ar = np.arange(self.H, dtype=np.int64)[:, None]
-        for cid in range(self.MC):
-            nb = int(self.nblk[L][cid])
-            if nb <= 0:
-                continue
-            j = np.arange(nb, dtype=np.int64)[None, :]
-            lo = cid * self.bpc
-            for n in NAMES:
-                t = self.gpu_chunk[L][n][cid]
-                if self.prot[L][n][cid] and t is not None:
-                    truth[_ROW[n], :, lo:lo + nb] = (
-                        t.data_ptr() + h_ar * (t.stride(0) * self.elem)
-                        + j * self.block_bytes)
-        # ``pslot`` is key-indexed; (h, bid) comes from ``decode_key``.
-        pooled_keys = np.flatnonzero(self.pslot[L] >= 0)
-        if pooled_keys.size:
-            slots = self.pslot[L][pooled_keys].astype(np.int64)
-            hh, _pc, _pl, bb = self.decode_key(pooled_keys)
-            pool_k_ptr, pool_v_ptr = self._pool_ptr[L]
-            if np.any(truth[0, hh, bb] != 0) or np.any(truth[1, hh, bb] != 0):
-                problems.append("invariant 1 broken: a protected cid has pooled keys")
-            if not np.array_equal(self.slot_key[L][slots], pooled_keys):
-                problems.append(
-                    "invariant 2 broken: pslot -> slot_key is not the identity")
-            truth[0, hh, bb] = pool_k_ptr + slots * self.block_bytes
-            truth[1, hh, bb] = pool_v_ptr + slots * self.block_bytes
-
-        bad = np.nonzero(got != truth)
-        for i in range(min(12, bad[0].size)):
-            r, hh, bb = (int(bad[0][i]), int(bad[1][i]), int(bad[2][i]))
-            problems.append(
-                f"table[{NAMES[r]}, h={hh}, bid={bb}] = {int(got[r, hh, bb])} "
-                f"!= truth {int(truth[r, hh, bb])}")
-        if bad[0].size > 12:
-            problems.append(f"... (+{bad[0].size - 12} more table mismatches)")
-
-        if cache is not None:
-            for n in NAMES:
-                cname = CACHE_NAME[n]
-                chunks = cache.cache.get(L, {}).get(cname) or []
-                for h in range(min(self.H, len(chunks))):
-                    for cid in range(len(chunks[h])):
-                        want = cache.chunk_version(L, cname, h, cid)
-                        if int(self.cver[L][n][h, cid]) != int(want):
-                            problems.append(
-                                f"cver[{n}][h={h}, cid={cid}] = "
-                                f"{int(self.cver[L][n][h, cid])} != MMCache {want}")
-                            break
-
-        if block_indices is not None:
-            ids = block_indices.detach().cpu().numpy().reshape(
-                -1, int(block_indices.shape[2]), int(block_indices.shape[3]))
-            for hh in range(self.H):
-                sel = np.unique(ids[:, hh, :])
-                sel = sel[(sel >= 0) & (sel < nvv)]
-                for bb in sel.tolist():
-                    cid, loc = divmod(int(bb), self.bpc)
-                    if loc >= int(self.nblk[L][cid]):
-                        continue
-                    if live[0, hh, bb] == 0 or live[1, hh, bb] == 0:
-                        problems.append(
-                            f"selected (h={hh}, bid={int(bb)}) was not readable "
-                            f"(K={int(live[0, hh, bb])}, V={int(live[1, hh, bb])})")
-        return problems
 
     def block_hit_rate(self) -> float:
         """``(protected + persistent) / selected_unique`` over non-fast-path calls."""

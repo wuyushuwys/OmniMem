@@ -774,11 +774,8 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
                             marks.mark("latent.submitted", chunk=start_frame // frame_per_block)
                         on_latent_chunk(LatentChunk(
                             chunk_index=start_frame // frame_per_block,
-                            frame_start=start_frame,
-                            frame_end=chunk_end,
                             latent=snapshot,
                             ready_event=ready_event,
-                            is_last=chunk_end >= num_frames,
                             submit_time=time.monotonic(),
                         ))
 
@@ -856,11 +853,6 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
             if return_latents:
                 # Latent-only contract: no decode, no extra copy of the latent buffer.
                 return LatentGenerationOutput(
-                    latents=latents,
-                    num_latent_frames=num_frames,
-                    requested_frames=frame_num,
-                    actual_frames=1 + self.vae_stride[0] * (num_frames - 1),
-                    denoise_seconds=t,
                     num_chunks=math.ceil(num_frames / frame_per_block),
                 )
             if offload_model:

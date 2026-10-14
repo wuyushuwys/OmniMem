@@ -310,7 +310,6 @@ class WanODETrainer(BaseWanTrainer):
             staging, self.model, self.optimizer, self.lr_scheduler, self.global_step,
             extra_state={
                 "scheduler_config": self._scheduler_config(),
-                "data_resume_policy": "resample_stream",
             },
         )
         world_size = dist.get_world_size() if dist.is_initialized() else 1

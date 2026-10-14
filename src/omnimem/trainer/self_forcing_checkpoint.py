@@ -326,7 +326,7 @@ class SelfForcingCheckpointMixin(CausalCheckpointMixin):
             self._checkpoint_rank0_call(save_weights)
             del state
         extra = {"trainer_family": self._sf_trainer_family, "training_config": self._training_config(),
-                 "ema_active": self.ema is not None, "data_resume_policy": "deterministic_epoch_cursor",
+                 "ema_active": self.ema is not None,
                  "data_cursor": self._sf_data_cursor.copy()}
         self.logger.info(f"SF checkpoint step {self.global_step}: saving generator optimizer/scheduler/RNG state.")
         save_training_state(staging, self.generator, self.generator_optimizer, self.generator_lr_scheduler,

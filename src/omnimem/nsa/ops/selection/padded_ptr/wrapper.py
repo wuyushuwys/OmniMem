@@ -297,8 +297,6 @@ def _touch_lru_and_detect_missing(
     if not by_cid:
         return False
 
-    _refuse_under_block_policy(kv_cache, "whole-chunk reload loop")
-
     all_h = []
     all_cid = []
     all_pk = []

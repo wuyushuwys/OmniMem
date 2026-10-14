@@ -32,7 +32,7 @@ from omnimem.utils.streaming_cli import _UnderscoreNegBooleanOptionalAction
 # The model assets of a run: required arguments of ``record`` / ``compare``.
 ASSET_ARGS = ("pretrained", "vae_path", "t5_path", "tokenizer_path")
 # Recipe fields that cannot change a golden payload (negative prompt, MP4 encoder settings).
-RECIPE_FIELDS_OUTSIDE_A_GOLDEN = ("n_prompt", "crf", "preset", "pix_fmt")
+RECIPE_FIELDS_OUTSIDE_A_GOLDEN = ("crf", "preset", "pix_fmt")
 DEFAULT_SWITCH_PROMPT = ("The same scene at dawn, warm golden light pouring in, the music slowing to "
                          "a gentle finale.")
 # request_spec keys compare checks against the golden's; a difference is warned about.
@@ -103,7 +103,7 @@ def _jsonable(obj):
 def recipe_kwargs(args) -> Dict[str, Any]:
     """The ``Recipe`` of this run, every field set from a switch of this tool."""
     return dict(
-        height=args.height, width=args.width, fps=args.fps, cfg=args.cfg,
+        height=args.height, width=args.width, fps=args.fps,
         num_inference_steps=args.num_inference_steps, shift=args.shift,
         frame_per_block=args.frame_per_block, window_size=args.window_size,
         sink_size=args.sink_size, enable_kv_evict=args.enable_kv_evict,
@@ -166,7 +166,7 @@ def make_runtime(args):
     try:
         rt = StreamingRuntime(paths, recipe, dit_device=args.dit_device,
                               decode_device=args.decode_device)
-        validate_request(spec["nframes"], recipe.frame_per_block, recipe.cfg,
+        validate_request(spec["nframes"], recipe.frame_per_block,
                          switch_prompts=spec["switch_prompts"],
                          switch_frame_indices=spec["switch_frame_indices"],
                          queue_depth=spec["queue_depth"])
@@ -543,7 +543,6 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--height", type=int, default=480)
         p.add_argument("--width", type=int, default=832)
         p.add_argument("--fps", type=int, default=16)
-        p.add_argument("--cfg", type=float, default=1.0, help="the streaming runtime requires 1")
         p.add_argument("--num_inference_steps", type=int, default=4)
         p.add_argument("--shift", type=float, default=5.0)
         p.add_argument("--frame_per_block", type=int, default=3)

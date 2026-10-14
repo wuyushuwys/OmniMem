@@ -44,8 +44,7 @@ logger = get_logger()
 __all__ = ['CausalWanNSAModel', 'CausalWanNSAttentionBlock',
            'ATTENTION_SCHEDULES', 'set_nsa_attention_schedule', 'get_nsa_attention_schedule',
            'set_selection_trace', 'set_selection_trace_context',
-           'causal_reorder_rope_apply', 'set_rope_factor_cache',
-           'clear_rope_factor_cache', 'get_rope_factor_cache_stats']
+           'causal_reorder_rope_apply']
 
 # Inference-only attention schedule: serial (default) or dual_topk_first.
 ATTENTION_SCHEDULES = ("serial", "dual_topk_first")
@@ -149,11 +148,9 @@ def token_restore_order(x, f, h, w, pool_f=1, pool_h=1, pool_w=1) -> torch.Tenso
 
 
 # RoPE position-factor cache keyed on (freqs version, c, f, h, w, start_frame, pool).
-_ROPE_FACTOR_CACHE_ENABLED = True
 _ROPE_FACTOR_CACHE_CAPACITY = 16                    # entries
 _ROPE_FACTOR_CACHE_MAX_BYTES = 128 * 1024 * 1024    # bytes
 _ROPE_FACTOR_CACHE = OrderedDict()
-_ROPE_FACTOR_CACHE_STATS = {'hits': 0, 'misses': 0, 'evictions': 0, 'skipped': 0}
 
 # id(freqs tensor) -> version, kept honest by a weakref callback that drops the
 # entry while the dying tensor is still the owner of that id.
@@ -207,16 +204,13 @@ def _rope_position_factor(freqs, c, f, h, w, start_frame, pool_f, pool_h, pool_w
     cached = _ROPE_FACTOR_CACHE.get(key)
     if cached is not None:
         _ROPE_FACTOR_CACHE.move_to_end(key)
-        _ROPE_FACTOR_CACHE_STATS['hits'] += 1
         return cached
-    _ROPE_FACTOR_CACHE_STATS['misses'] += 1
     value = _build_rope_position_factor(freqs, c, f, h, w, start_frame,
                                         pool_f, pool_h, pool_w)
     nbytes = value.numel() * value.element_size()
     if nbytes > _ROPE_FACTOR_CACHE_MAX_BYTES:
         # A single factor larger than the whole budget is never cached; the
         # caller still gets a correct, freshly built tensor.
-        _ROPE_FACTOR_CACHE_STATS['skipped'] += 1
         return value
     _ROPE_FACTOR_CACHE[key] = value
     total = nbytes + sum(v.numel() * v.element_size()
@@ -226,49 +220,15 @@ def _rope_position_factor(freqs, c, f, h, w, start_frame, pool_f, pool_h, pool_w
             or total > _ROPE_FACTOR_CACHE_MAX_BYTES):
         _, victim = _ROPE_FACTOR_CACHE.popitem(last=False)
         total -= victim.numel() * victim.element_size()
-        _ROPE_FACTOR_CACHE_STATS['evictions'] += 1
     return value
-
-
-def set_rope_factor_cache(enabled: bool, capacity: Optional[int] = None,
-                          max_bytes: Optional[int] = None) -> bool:
-    """Enable/disable the RoPE position-factor cache.  Returns the previous state."""
-    global _ROPE_FACTOR_CACHE_ENABLED, _ROPE_FACTOR_CACHE_CAPACITY
-    global _ROPE_FACTOR_CACHE_MAX_BYTES
-    previous = _ROPE_FACTOR_CACHE_ENABLED
-    _ROPE_FACTOR_CACHE_ENABLED = bool(enabled)
-    if capacity is not None:
-        _ROPE_FACTOR_CACHE_CAPACITY = int(capacity)
-    if max_bytes is not None:
-        _ROPE_FACTOR_CACHE_MAX_BYTES = int(max_bytes)
-    if not _ROPE_FACTOR_CACHE_ENABLED:
-        clear_rope_factor_cache()
-    return previous
-
-
-def clear_rope_factor_cache() -> None:
-    """Drop every cached factor (does not reset the counters)."""
-    _ROPE_FACTOR_CACHE.clear()
-
-
-def get_rope_factor_cache_stats() -> dict:
-    """``hits`` / ``misses`` / ``evictions`` / ``skipped`` plus current occupancy."""
-    return dict(
-        _ROPE_FACTOR_CACHE_STATS,
-        entries=len(_ROPE_FACTOR_CACHE),
-        bytes=sum(v.numel() * v.element_size() for v in _ROPE_FACTOR_CACHE.values()),
-        enabled=_ROPE_FACTOR_CACHE_ENABLED,
-        capacity=_ROPE_FACTOR_CACHE_CAPACITY,
-        max_bytes=_ROPE_FACTOR_CACHE_MAX_BYTES,
-    )
 
 
 @torch.compiler.disable()
 def causal_reorder_rope_apply(x, grid_sizes, freqs, start_frame=0, pool_f=1, pool_h=1, pool_w=1):
     """Apply RoPE to reordered tokens with temporal offset start_frame."""
     n, c = x.size(2), x.size(3) // 2
-    # Cache unless it is off or start_frame is not a plain int.
-    use_cache = _ROPE_FACTOR_CACHE_ENABLED and isinstance(start_frame, int)
+    # Cache unless start_frame is not a plain int.
+    use_cache = isinstance(start_frame, int)
     # split freqs
     if not use_cache:
         freqs_split = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)

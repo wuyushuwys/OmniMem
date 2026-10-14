@@ -3,7 +3,6 @@ import math
 import mmap
 import os
 import sys
-import threading
 import time
 import warnings
 from typing import Dict, Union, Optional, List, Iterable, Set, Tuple
@@ -17,8 +16,6 @@ from omnimem.nsa.backend import resolve_block_kv_backend
 # Exact-size pinned host buffers (cudaHostRegister) avoid the allocator's power-of-two rounding.
 EXACT_PINNED_KV_ENV = 'OMNIMEM_EXACT_PINNED_KV'
 
-_exact_pinned_lock = threading.RLock()  # __del__ may run under GC inside a locked section
-_exact_pinned_live = {'buffers': 0, 'bytes': 0, 'registered': 0, 'unregistered': 0}
 # Never run teardown in a fork()ed child: MADV_DONTFORK leaves the range unmapped there.
 _forked_mappings: list = []
 
@@ -31,12 +28,6 @@ def exact_pinned_kv_enabled() -> bool:
     if value == '1':
         return True
     raise ValueError(f'{EXACT_PINNED_KV_ENV} must be unset, 0 or 1, got {value!r}')
-
-
-def exact_pinned_kv_stats() -> Dict[str, int]:
-    """Live exact-pinned buffers/bytes and lifetime register/unregister counts."""
-    with _exact_pinned_lock:
-        return dict(_exact_pinned_live)
 
 
 def _cuda_device_index(device) -> int:
@@ -57,10 +48,6 @@ class _HostRegisteredMapping(mmap.mmap):
                 f'cudaHostRegister({nbytes} bytes) failed: '
                 f'{torch.cuda.cudart().cudaGetErrorString(err)}')
         self._registration = (ptr, nbytes, device_index, os.getpid())
-        with _exact_pinned_lock:
-            _exact_pinned_live['buffers'] += 1
-            _exact_pinned_live['bytes'] += nbytes
-            _exact_pinned_live['registered'] += 1
 
     def __del__(self):
         registration = getattr(self, '_registration', None)
@@ -75,10 +62,6 @@ class _HostRegisteredMapping(mmap.mmap):
             torch.cuda.synchronize(device_index)
         finally:
             err = torch.cuda.cudart().cudaHostUnregister(ptr)
-            with _exact_pinned_lock:
-                _exact_pinned_live['buffers'] -= 1
-                _exact_pinned_live['bytes'] -= nbytes
-                _exact_pinned_live['unregistered'] += 1
         if err != torch.cuda.cudart().cudaError.success:
             warnings.warn(f'cudaHostUnregister({nbytes} bytes) failed: '
                           f'{torch.cuda.cudart().cudaGetErrorString(err)}')
@@ -214,8 +197,6 @@ class MMCache:
                  chunk_buffer_types=None,
                  num_heads=None,
                  kv_block_size=0,
-                 ptr_ring_slots=8,
-                 ptr_ring_capacity=4096,
                  ):
         super().__init__()
 
@@ -328,8 +309,6 @@ class MMCache:
         self._ptr_name_index: Dict[str, int] = {n: i for i, n in enumerate(self._ptr_names)}
 
         # Event-protected pinned staging ring for every ptr-table publish.
-        self._ptr_ring_slots = int(ptr_ring_slots)
-        self._ptr_ring_capacity = int(ptr_ring_capacity)
         self._ptr_ring: Optional[_PtrStagingRing] = None
 
         # Publish/ring diagnostics; runtime-only, never serialized.
@@ -696,8 +675,6 @@ class MMCache:
             dtype=self.dtype,
             persistent_bytes=persistent_bytes,
             scratch_bytes=scratch_bytes,
-            ring_slots=self._ptr_ring_slots,
-            ring_capacity=self._ptr_ring_capacity,
             # The request's full K+V history in bytes, from the requested total k_cache length.
             history_bytes=(len(self.cache) * 2 * int(self.num_heads) * total_seq
                            * int(shape[3]) * self._elem_size()),
@@ -818,13 +795,11 @@ class MMCache:
             return
         budgets = self._block_store_budgets
         opts = dict(self._block_store_opts)
-        fused = store.fused_gather
         # Release the old store first so old and new pools never coexist.
         self._drop_block_store()
         self._block_store = self._new_block_store(*budgets, opts)
         self._block_store_budgets = budgets
         self._block_store_opts = opts
-        self._block_store.fused_gather = fused
         self._block_store.rebuild_all(self)
 
     def configure_window_buffers(self, enabled: bool = False) -> None:
@@ -1157,16 +1132,6 @@ class MMCache:
             if 0 <= cid < len(row):
                 row[cid] = None
 
-    def slot_version(self, name: str, layer_idx: int, head: int, cid: int) -> int:
-        """Version the pinned slot currently holds, or ``-1`` when invalid."""
-        rows = self._slot_meta.get(name, {}).get(layer_idx)
-        if rows is None or not (0 <= head < len(rows)):
-            return -1
-        row = rows[head]
-        if not (0 <= cid < len(row)) or row[cid] is None:
-            return -1
-        return row[cid][0]
-
     def _rebuild_chunk_versions(self) -> None:
         """Assign fresh versions to every restored chunk (checkpoint load); slots stay invalid."""
         self._chunk_version = {}
@@ -1320,7 +1285,7 @@ class MMCache:
             return n
 
         if self._ptr_ring is None:
-            self._ptr_ring = _PtrStagingRing(self._ptr_ring_slots, self._ptr_ring_capacity)
+            self._ptr_ring = _PtrStagingRing()
         slot_id, host, host_np = self._ptr_ring.acquire(n, stats)
         host_np[:n] = list(merged.keys())
         host_np[n:2 * n] = list(merged.values())
@@ -1374,22 +1339,6 @@ class MMCache:
             self.n_chunks_per_head_gpu[layer_idx][name],
             self.chunk_base_strides[layer_idx][name],
         )
-
-    def notify_chunks_reloaded(self, layer_idx: int, name: str,
-                               h_cid_pairs: List[tuple]):
-        """Re-publish the addresses of chunks somebody moved back onto the GPU, in one batch."""
-        if name not in self.chunk_per_head_types or not h_cid_pairs:
-            return
-        if not self._has_ptr_table(layer_idx, name):
-            return
-        chunks = self.cache.get(layer_idx, {}).get(name)
-        if chunks is None:
-            return
-        self.publish_chunk_ptrs(layer_idx, (
-            (name, h, cid,
-             self.chunk_ptr_of(chunks[h][cid] if cid < len(chunks[h]) else None))
-            for h, cid in h_cid_pairs
-        ))
 
     # ──────────────────────────────────────────────────────────
     # Device / state management

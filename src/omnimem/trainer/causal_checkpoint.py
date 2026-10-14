@@ -215,8 +215,7 @@ class CausalCheckpointMixin:
             self._checkpoint_rank0_call(save_weights)
             del state
         save_training_state(staging, self.model, self.optimizer, self.lr_scheduler, self.global_step,
-                            extra_state={"trainer_family": "causal", "training_config": self._training_config(),
-                                         "data_resume_policy": "resample_stream"})
+                            extra_state={"trainer_family": "causal", "training_config": self._training_config()})
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         checkpoint = Path(self._checkpoint_rank0_call(
             lambda: str(self._checkpoint_store.commit(staging, self.global_step, world_size))))

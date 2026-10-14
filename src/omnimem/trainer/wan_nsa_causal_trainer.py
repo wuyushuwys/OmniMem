@@ -1,13 +1,10 @@
-import os
 import math
 
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.distributed.fsdp import fully_shard
 from torch.optim.lr_scheduler import LRScheduler
 
-from peft import PeftModel
 
 from omnimem.models.flex_attention_utils import create_causal_block_mask_cached
 from omnimem.models.transformers.causal_wan_nsa_model import CausalWanNSAModel, CausalWanNSAttentionBlock
@@ -16,7 +13,6 @@ from omnimem.schedulers import RectifiedFlowScheduler
 from omnimem.utils.torch_utils import (
     get_fsdp_state_dict, 
     load_and_broadcast_diffuser, 
-    resume_model, 
     update_ema_fsdp,
     )
 from omnimem.utils.meter import TimerMeter

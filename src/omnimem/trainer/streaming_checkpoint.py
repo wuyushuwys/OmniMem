@@ -113,11 +113,6 @@ class StreamingCheckpointMixin:
         # Record the rollout algorithm even at inactive sequence boundaries.
         # Raw-overlap checkpoints must start a new run when adopting VAE boundaries.
         config["streaming_boundary_mode"] = self.streaming_boundary_mode
-        schedule = getattr(self, "streaming_generator_schedule", "fixed")
-        # Omit the legacy default to keep existing fixed-schedule recipes
-        # resumable. A changed schedule is a new training run, not exact resume.
-        if schedule != "fixed":
-            config["streaming_generator_schedule"] = schedule
         config["kv_evict_min_gpu_chunks"] = getattr(self, "kv_evict_min_gpu_chunks", None)
         config["vae_path"] = self.config.get("vae_path")
         config["scheduler_path"] = self.config.get("scheduler_path")

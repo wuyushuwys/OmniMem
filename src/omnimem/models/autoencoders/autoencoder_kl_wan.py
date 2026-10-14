@@ -738,48 +738,37 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         )
 
     # Fast decode: channels_last convs, one temporal pass per chunk, fused RMS norm.
-    _FAST_DEFAULTS = {"channels_last": True, "group_temporal": True, "upsample_bf16": True,
-                      "fuse_norm": True}
-    _fast_decode: bool = False
-    _fast_opts: Optional[dict] = None
-    _fast_group_temporal: bool = True
+    _fast_decode: Optional[bool] = None
 
-    def enable_fast_decode(self, enabled: bool = True, **opts) -> None:
+    def enable_fast_decode(self, enabled: bool = True) -> None:
         """Turn the opt-in fast decode path on or off."""
-        unknown = set(opts) - set(self._FAST_DEFAULTS)
-        if unknown:
-            raise TypeError(f"enable_fast_decode got unexpected options {sorted(unknown)}")
         self._fast_decode = bool(enabled)
-        self._fast_opts = {**self._FAST_DEFAULTS, **opts}
         self._apply_fast_decode()
 
     def _apply_fast_decode(self) -> None:
         """Push the fast-decode flags onto the submodules; re-run after .to()."""
-        o = self._fast_opts or self._FAST_DEFAULTS
         enabled = self._fast_decode
-        want_cl = enabled and o["channels_last"]
         for m in self.decoder.modules():
             if isinstance(m, (WanCausalConv3d, WanResample)):
-                m.fast = want_cl
+                m.fast = enabled
             elif isinstance(m, WanUpsample):
-                m.fast = enabled and o["upsample_bf16"]
+                m.fast = enabled
             elif isinstance(m, WanRMS_norm):
                 m._fast_gamma = ((m.gamma.detach() * m.scale).to(m.gamma.dtype)
-                                 if (enabled and o["fuse_norm"]) else None)
-        self.post_quant_conv.fast = want_cl
+                                 if enabled else None)
+        self.post_quant_conv.fast = enabled
         # Layout change only; contiguous is a no-op when the layout already matches.
         for m in list(self.decoder.modules()) + [self.post_quant_conv]:
             if not isinstance(m, (nn.Conv2d, nn.Conv3d)):
                 continue
             w = m.weight
             fmt = torch.channels_last_3d if w.dim() == 5 else torch.channels_last
-            m.weight.data = (w.data.contiguous(memory_format=fmt) if want_cl
+            m.weight.data = (w.data.contiguous(memory_format=fmt) if enabled
                              else w.data.contiguous())
-        self._fast_group_temporal = bool(o["group_temporal"])
 
     def _apply(self, *args, **kwargs):
         out = super()._apply(*args, **kwargs)
-        if self._fast_opts is not None:
+        if self._fast_decode is not None:
             self._apply_fast_decode()
         return out
 
@@ -861,7 +850,7 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         iter_ = z.shape[2]
         x = self.post_quant_conv(z)
-        if self._fast_decode and self._fast_group_temporal:
+        if self._fast_decode:
             # One temporal pass per chunk; the first decoder call of a request stays alone.
             parts = []
             start = 0

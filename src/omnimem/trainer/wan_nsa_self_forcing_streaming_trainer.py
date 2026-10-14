@@ -25,7 +25,6 @@ class WanNSASelfForcingStreamingTrainer(StreamingCheckpointMixin, WanNSASelfForc
     Streaming long-video trainer that generates and trains one chunk at a time with a persistent KV cache.
     Re-encodes the previous window's last frames as a VAE boundary block and writes its clean KV first.
     """
-    _supports_complete_sf_resume = True
     _sf_trainer_family = "nsa-self-forcing-streaming"
     streaming_boundary_mode = "vae_roundtrip_block"
 
@@ -39,7 +38,7 @@ class WanNSASelfForcingStreamingTrainer(StreamingCheckpointMixin, WanNSASelfForc
         # Validate before loading models or comparing a checkpoint recipe.
         generator_update_due(
             0, config.get("dfake_gen_update_ratio", 5),
-            schedule=self.streaming_generator_schedule, seed=config.get("global_seed", 42),
+            schedule=self.streaming_generator_schedule,
         )
         # Complete resume can defer saves until a rollout ends, omitting its KV.
         self.streaming_checkpoint_at_rollout_boundary = config.get(
@@ -535,7 +534,6 @@ class WanNSASelfForcingStreamingTrainer(StreamingCheckpointMixin, WanNSASelfForc
         is_gen_step = generator_update_due(
             self.global_step, self.dfake_gen_update_ratio,
             schedule=getattr(self, "streaming_generator_schedule", "fixed"),
-            seed=self.config.get("global_seed", 42),
         )
 
         # One simulation feeds both generator and critic; critic_step detaches internally.

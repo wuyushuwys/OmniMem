@@ -65,7 +65,6 @@ class Recipe:
     height: int = 480
     width: int = 832
     fps: int = 16
-    cfg: float = 1.0
     num_inference_steps: int = 4
     shift: float = 5.0
     frame_per_block: int = 3
@@ -74,7 +73,6 @@ class Recipe:
     enable_kv_evict: bool = True
     # Chunk LRU capacity of 'chunk_lru'; residency only.
     lru_max_size: int = 20
-    n_prompt: str = NEG_PROMPT
     compile: bool = True
     # "default": max-autotune picks Inductor kernels by timing, which is not reproducible.
     compile_mode: str = "default"
@@ -120,14 +118,11 @@ def actual_frames(nframes: int, temporal_stride: int = 4) -> int:
     return 1 + temporal_stride * (latent_frames(nframes, temporal_stride) - 1)
 
 
-def validate_request(nframes: int, frame_per_block: int, cfg: float, *,
+def validate_request(nframes: int, frame_per_block: int, *,
                      switch_prompts: Optional[Sequence[str]] = None,
                      switch_frame_indices: Optional[Sequence[int]] = None,
                      queue_depth: int = 2) -> None:
     """Fail early (``ValueError``) for a request the streaming path cannot run."""
-    if cfg is None or float(cfg) != 1.0:
-        raise ValueError(f"the streaming path requires CFG == 1 (got {cfg}); "
-                         "CFG > 1 is only supported by the non-streaming entry points")
     if nframes < 1:
         raise ValueError(f"nframes must be >= 1, got {nframes}")
     if frame_per_block < 1:
@@ -265,12 +260,10 @@ def _percentile(xs: Sequence[float], q: float) -> Optional[float]:
 class VideoFileSink:
     """Writer-thread sink: incremental MP4 + previews + optional frame capture."""
 
-    def __init__(self, writer: StreamingVideoWriter, capture: bool = False,
-                 on_frames_cb=None):
+    def __init__(self, writer: StreamingVideoWriter, capture: bool = False):
         self.writer = writer
         self.capture = capture
         self.captured: List[np.ndarray] = []
-        self.on_frames_cb = on_frames_cb
         self.first_delivery_time: Optional[float] = None
 
     def on_frames(self, frames_u8: torch.Tensor, frame_start: int, chunk_index: int) -> None:
@@ -282,8 +275,6 @@ class VideoFileSink:
             self.first_delivery_time = time.monotonic()
         if self.capture:
             self.captured.append(arr.copy())
-        if self.on_frames_cb is not None:
-            self.on_frames_cb(arr, frame_start, chunk_index)
 
     def finish(self):
         if not self.writer.is_open:
@@ -599,13 +590,13 @@ class StreamingRuntime:
     def _pipe_kwargs(self, nframes: int, switch_prompts, switch_frame_indices) -> Dict[str, Any]:
         r = self.recipe
         kw = dict(
-            n_prompt=r.n_prompt,
+            n_prompt=NEG_PROMPT,
             size=(r.width, r.height),
             frame_num=nframes,
             shift=r.shift,
             sample_solver="unipc",
             sampling_steps=r.num_inference_steps,
-            guide_scale=r.cfg,
+            guide_scale=1.0,
             offload_model=False,
             sink_size={"kv": r.sink_size, "kv_cmp": None},
             window_size={"kv": r.window_size, "kv_cmp": None},
@@ -738,7 +729,6 @@ class StreamingRuntime:
             # Resolved store geometry: which gather variant actually ran (one fused
             # launch vs the split ones) belongs next to the counters it explains.
             store_cfg = kv.block_store_config()
-            out["block_fused_gather"] = store_cfg["fused_gather"]
             for _k in ("persistent_slots_per_layer", "scratch_slots", "max_blocks", "block_bytes",
                       "mode", "dedup", "resident_history_bytes",
                       "resident_budget_bytes"):
@@ -773,7 +763,7 @@ class StreamingRuntime:
                 f"this runtime cannot run another request: {self._unusable}.  Build a "
                 f"new runtime, preferably in a new process")
         r = self.recipe
-        validate_request(nframes, r.frame_per_block, r.cfg, switch_prompts=switch_prompts,
+        validate_request(nframes, r.frame_per_block, switch_prompts=switch_prompts,
                          switch_frame_indices=switch_frame_indices, queue_depth=queue_depth)
         check_output_target(output_path, preview_dir)
         config = self.configure()

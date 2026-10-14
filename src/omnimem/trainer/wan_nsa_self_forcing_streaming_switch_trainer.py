@@ -14,7 +14,6 @@ class WanNSASelfForcingStreamingSwitchTrainer(WanNSASelfForcingStreamingTrainer)
     Config keys: switch_prompt_file (str), switch_mode (str), switch_choices (list[int]).
     Falls back to base behavior when switch_prompt_file is not set.
     """
-    _supports_complete_sf_resume = True
     _sf_trainer_family = "nsa-self-forcing-switch"
 
     def __init__(self, config):
