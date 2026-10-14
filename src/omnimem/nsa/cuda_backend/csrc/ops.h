@@ -55,10 +55,4 @@ std::tuple<at::Tensor, at::Tensor> sel_bwd_ptr_cuda(
     double scale, c10::string_view input_precision, bool compute_dkv,
     at::TensorList owners, at::TensorList grad_buffers);
 
-// Inverted index (CSR) over query groups: (sorted_groups [B,H,MG*T], offsets [B,H,NS+1]);
-// empty n_blocks_per_head means num_blocks for every head.
-std::tuple<at::Tensor, at::Tensor> inverted_index_cuda(
-    const at::Tensor& block_indices, const at::Tensor& n_blocks_per_head, int64_t num_blocks,
-    int64_t block_size, int64_t chunk_size, bool causal, int64_t group_size);
-
 }  // namespace omnimem_nsa

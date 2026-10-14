@@ -27,7 +27,6 @@ class SelectionAttentionCUDA(torch.autograd.Function):
         ctx.causal = causal
         ctx.allow_tf32 = allow_tf32
         ctx.group_size = group_size
-        ctx.bwd_method = bwd_method  # accepted for API compatibility; one CUDA backward
         if return_lse:
             ctx.mark_non_differentiable(lse)
             return out, lse

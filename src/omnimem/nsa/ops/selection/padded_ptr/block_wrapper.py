@@ -5,8 +5,6 @@ from typing import Optional
 
 import torch
 
-from omnimem.utils.stage_marks import profile_label
-
 from omnimem.nsa.backend import get_backend
 
 from ._dispatch import build_ptr_table, launch_ptr_fwd
@@ -60,8 +58,7 @@ def selection_attention_block_store(
     if softmax_scale is None:
         softmax_scale = D ** -0.5
 
-    with profile_label("nsa.block_prepare"):
-        lease = store.prepare_selection(layer_idx, block_indices)
+    lease = store.prepare_selection(layer_idx, block_indices)
     try:
         addr_k, addr_v, n_valid = store.table_views(layer_idx)
         ptr_table_k, ptr_table_v = build_ptr_table(

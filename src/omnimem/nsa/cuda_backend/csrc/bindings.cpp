@@ -33,9 +33,6 @@ TORCH_LIBRARY(omnimem_nsa, m) {
       "int stride_dbn, int stride_dbd, int blocks_per_chunk, int in_chunk_block_bytes_kv, "
       "int in_chunk_block_bytes_dkv, float scale, str input_precision, bool compute_dkv, "
       "Tensor[] owners, Tensor(a!)[] grad_buffers) -> (Tensor, Tensor)");
-  m.def(
-      "inverted_index(Tensor block_indices, Tensor n_blocks_per_head, int num_blocks, "
-      "int block_size, int chunk_size, bool causal, int group_size) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(omnimem_nsa, CUDA, m) {
@@ -45,5 +42,4 @@ TORCH_LIBRARY_IMPL(omnimem_nsa, CUDA, m) {
   m.impl("sel_fwd_ptr", &omnimem_nsa::sel_fwd_ptr_cuda);
   m.impl("sel_bwd", &omnimem_nsa::sel_bwd_cuda);
   m.impl("sel_bwd_ptr", &omnimem_nsa::sel_bwd_ptr_cuda);
-  m.impl("inverted_index", &omnimem_nsa::inverted_index_cuda);
 }

@@ -11,8 +11,7 @@ from ._extension import Extension
 
 LIB_NAMESPACE = "omnimem_nsa"
 #: The operators the library registers under ``torch.ops.omnimem_nsa``.
-OP_NAMES = ("topk", "build_ptr_table", "sel_fwd", "sel_fwd_ptr", "sel_bwd", "sel_bwd_ptr",
-            "inverted_index")
+OP_NAMES = ("topk", "build_ptr_table", "sel_fwd", "sel_fwd_ptr", "sel_bwd", "sel_bwd_ptr")
 
 EXTENSION = Extension(
     prefix="omnimem_nsa_cuda",

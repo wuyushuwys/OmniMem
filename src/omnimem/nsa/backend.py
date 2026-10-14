@@ -1,10 +1,9 @@
 """NSA backend selection: OMNIMEM_NSA_BACKEND (triton or cuda) or set_backend()."""
 from __future__ import annotations
 
-import contextlib
 import os
 import threading
-from typing import Iterator, Optional
+from typing import Optional
 
 VALID_BACKENDS = ("triton", "cuda")
 ENV_VAR = "OMNIMEM_NSA_BACKEND"
@@ -48,17 +47,6 @@ def set_backend(name: str) -> str:
     with _lock:
         _backend = name
     return name
-
-
-@contextlib.contextmanager
-def use_backend(name: str) -> Iterator[str]:
-    """Temporarily switch the backend inside a ``with`` block."""
-    prev = get_backend()
-    set_backend(name)
-    try:
-        yield name
-    finally:
-        set_backend(prev)
 
 
 def resolve_block_kv_backend(name: Optional[str] = None) -> str:

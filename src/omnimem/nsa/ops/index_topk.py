@@ -58,7 +58,6 @@ def parallel_nsa_topk(
         progressive_exclude: bool = False,
         tf_mask: bool = False,
         q_chunk_offset: int = 0,
-        _chunk_size_k: Optional[int] = None,
 ) -> torch.Tensor:
     """Select top-K compressed-key block indices.
 
@@ -81,7 +80,7 @@ def parallel_nsa_topk(
         chunk_size = chunk_size // G
         T = T // G
     else:
-        chunk_size_k = _chunk_size_k if _chunk_size_k is not None else chunk_size
+        chunk_size_k = chunk_size
 
     if causal:
         assert chunk_size_k % block_size == 0

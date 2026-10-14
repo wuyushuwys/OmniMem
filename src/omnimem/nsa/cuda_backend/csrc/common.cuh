@@ -103,12 +103,6 @@ __host__ inline int next_pow2(int n) {
   return p;
 }
 
-// floor(a / b) for possibly negative a (b > 0).
-__device__ __forceinline__ int floordiv(int a, int b) {
-  int q = a / b;
-  return (a % b != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
-}
-
 // [B, M, H, D]-style strided view (element strides).
 template <typename T>
 struct Strided4 {

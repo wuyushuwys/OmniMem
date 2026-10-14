@@ -1,7 +1,7 @@
 """Python adapters for the torch.ops.omnimem_nsa operators, plus fake versions for torch.compile."""
 from __future__ import annotations
 
-from typing import Optional, Sequence, Tuple
+from typing import Sequence, Tuple
 
 import torch
 
@@ -225,23 +225,6 @@ def sel_bwd_ptr(
     )
 
 
-def inverted_index(
-    block_indices: torch.Tensor, num_blocks: int, block_size: int, chunk_size: int,
-    causal: bool, group_size: int, n_blocks_per_head: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if n_blocks_per_head is None:
-        n_blocks_per_head = torch.empty(0, dtype=torch.int32, device=block_indices.device)
-    _check_cuda((block_indices, "block_indices"), (n_blocks_per_head, "n_blocks_per_head"))
-    n_blocks_per_head = _contig_meta(n_blocks_per_head)
-    _check_int("num_blocks", num_blocks); _check_int("block_size", block_size, 1)
-    _check_int("chunk_size", chunk_size, 1); _check_int("group_size", group_size, 1)
-    return _call(
-        "inverted_index",
-        block_indices, n_blocks_per_head, int(num_blocks), int(block_size), int(chunk_size),
-        bool(causal), int(group_size),
-    )
-
-
 # Fake / meta implementations (shape-only)
 _fakes_registered = False
 
@@ -291,10 +274,3 @@ def register_fakes() -> None:
                       blocks_per_chunk, in_chunk_block_bytes_kv, in_chunk_block_bytes_dkv, scale,
                       input_precision, compute_dkv, owners, grad_buffers):
         return torch.empty_like(q), lse.new_empty(lse.shape)  # delta is a fresh contiguous buffer
-
-    @lib.register_fake("omnimem_nsa::inverted_index")
-    def _inv_fake(block_indices, n_blocks_per_head, num_blocks, block_size, chunk_size, causal,
-                  group_size):
-        B, MG, H, T = block_indices.shape
-        return (block_indices.new_empty((B, H, MG * T), dtype=torch.int32),
-                block_indices.new_empty((B, H, num_blocks + 1), dtype=torch.int32))

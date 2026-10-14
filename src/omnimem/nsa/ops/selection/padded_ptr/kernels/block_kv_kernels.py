@@ -146,16 +146,3 @@ def gather_publish_clear(desc: torch.Tensor, n_fetch: int, n_clear: int,
     else:
         raise ValueError(f"unknown block KV backend {backend!r}")
     return n_fetch + cdiv(n_clear, _CLR_BLOCK)
-
-
-# Lazily re-exported so importing this facade never imports Triton.
-_TRITON_REEXPORTS = ("_block_range_kernel", "_gather_publish_clear_kernel")
-
-
-def __getattr__(name: str):
-    if name in _TRITON_REEXPORTS:
-        from . import block_kv_kernels_triton as _t
-        value = getattr(_t, name)
-        globals()[name] = value           # cache: only the first access pays the import
-        return value
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

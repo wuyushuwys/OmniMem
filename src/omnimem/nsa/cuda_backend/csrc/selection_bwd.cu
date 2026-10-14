@@ -1524,6 +1524,8 @@ std::tuple<at::Tensor, at::Tensor> sel_bwd_ptr_cuda(
   TORCH_CHECK(q.dim() == 4 && out.dim() == 4 && d_out.dim() == 4, "sel_bwd_ptr: q/out/d_out must be 4-D");
   TORCH_CHECK(q.scalar_type() == out.scalar_type() && q.scalar_type() == d_out.scalar_type(),
               "sel_bwd_ptr: q/out/d_out must share one dtype");
+  TORCH_CHECK(q.scalar_type() == at::kBFloat16, "sel_bwd_ptr: q must be bfloat16, got ",
+              q.scalar_type());
   TORCH_CHECK(out.sizes() == q.sizes() && d_out.sizes() == q.sizes(),
               "sel_bwd_ptr: out/d_out must have q's shape");
   TORCH_CHECK(ptr_k.scalar_type() == at::kLong && ptr_v.scalar_type() == at::kLong,
@@ -1561,7 +1563,8 @@ std::tuple<at::Tensor, at::Tensor> sel_bwd_ptr_cuda(
   const bool use_mma = (prec == Precision::kTF32);
   const at::Tensor order = group_order(block_indices, MG, T);
 
-  OMNIMEM_DISPATCH_FLOAT_TYPES(q.scalar_type(), "sel_bwd_ptr", [&] {
+  [&] {
+    using scalar_t = c10::BFloat16;
     PtrKV<scalar_t> acc;
     acc.ptr_k = ptr_k.data_ptr<int64_t>();
     acc.ptr_v = ptr_v.data_ptr<int64_t>();
@@ -1585,7 +1588,7 @@ std::tuple<at::Tensor, at::Tensor> sel_bwd_ptr_cuda(
       launch_dq<scalar_t>(q, out, d_out, dq, lse, delta, order, acc, B, H, MG, G, T, D,
                           /*chunk_size=*/1, scale, block_size, stream, "sel_bwd_ptr dQ");
     }
-  });
+  }();
 
   if (!compute_dkv) return std::make_tuple(dq, delta);  // LRU dq-only training path
 
@@ -1617,7 +1620,8 @@ std::tuple<at::Tensor, at::Tensor> sel_bwd_ptr_cuda(
   std::tie(groups, offsets) = build_inverted_index_impl(
       block_indices, n_blocks_per_head, max_n, block_size, /*chunk_size=*/1, /*causal=*/false, G);
 
-  OMNIMEM_DISPATCH_FLOAT_TYPES(q.scalar_type(), "sel_bwd_ptr", [&] {
+  [&] {
+    using scalar_t = c10::BFloat16;
     PtrKVGrad<scalar_t> res;
     res.base_k = base_k.data_ptr<int64_t>();
     res.base_v = base_v.data_ptr<int64_t>();
@@ -1646,7 +1650,7 @@ std::tuple<at::Tensor, at::Tensor> sel_bwd_ptr_cuda(
       launch_dkv<scalar_t>(q, d_out, lse, delta, groups, offsets, res, B, H, max_n, G, D,
                            /*chunk_size=*/1, scale, block_size, stream, "sel_bwd_ptr dK/dV");
     }
-  });
+  }();
 
   return std::make_tuple(dq, delta);
 }

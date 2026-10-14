@@ -200,11 +200,4 @@ std::tuple<at::Tensor, at::Tensor> build_inverted_index_impl(
   return std::make_tuple(groups, offsets);
 }
 
-std::tuple<at::Tensor, at::Tensor> inverted_index_cuda(
-    const at::Tensor& block_indices, const at::Tensor& n_blocks_per_head, int64_t num_blocks,
-    int64_t block_size, int64_t chunk_size, bool causal, int64_t group_size) {
-  return build_inverted_index_impl(block_indices, n_blocks_per_head, num_blocks, block_size,
-                                   chunk_size, causal, group_size);
-}
-
 }  // namespace omnimem_nsa
