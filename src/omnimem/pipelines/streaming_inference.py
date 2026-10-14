@@ -562,17 +562,13 @@ class StreamingRuntime:
             "gpus": self.gpus, "decode": "sync" if self.gpus == 1 else "async",
             "kv_tier_device": str(self._kv_tier_device) if self._kv_tier_device else None,
             "kv_tier_budget_gb": self._kv_tier_budget_bytes / 2 ** 30,
-            # 'block_lru': the persistent block pool.  'chunk_lru': 0.
             "kv_block_pool_gb": self._kv_block_pool_bytes / 2 ** 30,
             "kv_cache_policy": self._kv_cache_policy,
             "kv_block_scratch_gb": self._kv_block_scratch_bytes / 2 ** 30,
-            # Block store options are echoed under every policy but applied only under 'block_lru'.
             "kv_block_resident_if_fits": self._kv_block_resident_if_fits,
             "kv_block_dedup": self._kv_block_dedup,
             "kv_window_buffer": bool(self.recipe.kv_window_buffer),
             "kv_exact_pinned_host": self._kv_exact_pinned_host,
-            # The chunk LRU does not exist under 'block_lru' (history retirement runs at
-            # every generation-chunk boundary instead); say so explicitly in the manifest.
             "lru_max_size": "n/a (block_lru)" if block_policy else self.recipe.lru_max_size,
             "attention_schedule": get_nsa_attention_schedule(self.transformer),
             "attention_modules_set": n_set,
@@ -618,21 +614,15 @@ class StreamingRuntime:
             lru_max_size=r.lru_max_size,
             slice_last_frames=r.slice_last_frames,
             recache_mode=r.recache_mode,
-            # Applied to the (lazily created, reused) cache on every request.
             kv_tier_device=self._kv_tier_device,
             kv_tier_budget_bytes=self._kv_tier_budget_bytes,
-            # 'block_lru': the persistent block pool budget of the block store.
-            # 'chunk_lru': 0.
             kv_block_pool_bytes=self._kv_block_pool_bytes,
             kv_cache_policy=self._kv_cache_policy,
             kv_block_scratch_bytes=self._kv_block_scratch_bytes,
-            # Block store options; only meaningful under kv_cache_policy='block_lru'.
             kv_block_resident_if_fits=self._kv_block_resident_if_fits,
             kv_block_dedup=self._kv_block_dedup,
             kv_window_buffer=r.kv_window_buffer,
-            # The chunk LRU's fully-resident selection fast path: always on.
             kv_resident_fast_path=self._kv_cache_policy == "chunk_lru",
-            # How the host copy of the KV history is page-locked, see ``_resolve_kv_history``.
             kv_exact_pinned_host=self._kv_exact_pinned_host,
         )
         if r.park_t5:

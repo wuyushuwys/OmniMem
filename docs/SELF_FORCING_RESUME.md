@@ -23,13 +23,11 @@ step_00000200/
   COMPLETED.json            # SHA256 and size for every payload file
 ```
 
-All ranks save to a shared `.incomplete-step_...` directory. Rank 0 validates both model payloads, both optimizer states, rank RNG identities, step/world size, recipe, and EMA policy before atomically renaming it. S3 receives every payload before `COMPLETED.json`; upload errors propagate. Checkpoints cannot be published halfway through gradient accumulation.
+Publication, S3 upload and discovery use the ODE checkpoint store; see [ODE resume](ODE_RESUME.md#what-one-complete-checkpoint-contains). Before publishing, rank 0 also validates both model payloads, both optimizer states, rank RNG identities, step/world size, recipe, and EMA policy. Legacy checkpoints and stage-incompatible checkpoints are rejected.
 
 Set `checkpoint_keep_local: 0` with S3 upload enabled to delete each completed local checkpoint after its remote manifest and every payload object's size and available SHA256 have been verified. Upload or verification failures preserve the local copy. Interrupted `.incomplete-*` directories are also preserved for recovery. A checkpoint downloaded during resume is removed only after all ranks have loaded model, optimizer, EMA, and streaming state. Unset retention keeps completed checkpoints; a positive value retains that many recent local copies. Without S3 upload nothing is pruned.
 
-For a single-node run, use an explicit `checkpoint_dir` on local SSD plus a durable `checkpoint_s3_prefix`; all local ranks can share that SSD directory, and outputs and logs can live there too. Multi-node checkpoints still require storage visible to every rank. Check user quota as well as filesystem free space before staging a full checkpoint.
-
-Discovery considers completed local and S3 candidates in descending step order, verifies hashes and required payloads, and falls back from an incomplete/corrupt candidate to an older valid one. An invalid candidate with no valid fallback raises. Legacy checkpoints and stage-incompatible checkpoints are rejected. A remote discovery failure may use a verified local checkpoint with an explicit warning; without one it fails. Remote access/authorization failures during download propagate.
+For a single-node run, use an explicit `checkpoint_dir` on local SSD plus a durable `checkpoint_s3_prefix`; all local ranks can share that SSD directory, and outputs and logs can live there too. Check user quota as well as filesystem free space before staging a full checkpoint.
 
 ## Continuation semantics
 

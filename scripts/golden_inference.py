@@ -26,18 +26,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 import torch
 
-
-class _UnderscoreNegBooleanOptionalAction(argparse.BooleanOptionalAction):
-    """Like ``argparse.BooleanOptionalAction`` but the negative flag is ``--no_foo``."""
-
-    def __init__(self, option_strings, dest, **kwargs):
-        super().__init__(option_strings, dest, **kwargs)
-        self.option_strings = [s.replace("--no-", "--no_", 1) if s.startswith("--no-") else s
-                               for s in self.option_strings]
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        if option_string in self.option_strings:
-            setattr(namespace, self.dest, not option_string.startswith("--no_"))
+from omnimem.utils.streaming_cli import _UnderscoreNegBooleanOptionalAction
 
 
 # The model assets of a run: required arguments of ``record`` / ``compare``.

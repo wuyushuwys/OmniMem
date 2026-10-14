@@ -113,10 +113,6 @@ args=("${wan[@]}" --pretrained checkpoints/long_rolling_switch_prompt_from_ode_i
 
 `--prompt_file` writes one MP4 per line of the file into the `--output` directory. For a single video of your own, pass `--prompt "<your prompt>" --output demo/example.mp4` instead. `--pretrained` also takes your own `outputs/<exp_name>/checkpoints/ema`.
 
-### Triton kernels (default)
-
-Nothing to build.
-
 ```bash
 # single GPU: DiT and VAE on cuda:0
 python inference_single_gpu.py "${args[@]}"
@@ -125,21 +121,7 @@ python inference_single_gpu.py "${args[@]}"
 python inference_dual_gpu.py "${args[@]}"
 ```
 
-### CUDA kernels
-
-Build the extension once (needs `nvcc` and `ninja`), then add `--nsa_backend cuda`:
-
-```bash
-python -m omnimem.nsa.cuda_backend.build
-
-# single GPU
-python inference_single_gpu.py "${args[@]}" --nsa_backend cuda
-
-# dual GPU
-python inference_dual_gpu.py "${args[@]}" --nsa_backend cuda
-```
-
-Training and the other entry points select the CUDA kernels with `OMNIMEM_NSA_BACKEND=cuda`. Both backends load the same checkpoints; for the same seed they give different samples.
+The NSA kernels run on Triton by default. For the CUDA kernels, build the extension once with `python -m omnimem.nsa.cuda_backend.build` (needs `nvcc` and `ninja`) and add `--nsa_backend cuda`.
 
 See [streaming inference](docs/STREAMING_INFERENCE.md) for the options, memory requirements and reproducibility notes.
 

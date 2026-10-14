@@ -1,24 +1,10 @@
 # Streaming inference
 
-Details for `inference_single_gpu.py` and `inference_dual_gpu.py`: options, memory requirements, backends and reproducibility. The [README](../README.md#inference) has the minimal command.
+Details for `inference_single_gpu.py` and `inference_dual_gpu.py`: options, memory requirements, backends and reproducibility. The [README](../README.md#inference) has the commands.
 
 ## Usage
 
-`inference_single_gpu.py` generates one long video (T2V, CFG = 1) with a plain `python` launch. Frames are decoded and appended to the MP4 while the DiT is still generating. Only the model paths and the output file are required:
-
-```bash
-model_path=checkpoints/long_rolling_plain_from_ode_init
-wan_path=wan_models/Wan2.1-T2V-1.3B
-
-python inference_single_gpu.py \
-    --pretrained $model_path \
-    --vae_path wan_models/vae-2.1/vae \
-    --t5_path $wan_path/models_t5_umt5-xxl-enc-bf16.pth \
-    --tokenizer_path $wan_path/google/umt5-xxl \
-    --output demo/example.mp4
-```
-
-`inference_dual_gpu.py` takes the same arguments; the two scripts differ in where the VAE runs:
+Both scripts generate T2V videos with CFG = 1; only the model paths and `--output` are required. They differ in where the VAE runs:
 
 | Script | Layout |
 |--------|--------|
@@ -27,7 +13,7 @@ python inference_single_gpu.py \
 
 Defaults: a demo prompt, `--nframes 969` (about 60 s at 16 fps), 480x832, 4 sampling steps, `--seed 42`. Set `--prompt`, `--nframes` (the number of latent frames, `(nframes - 1) // 4 + 1`, must be a multiple of 3: 81, 249, 969, ...) and `--seed` as needed; `--switch_prompts` / `--switch_frame_indices` change the prompt mid-video (one latent-frame index per switch prompt: increasing, inside the video and multiples of `--frame_per_block`). The video is written with the `ffmpeg` executable (libx264), which must be on `PATH`.
 
-`--prompt_file` replaces `--prompt` and the switch options and generates one video per line of the file into the `--output` directory: a `.txt` holds one prompt per line, a `.jsonl` one `{"id", "prompts", "switch_frame_indices"}` record per line, written as `<id>.mp4`. The README uses `configs/prompts/demo.txt` for short videos, `configs/prompts/project_page/standard_60s.jsonl` for long videos and `configs/prompts/interactive_60s.jsonl` for long videos with prompt switching.
+`--prompt_file` replaces `--prompt` and the switch options and generates one video per line of the file into the `--output` directory: a `.txt` holds one prompt per line, a `.jsonl` one `{"id", "prompts", "switch_frame_indices"}` record per line, written as `<id>.mp4`.
 
 **KV history cache.** NSA attends to a sliding window of recent chunks plus the history blocks it selects. `--kv_cache_policy` decides where that history is kept:
 
@@ -46,22 +32,11 @@ Keep `block_lru` unless you want the GPU tier: `--kv_cache_policy chunk_lru --kv
 
 **Smaller machines.** Lower `--kv_block_pool_gb` (a 12 GiB pool was verified at 960 frames; a 16 GiB pool is 1.5-4% slower than 24), pass `--no_kv_window_buffer` (saves about 5 GiB on the DiT GPU, noticeably slower) or `--park_t5 cpu` (moves the T5 encoder off the DiT GPU once the prompts are encoded: frees about 11 GB there and costs about 10 s of first-frame latency per request; `cuda:1` works too), or generate a shorter video. A smaller pool does not reduce the host memory, which is set by the video length; the GPU tier avoids it. Shortening the video aside, none of these changes the sampled latents.
 
-**Other switches.** The fast VAE decode is on by default; `--no_vae_fast` restores the original decoder. `--patch_embed_linear` (off by default) is a faster patch embedding that is not guaranteed to reproduce the default latents. The DiT is compiled with `torch.compile` in mode `default`; `--compile_mode` and `--no_compile` change that (see [Reproducibility](#reproducibility)). `--preview_dir` writes PNG previews, `--metrics_json` the timings and the resolved configuration; see `--help` of either script for the rest.
+**Other switches.** The fast VAE decode (on by default; `--no_vae_fast` turns it off), the faster `--patch_embed_linear` (off by default) and the compile settings (`torch.compile` mode `default`; `--compile_mode`, `--no_compile`) are covered under [Reproducibility](#reproducibility). `--preview_dir` writes PNG previews, `--metrics_json` the timings and the resolved configuration; see `--help` of either script for the rest.
 
 ## NSA backend (Triton / CUDA)
 
-The NSA kernels (top-k selection, selection attention, pointer table) and the block-KV cache kernels run on Triton (installed with PyTorch) by default. A native CUDA extension can be selected per process with `OMNIMEM_NSA_BACKEND=cuda` (all entry points, training included) or `--nsa_backend cuda` (the two streaming scripts):
-
-```bash
-python -m omnimem.nsa.cuda_backend.build      # once; needs the CUDA toolkit (nvcc) and ninja
-
-OMNIMEM_NSA_BACKEND=cuda python inference_single_gpu.py \
-    --pretrained $model_path \
-    --vae_path wan_models/vae-2.1/vae \
-    --t5_path $wan_path/models_t5_umt5-xxl-enc-bf16.pth \
-    --tokenizer_path $wan_path/google/umt5-xxl \
-    --output demo/example_cuda.mp4
-```
+The NSA kernels (top-k selection, selection attention, pointer table) and the block-KV cache kernels run on Triton (installed with PyTorch) by default. A native CUDA extension can be selected per process with `OMNIMEM_NSA_BACKEND=cuda` (all entry points, training included) or `--nsa_backend cuda` (the two streaming scripts). `python -m omnimem.nsa.cuda_backend.build` builds it once and needs the CUDA toolkit (nvcc) and ninja.
 
 The build targets the visible GPUs (`TORCH_CUDA_ARCH_LIST` overrides, sm80 and later) and honours `MAX_JOBS` and `TORCH_EXTENSIONS_DIR`; without the explicit build step the extension is compiled on first use. A missing toolchain, a compile error or an unsupported input raises `omnimem.nsa.backend.NSABackendError` — there is no silent fallback to Triton. The switch only changes which kernels run: checkpoints, configs and the training recipe are the same.
 
