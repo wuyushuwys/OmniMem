@@ -81,8 +81,7 @@ class WanCausalConv3d(nn.Conv3d):
         if self.fast:
             if padding[4]:
                 x = F.pad(x, (0, 0, 0, 0, padding[4], 0))
-            # PyTorch 2.9 routes contiguous NCDHW bf16 conv3d to ``slow_conv_dilated3d``
-            # (vol2col + GEMM); channels_last_3d reaches cuDNN and is 3-11x faster.
+            # channels_last_3d is the faster cuDNN layout for these convolutions.
             x = x.contiguous(memory_format=torch.channels_last_3d)
             return F.conv3d(x, self.weight, self.bias, self.stride, self._spatial_padding,
                             self.dilation, self.groups)

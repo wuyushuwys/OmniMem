@@ -18,7 +18,7 @@ logger = get_logger()
 __all__ = ["RECOMPILE_LIMIT", "pin_compile_settings", "compiled_request",
            "filter_expected_dynamo_warnings"]
 
-#: dynamo's per-frame recompile limit this code base is pinned to (the torch 2.9
+#: dynamo's per-frame recompile limit this code base is pinned to (dynamo's
 #: default).  Another value moves the compiled / eager boundary of every long video.
 RECOMPILE_LIMIT = 8
 

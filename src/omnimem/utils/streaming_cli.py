@@ -112,7 +112,7 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     p.add_argument("--no_compile", action="store_true",
                    help="run the DiT without torch.compile")
     p.add_argument("--compile_mode", default="default",
-                   help="torch.compile mode of the DiT; only 'default' is reproducible across processes")
+                   help="torch.compile mode of the DiT; modes other than 'default' autotune per process")
     # prompt switch
     p.add_argument("--switch_prompts", nargs="*", default=None,
                    help="prompts the video switches to, in order: one per entry of "

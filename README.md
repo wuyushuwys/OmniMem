@@ -21,7 +21,7 @@ git lfs pull   # fetch the prompt list
 
 conda create -n omnimem python=3.10 -y
 conda activate omnimem
-pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
+pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
 pip install -e . --extra-index-url https://download.pytorch.org/whl/cu128
 MAX_JOBS=16 pip install flash-attn --no-build-isolation
 ```
