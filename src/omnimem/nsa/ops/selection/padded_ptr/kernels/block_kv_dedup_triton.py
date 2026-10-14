@@ -5,10 +5,11 @@ import torch
 import triton
 import triton.language as tl
 
+from .block_kv_dedup import _SCAN_BLOCK
+
 __all__ = ["launch_dedup_triton", "_MARK_BLOCK", "_SCAN_BLOCK"]
 
 _MARK_BLOCK = 1024
-_SCAN_BLOCK = 1024
 
 
 @triton.jit(do_not_specialize=["n_entries", "epoch"])

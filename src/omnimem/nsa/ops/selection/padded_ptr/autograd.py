@@ -10,8 +10,7 @@ import torch
 
 from omnimem.nsa.backend import get_backend
 
-from ._dispatch import launch_ptr_fwd, launch_ptr_bwd
-from .ptr_builder import build_ptr_table
+from ._dispatch import launch_ptr_fwd, launch_ptr_bwd, build_ptr_table
 from .wrapper import (
     _compute_needed_bids_per_head,
     _build_block_base_ptrs_chunk_level,

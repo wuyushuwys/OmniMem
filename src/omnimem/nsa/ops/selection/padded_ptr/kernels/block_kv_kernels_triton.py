@@ -4,6 +4,8 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
+from .block_kv_kernels import _CLR_BLOCK
+
 __all__ = [
     "launch_block_range_triton",
     "launch_gather_publish_clear_triton",
@@ -13,7 +15,6 @@ __all__ = [
     "_RANGE_BLOCK",
 ]
 
-_CLR_BLOCK = 256
 _RANGE_BLOCK = 128
 
 

@@ -156,20 +156,6 @@ __host__ __device__ __forceinline__ size_t group_smem_bytes(int Gc, int D, size_
   return f32b + esize * static_cast<size_t>(kTileN) * (ldk_for(D) + ldv_for(D));
 }
 
-// Vector width (bytes) for reading a contiguous [.., D] row straight from global memory.
-template <typename T>
-__device__ __forceinline__ int gvec_width(const T* base, int64_t sn, int64_t sd, int D, int unit) {
-  if (sd != 1) return 0;
-  constexpr size_t es = sizeof(T);
-  const uintptr_t a = reinterpret_cast<uintptr_t>(base);
-  const size_t rowb = static_cast<size_t>(D) * es;
-  const size_t stepb = static_cast<size_t>(sn) * es;
-  const size_t unitb = static_cast<size_t>(unit) * es;   // granularity actually consumed
-  if ((a % 16 == 0) && (rowb % 16 == 0) && (stepb % 16 == 0) && (unitb % 16 == 0)) return 16;
-  if ((a % 8 == 0) && (rowb % 8 == 0) && (stepb % 8 == 0) && (unitb % 8 == 0)) return 8;
-  return 0;
-}
-
 // G > 1: one CTA per (b, g, h) with shared-memory staged K/V tiles.
 template <typename T, typename ACC, int DPL>
 __global__ void __launch_bounds__(512) sel_fwd_group_kernel(
@@ -407,10 +393,10 @@ __global__ void __launch_bounds__(kTokenWarps * 32) sel_fwd_token_kernel(
     const int64_t vsn = kv.v_stride_n();
     const int64_t vsd = kv.v_stride_d();
     // K: one whole row per lane, 16B vector loads when stride_d == 1 and aligned.
-    const int kvw = gvec_width<T>(bv.k, bv.stride_n, bv.stride_d, D, D);
+    const int kvw = vec_width<T>(bv.k, bv.stride_n, bv.stride_d, D, D);
     // V: lane == dim slice; load_vecN only when rows are aligned for it.
     const bool v_vec =
-        d_full && gvec_width<T>(bv.v, vsn, vsd, D, DPL) >= load_vecN_align<T, DPL>();
+        d_full && vec_width<T>(bv.v, vsn, vsd, D, DPL) >= load_vecN_align<T, DPL>();
 
     for (int tok0 = 0; tok0 < bv.n_valid; tok0 += kTileN) {
       const int ntile = ::min(kTileN, bv.n_valid - tok0);

@@ -5,11 +5,10 @@ import torch
 
 from omnimem.nsa.backend import BlockKVBackendError
 from . import _block_kv_loader
+from .ops import _INT32_MAX
 
 __all__ = ["gather_publish_clear", "block_range", "dedup_run",
            "is_loaded", "load", "warmup"]
-
-_INT32_MAX = 2 ** 31 - 1
 
 
 def _ops():

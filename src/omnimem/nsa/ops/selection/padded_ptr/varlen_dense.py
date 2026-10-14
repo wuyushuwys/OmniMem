@@ -13,8 +13,7 @@ import torch
 
 from omnimem.nsa.backend import get_backend
 
-from ._dispatch import launch_ptr_fwd, launch_ptr_bwd, build_ptr_table_dispatch
-from .ptr_builder import build_ptr_table
+from ._dispatch import launch_ptr_fwd, launch_ptr_bwd, build_ptr_table
 
 
 
@@ -252,7 +251,7 @@ class _SelectionAttentionVarlenDense(torch.autograd.Function):
         n_global_blocks = n_chunks_per_head * blocks_per_chunk
 
         # rebuild ptr table from fresh K_gather addresses (with the backend captured at forward)
-        ptr_table_k, ptr_table_v = build_ptr_table_dispatch(
+        ptr_table_k, ptr_table_v = build_ptr_table(
             block_indices_remapped, chunk_base_ptrs_k, chunk_base_ptrs_v, n_global_blocks,
             batch_stride_kv_bytes, blocks_per_chunk, in_chunk_block_bytes_kv,
             backend=ctx.backend,

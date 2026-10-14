@@ -9,8 +9,7 @@ from collections import defaultdict
 import torch
 
 from omnimem.nsa.backend import get_backend
-from ._dispatch import launch_ptr_fwd
-from .ptr_builder import build_ptr_table
+from ._dispatch import launch_ptr_fwd, build_ptr_table
 
 
 def _check_bf16_storage(k_t: torch.Tensor, v_t: torch.Tensor, h: int, idx: int) -> None:

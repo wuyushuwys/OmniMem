@@ -8,10 +8,10 @@ import torch
 from omnimem.nsa.backend import get_backend
 from omnimem.nsa.ops._int_utils import compute_tile_n, next_power_of_2
 
-__all__ = ["launch_ptr_fwd", "launch_ptr_bwd", "build_ptr_table_dispatch", "get_backend"]
+__all__ = ["launch_ptr_fwd", "launch_ptr_bwd", "build_ptr_table", "get_backend"]
 
 
-def build_ptr_table_dispatch(
+def build_ptr_table(
     block_indices: torch.Tensor,
     block_base_ptrs_k: torch.Tensor,
     block_base_ptrs_v: torch.Tensor,

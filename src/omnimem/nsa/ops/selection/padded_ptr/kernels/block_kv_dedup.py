@@ -10,7 +10,7 @@ from omnimem.nsa.ops._int_utils import cdiv
 
 __all__ = ["DeviceBlockDedup"]
 
-#: Scan tile size; must match block_kv_dedup_triton._SCAN_BLOCK and the CUDA kernel's tile.
+#: Scan tile size; must match the CUDA kernel's tile.
 _SCAN_BLOCK = 1024
 
 

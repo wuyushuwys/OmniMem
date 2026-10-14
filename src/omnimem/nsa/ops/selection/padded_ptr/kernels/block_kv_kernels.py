@@ -16,7 +16,7 @@ __all__ = [
     "table_entry_addresses",
 ]
 
-#: K1 clear-tile size; must match block_kv_kernels_triton._CLR_BLOCK and the CUDA kernel's tile.
+#: K1 clear-tile size; must match the CUDA kernel's tile.
 _CLR_BLOCK = 256
 
 

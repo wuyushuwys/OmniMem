@@ -9,18 +9,9 @@ from omnimem.utils.stage_marks import profile_label
 
 from omnimem.nsa.backend import get_backend
 
-from ._dispatch import build_ptr_table_dispatch, launch_ptr_fwd
+from ._dispatch import build_ptr_table, launch_ptr_fwd
 
 __all__ = ["selection_attention_block_store", "build_ptr_table"]
-
-
-def build_ptr_table(*, block_indices, block_base_ptrs_k, block_base_ptrs_v,
-                    n_blocks_per_head, batch_stride=0, blocks_per_chunk=0,
-                    in_chunk_block_bytes=0, backend=None):
-    """Block-level pointer build (keyword-only so tests can spy on it)."""
-    return build_ptr_table_dispatch(
-        block_indices, block_base_ptrs_k, block_base_ptrs_v, n_blocks_per_head,
-        batch_stride, blocks_per_chunk, in_chunk_block_bytes, backend=backend)
 
 
 def selection_attention_block_store(
@@ -45,8 +36,6 @@ def selection_attention_block_store(
         f"batch element's block and the ptr table adds no batch stride")
     assert q.is_cuda and q.dtype == torch.bfloat16, \
         f"block-store selection attention needs bf16 CUDA queries, got {q.dtype}"
-    assert M % G == 0, \
-        f"selection attention requires M ({M}) divisible by group_size ({G})"
     assert block_indices.shape == (B, MG, H, T), \
         f"block_indices {tuple(block_indices.shape)} != {(B, MG, H, T)}"
     assert block_indices.dtype == torch.int32, \
