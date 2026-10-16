@@ -5,6 +5,7 @@ Kept out of omnimem.pipelines, whose import loads torch: run() binds to the GPU'
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 import os
@@ -12,6 +13,8 @@ import re
 import sys
 import time
 import warnings
+
+from omnimem.utils.streaming_recipe import Recipe
 
 warnings.filterwarnings("ignore")
 # omnimem's logger forces root handlers to ERROR; keep our progress on a private logger.
@@ -68,7 +71,68 @@ def load_prompt_file(path: str) -> list:
     return requests
 
 
-def build_parser(description: str) -> argparse.ArgumentParser:
+def add_recipe_args(p: argparse.ArgumentParser, tier: bool = False) -> list:
+    """Add a flag per ``Recipe`` field (no encoder settings), defaults from ``Recipe()``; returns their dests."""
+    d = Recipe()
+    first = len(p._actions)
+    p.add_argument("--height", type=int, default=d.height)
+    p.add_argument("--width", type=int, default=d.width)
+    p.add_argument("--fps", type=int, default=d.fps)
+    p.add_argument("--num_inference_steps", type=int, default=d.num_inference_steps)
+    p.add_argument("--shift", type=float, default=d.shift)
+    p.add_argument("--frame_per_block", type=int, default=d.frame_per_block)
+    p.add_argument("--window_size", type=int, default=d.window_size)
+    p.add_argument("--sink_size", type=int, default=d.sink_size)
+    p.add_argument("--enable_kv_evict", action=_UnderscoreNegBooleanOptionalAction,
+                   default=d.enable_kv_evict,
+                   help="evict KV history outside the window and sink from the DiT GPU")
+    p.add_argument("--lru_max_size", type=int, default=d.lru_max_size,
+                   help="chunk LRU capacity; only with --kv_cache_policy chunk_lru")
+    p.add_argument("--park_t5", default=d.park_t5,
+                   help="move the T5 encoder to this device after encoding (e.g. cuda:1 or cpu) to free DiT GPU memory")
+    p.add_argument("--vae_fast", action=_UnderscoreNegBooleanOptionalAction,
+                   default=d.vae_decode_fast,
+                   help="use the faster VAE decode path; --no_vae_fast keeps the original decoder")
+    p.add_argument("--patch_embed_linear", action="store_true", default=d.patch_embed_linear,
+                   help="use a linear patch embedding instead of Conv3d; results may differ slightly")
+    p.add_argument("--no_compile", action="store_true", default=not d.compile,
+                   help="run the DiT without torch.compile")
+    p.add_argument("--compile_mode", default=d.compile_mode,
+                   help="torch.compile mode of the DiT; modes other than 'default' autotune per process")
+    p.add_argument("--slice_last_frames", type=int, default=d.slice_last_frames,
+                   help="latent frames before a prompt switch whose KV history is recomputed under the new prompt")
+    p.add_argument("--recache_mode", default=d.recache_mode, choices=["full", "window_only", "none"],
+                   help="KV history handling at a prompt switch; window_only restores old KV outside the window, none keeps it")
+    p.add_argument("--kv_cache_policy", default=d.kv_cache_policy, choices=["block_lru", "chunk_lru"],
+                   help="history cache policy: block_lru keeps selected KV blocks, chunk_lru keeps whole chunks")
+    p.add_argument("--kv_block_pool_gb", type=float, default=d.kv_block_pool_gb,
+                   help="persistent block pool budget in GiB, must be > 0 (unset = 24); only with block_lru")
+    p.add_argument("--kv_block_scratch_gb", type=float, default=d.kv_block_scratch_gb,
+                   help="shared scratch block pool budget in GiB (unset = 0.75); only with block_lru")
+    # Block store options: each only meaningful with --kv_cache_policy block_lru.
+    p.add_argument("--kv_block_resident_if_fits", action=_UnderscoreNegBooleanOptionalAction,
+                   default=d.kv_block_resident_if_fits,
+                   help="keep the whole KV history on the DiT GPU if it fits the pool budget; only with block_lru")
+    p.add_argument("--kv_block_dedup", default=d.kv_block_dedup, choices=["unique", "device"],
+                   help="dedup of selected block keys, on the device or with torch.unique; only with block_lru")
+    p.add_argument("--kv_window_buffer", action=_UnderscoreNegBooleanOptionalAction,
+                   default=d.kv_window_buffer,
+                   help="preallocate KV history and window buffers; faster but uses more GPU memory")
+    if tier:
+        p.add_argument("--kv_tier", action="store_true", default=d.kv_tier,
+                       help="with --kv_cache_policy chunk_lru: evict KV history to the decode GPU, not host memory")
+        p.add_argument("--kv_tier_budget_gb", type=float, default=d.kv_tier_budget_gb,
+                       help="KV history budget on the decode GPU, in GiB; evictions past it go to host memory")
+    return [a.dest for a in p._actions[first:]]
+
+
+def recipe_kwargs(args) -> dict:
+    """The ``Recipe`` fields ``args`` sets, in field order."""
+    given = dict(vars(args), compile=not args.no_compile, vae_decode_fast=args.vae_fast)
+    return {f.name: given[f.name] for f in dataclasses.fields(Recipe) if f.name in given}
+
+
+def build_parser(description: str, tier: bool = False) -> argparse.ArgumentParser:
     """Parser of the options both entry scripts take; each script adds its device options."""
     p = argparse.ArgumentParser(description=description,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -82,61 +146,21 @@ def build_parser(description: str) -> argparse.ArgumentParser:
                    help="text prompt (default: the cat/piano demo prompt)")
     p.add_argument("--prompt_file", default=None,
                    help="one video per line: a .txt of prompts, or a .jsonl of prompts and switch_frame_indices")
-    p.add_argument("--height", type=int, default=480)
-    p.add_argument("--width", type=int, default=832)
     p.add_argument("--nframes", type=int, default=969,
                    help="requested frames; actual = 1 + 4 * ((nframes - 1) // 4)")
-    p.add_argument("--fps", type=int, default=16)
-    p.add_argument("--num_inference_steps", type=int, default=4)
-    p.add_argument("--shift", type=float, default=5.0)
     p.add_argument("--seed", type=int, default=42)
-    # causal / NSA runtime
     p.add_argument("--nsa_backend", default=None, choices=["triton", "cuda"],
                    help="kernel backend, triton or cuda (unset: $OMNIMEM_NSA_BACKEND, else triton)")
-    p.add_argument("--frame_per_block", type=int, default=3)
-    p.add_argument("--window_size", type=int, default=3)
-    p.add_argument("--sink_size", type=int, default=None)
-    p.add_argument("--enable_kv_evict", action=_UnderscoreNegBooleanOptionalAction, default=True,
-                   help="evict KV history outside the window and sink from the DiT GPU")
-    p.add_argument("--lru_max_size", type=int, default=20,
-                   help="chunk LRU capacity; only with --kv_cache_policy chunk_lru")
-    p.add_argument("--park_t5", default=None,
-                   help="move the T5 encoder to this device after encoding (e.g. cuda:1 or cpu) to free DiT GPU memory")
-    p.add_argument("--vae_fast", action=_UnderscoreNegBooleanOptionalAction, default=True,
-                   help="use the faster VAE decode path; --no_vae_fast keeps the original decoder")
-    p.add_argument("--patch_embed_linear", action="store_true",
-                   help="use a linear patch embedding instead of Conv3d; results may differ slightly")
-    p.add_argument("--no_compile", action="store_true",
-                   help="run the DiT without torch.compile")
-    p.add_argument("--compile_mode", default="default",
-                   help="torch.compile mode of the DiT; modes other than 'default' autotune per process")
     # prompt switch
     p.add_argument("--switch_prompts", nargs="*", default=None,
                    help="prompts the video switches to, in order: one per entry of "
                         "--switch_frame_indices")
     p.add_argument("--switch_frame_indices", nargs="*", type=int, default=None,
                    help="latent frame indices of the prompt switches; increasing, multiples of --frame_per_block")
-    p.add_argument("--slice_last_frames", type=int, default=21,
-                   help="latent frames before a prompt switch whose KV history is recomputed under the new prompt")
-    p.add_argument("--recache_mode", default="full", choices=["full", "window_only", "none"],
-                   help="KV history handling at a prompt switch; window_only restores old KV outside the window, none keeps it")
-    # streaming switches
     p.add_argument("--queue_depth", type=int, default=2,
                    help="capacity of the latent and frame queues, in chunks")
-    p.add_argument("--kv_cache_policy", default="block_lru", choices=["block_lru", "chunk_lru"],
-                   help="history cache policy: block_lru keeps selected KV blocks, chunk_lru keeps whole chunks")
-    p.add_argument("--kv_block_pool_gb", type=float, default=None,
-                   help="persistent block pool budget in GiB, must be > 0 (unset = 24); only with block_lru")
-    p.add_argument("--kv_block_scratch_gb", type=float, default=None,
-                   help="shared scratch block pool budget in GiB (unset = 0.75); only with block_lru")
-    # Block store options: each only meaningful with --kv_cache_policy block_lru.
-    p.add_argument("--kv_block_resident_if_fits", action=_UnderscoreNegBooleanOptionalAction,
-                   default=True,
-                   help="keep the whole KV history on the DiT GPU if it fits the pool budget; only with block_lru")
-    p.add_argument("--kv_block_dedup", default="device", choices=["unique", "device"],
-                   help="dedup of selected block keys, on the device or with torch.unique; only with block_lru")
-    p.add_argument("--kv_window_buffer", action=_UnderscoreNegBooleanOptionalAction, default=True,
-                   help="preallocate KV history and window buffers; faster but uses more GPU memory")
+    # the recipe: resolution, sampler, causal / NSA runtime, KV history
+    add_recipe_args(p, tier=tier)
     p.add_argument("--no_numa_bind", action="store_true")
     # output
     p.add_argument("--output", required=True,
@@ -149,13 +173,13 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     p.add_argument("--metrics_json", default=None)
     p.add_argument("--repeat", type=int, default=1,
                    help="generate the request N times (repeats get a _rK suffix on output and preview paths)")
-    p.add_argument("--crf", type=int, default=18)
-    p.add_argument("--preset", default="medium")
+    p.add_argument("--crf", type=int, default=Recipe.crf)
+    p.add_argument("--preset", default=Recipe.preset)
     return p
 
 
-def run(args, dit_device, decode_device=None, **tier) -> int:
-    """Run the parsed request; a ``decode_device`` means two GPUs, ``tier`` are Recipe fields."""
+def run(args, dit_device, decode_device=None) -> int:
+    """Run the parsed request; a ``decode_device`` means two GPUs."""
     if not args.no_numa_bind:
         from omnimem.utils.numa_bind import bind_to_gpu_numa
         bind_to_gpu_numa(verbose=False)
@@ -163,7 +187,7 @@ def run(args, dit_device, decode_device=None, **tier) -> int:
     # Imported after the NUMA binding, so that the threads torch starts inherit it.
     from omnimem.pipelines.compile_state import filter_expected_dynamo_warnings
     from omnimem.pipelines.streaming_inference import (
-        DEFAULT_PROMPT, ModelPaths, Recipe, StreamingRuntime, git_info,
+        DEFAULT_PROMPT, ModelPaths, StreamingRuntime, git_info,
         validate_request, actual_frames, check_output_target, check_layout)
 
     # Everything that can be refused without the weights is refused here, before the
@@ -193,24 +217,7 @@ def run(args, dit_device, decode_device=None, **tier) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    recipe = Recipe(height=args.height, width=args.width, fps=args.fps,
-                    num_inference_steps=args.num_inference_steps, shift=args.shift,
-                    frame_per_block=args.frame_per_block, window_size=args.window_size,
-                    sink_size=args.sink_size, enable_kv_evict=args.enable_kv_evict,
-                    lru_max_size=args.lru_max_size,
-                    compile=not args.no_compile,
-                    compile_mode=args.compile_mode, crf=args.crf, preset=args.preset,
-                    slice_last_frames=args.slice_last_frames, recache_mode=args.recache_mode,
-                    park_t5=args.park_t5,
-                    kv_cache_policy=args.kv_cache_policy,
-                    kv_block_pool_gb=args.kv_block_pool_gb,
-                    kv_block_scratch_gb=args.kv_block_scratch_gb,
-                    kv_block_resident_if_fits=args.kv_block_resident_if_fits,
-                    kv_block_dedup=args.kv_block_dedup,
-                    kv_window_buffer=args.kv_window_buffer,
-                    vae_decode_fast=args.vae_fast,
-                    patch_embed_linear=args.patch_embed_linear,
-                    **tier)
+    recipe = Recipe(**recipe_kwargs(args))
     paths = ModelPaths(args.pretrained, args.vae_path, args.t5_path, args.tokenizer_path)
     if args.nsa_backend is not None:
         # Before ``load()``, which builds / loads the extensions of the active backend.

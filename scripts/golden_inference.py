@@ -26,7 +26,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 import torch
 
-from omnimem.utils.streaming_cli import _UnderscoreNegBooleanOptionalAction
+from omnimem.utils.streaming_cli import add_recipe_args, recipe_kwargs
 
 
 # The model assets of a run: required arguments of ``record`` / ``compare``.
@@ -35,6 +35,14 @@ ASSET_ARGS = ("pretrained", "vae_path", "t5_path", "tokenizer_path")
 RECIPE_FIELDS_OUTSIDE_A_GOLDEN = ("crf", "preset", "pix_fmt")
 DEFAULT_SWITCH_PROMPT = ("The same scene at dawn, warm golden light pouring in, the music slowing to "
                          "a gentle finale.")
+# The reference request (chunk LRU 7, original VAE decode): every recipe default is this tool's own, not the runtime's.
+REFERENCE_RECIPE = dict(
+    height=480, width=832, fps=16, num_inference_steps=4, shift=5.0, frame_per_block=3,
+    window_size=3, sink_size=None, enable_kv_evict=True, lru_max_size=7, park_t5=None,
+    vae_fast=False, patch_embed_linear=False, no_compile=False, compile_mode="default",
+    slice_last_frames=21, recache_mode="full", kv_cache_policy="chunk_lru",
+    kv_block_pool_gb=0.0, kv_block_scratch_gb=0.0, kv_block_resident_if_fits=True,
+    kv_block_dedup="device", kv_window_buffer=False, kv_tier=False, kv_tier_budget_gb=48.0)
 # request_spec keys compare checks against the golden's; a difference is warned about.
 SPEC_KEYS_COMPARED = ("gpus", "kv_tier", "nframes", "seed", "lru_max_size", "compile",
                       "queue_depth", "recache_mode", "kv_cache_policy", "kv_block_pool_gb",
@@ -100,28 +108,6 @@ def _jsonable(obj):
 
 
 # ----------------------------------------------------------------------------- runtime
-def recipe_kwargs(args) -> Dict[str, Any]:
-    """The ``Recipe`` of this run, every field set from a switch of this tool."""
-    return dict(
-        height=args.height, width=args.width, fps=args.fps,
-        num_inference_steps=args.num_inference_steps, shift=args.shift,
-        frame_per_block=args.frame_per_block, window_size=args.window_size,
-        sink_size=args.sink_size, enable_kv_evict=args.enable_kv_evict,
-        lru_max_size=args.lru_max_size,
-        compile=not args.no_compile, compile_mode=args.compile_mode,
-        patch_embed_linear=args.patch_embed_linear,
-        slice_last_frames=args.slice_last_frames, recache_mode=args.recache_mode,
-        park_t5=args.park_t5,
-        kv_cache_policy=args.kv_cache_policy, kv_block_pool_gb=args.kv_block_pool_gb,
-        kv_block_scratch_gb=args.kv_block_scratch_gb,
-        kv_block_resident_if_fits=args.kv_block_resident_if_fits,
-        kv_block_dedup=args.kv_block_dedup,
-        kv_tier=args.kv_tier, kv_tier_budget_gb=args.kv_tier_budget_gb,
-        kv_window_buffer=args.kv_window_buffer,
-        vae_decode_fast=args.vae_decode_fast,
-    )
-
-
 def build_recipe(args):
     """``Recipe(**recipe_kwargs(args))``, refusing a ``Recipe`` this tool does not cover."""
     import dataclasses
@@ -538,23 +524,12 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--switch_latent_frame", type=int, default=None)
         p.add_argument("--no_trace", action="store_true", help="do not capture per-layer top-k IDs")
         p.add_argument("--repeat", type=int, default=1)
-        # The request (``Recipe``) -- every default below is this tool's own, not the
-        # runtime's: the reference configuration (chunk LRU 7, original VAE decode).
-        p.add_argument("--height", type=int, default=480)
-        p.add_argument("--width", type=int, default=832)
-        p.add_argument("--fps", type=int, default=16)
-        p.add_argument("--num_inference_steps", type=int, default=4)
-        p.add_argument("--shift", type=float, default=5.0)
-        p.add_argument("--frame_per_block", type=int, default=3)
-        p.add_argument("--window_size", type=int, default=3)
-        p.add_argument("--sink_size", type=int, default=None)
-        p.add_argument("--enable_kv_evict", action=_UnderscoreNegBooleanOptionalAction, default=True,
-                       help="evict KV history outside the window and sink from the DiT GPU")
-        p.add_argument("--lru_max_size", type=int, default=7)
-        p.add_argument("--slice_last_frames", type=int, default=21)
-        p.add_argument("--no_compile", action="store_true")
-        p.add_argument("--compile_mode", default="default",
-                       help="torch.compile mode of the DiT; only 'default' is reproducible across processes")
+        # The request (``Recipe``), with this tool's own defaults.
+        recipe_flags = add_recipe_args(p, tier=True)
+        if set(recipe_flags) != set(REFERENCE_RECIPE):
+            raise RuntimeError(f"REFERENCE_RECIPE must set exactly the recipe flags "
+                               f"{sorted(set(recipe_flags) ^ set(REFERENCE_RECIPE))}")
+        p.set_defaults(**REFERENCE_RECIPE)
         p.add_argument("--queue_depth", type=int, default=2)
         p.add_argument("--nsa_backend", default=os.environ.get("OMNIMEM_NSA_BACKEND", "triton"),
                        choices=["triton", "cuda"],
@@ -567,39 +542,10 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--expect_reload", action="store_true",
                        help="fail unless whole chunks were reloaded (cache_stats bytes > 0)")
         p.add_argument("--save_repeats", action="store_true", help="record: also save repeat payloads as repeat_r<i>.pt")
-        p.add_argument("--kv_cache_policy", default="chunk_lru", choices=["chunk_lru", "block_lru"],
-                       help="history cache policy: block_lru keeps selected KV blocks, chunk_lru keeps whole chunks")
-        p.add_argument("--kv_block_pool_gb", type=float, default=0.0,
-                       help="persistent block pool budget in GiB, must be > 0; only with block_lru, else leave 0")
-        p.add_argument("--kv_block_scratch_gb", type=float, default=0.0,
-                       help="shared scratch block pool budget in GiB; only with block_lru, else leave 0")
-        p.add_argument("--kv_tier", action="store_true",
-                       help="with --kv_cache_policy chunk_lru on two GPUs: evict KV history to the decode GPU, not host memory")
-        p.add_argument("--kv_tier_budget_gb", type=float, default=48.0,
-                       help="KV history budget on the decode GPU, in GiB")
-        # Block store options: each only meaningful with --kv_cache_policy block_lru;
-        # saved in the golden spec (compare warns on drift, same as --recache_mode).
-        p.add_argument("--kv_block_resident_if_fits", action=_UnderscoreNegBooleanOptionalAction,
-                       default=True,
-                       help="keep the whole KV history on the DiT GPU if it fits the pool budget; only with block_lru")
-        p.add_argument("--kv_block_dedup", default="device", choices=["unique", "device"],
-                       help="dedup of selected block keys, on the device or with torch.unique; only with block_lru")
-        # A golden run keeps the original window-buffer and VAE decode path unless flagged.
-        p.add_argument("--kv_window_buffer", action="store_true",
-                       help="preallocate KV history and window buffers; faster but uses more GPU memory")
-        p.add_argument("--vae_fast", dest="vae_decode_fast",
-                       action=_UnderscoreNegBooleanOptionalAction, default=False,
-                       help="faster VAE decode path, off by default here; output is not bit-identical")
-        p.add_argument("--patch_embed_linear", action="store_true",
-                       help="use a linear patch embedding instead of Conv3d; results may differ slightly")
-        p.add_argument("--recache_mode", default="full", choices=["full", "window_only", "none"],
-                       help="KV history handling at a prompt switch; window_only restores old KV outside the window, none keeps it")
         p.add_argument("--expect_block_fetch", action="store_true",
                        help="fail unless every repeat used the block path (block fetches and retirements > 0)")
         p.add_argument("--expect_no_chunk_reload", action="store_true",
                        help="fail unless every repeat had no whole-chunk reloads")
-        p.add_argument("--park_t5", default=None,
-                       help="move the T5 encoder to this device after encoding (e.g. cuda:1 or cpu) to free DiT GPU memory")
 
     p_rec = sub.add_parser("record")
     add_run_args(p_rec)
