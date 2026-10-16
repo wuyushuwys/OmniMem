@@ -52,8 +52,8 @@ _ROPE_TABLE_CACHE = {}
 _ROPE_TABLE_CACHE_ENABLED = True
 
 
-def build_rope_table_uncached(dim: int, num_heads: int, device) -> torch.Tensor:
-    """The original ``get_rope_params`` body, with no memoisation."""
+def build_rope_table_uncached(dim: int, num_heads: int, device=None) -> torch.Tensor:
+    """The original ``get_rope_params`` body, with no memoisation; ``device=None`` keeps the build device."""
     d = dim // num_heads
     return torch.cat([
         rope_params(1024, d - 4 * (d // 6)),
@@ -416,13 +416,7 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # freqs: not via register_buffer to avoid dtype change on .to()
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
-        d = dim // num_heads
-        self.freqs = torch.cat([
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6))
-        ],
-            dim=1)
+        self.freqs = build_rope_table_uncached(dim, num_heads)
 
         # initialize weights
         self.init_weights()
@@ -432,13 +426,7 @@ class WanModel(ModelMixin, ConfigMixin):
         # See the `build_rope_table` block above for the exactness argument.
         if _ROPE_TABLE_CACHE_ENABLED:
             return build_rope_table(self.dim, self.num_heads, device)
-        d = self.dim // self.num_heads
-        freqs = torch.cat([
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6))
-        ], dim=1).to(device=device)
-        return freqs
+        return build_rope_table_uncached(self.dim, self.num_heads, device)
 
     def forward(
             self,

@@ -228,10 +228,8 @@ def causal_reorder_rope_apply(x, grid_sizes, freqs, start_frame=0, pool_f=1, poo
     """Apply RoPE to reordered tokens with temporal offset start_frame."""
     n, c = x.size(2), x.size(3) // 2
     # Cache unless start_frame is not a plain int.
-    use_cache = isinstance(start_frame, int)
-    # split freqs
-    if not use_cache:
-        freqs_split = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    position_factor = (_rope_position_factor if isinstance(start_frame, int)
+                       else _build_rope_position_factor)
     output = []
     # loop over samples
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
@@ -240,24 +238,7 @@ def causal_reorder_rope_apply(x, grid_sizes, freqs, start_frame=0, pool_f=1, poo
         x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
             seq_len, n, -1, 2))
 
-        if use_cache:
-            freqs_i = _rope_position_factor(freqs, c, f, h, w, start_frame,
-                                            pool_f, pool_h, pool_w)
-        else:
-            # Build 3D freq grid then rearrange to match reordered token layout.
-            freqs_grid = torch.cat([
-                freqs_split[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
-                freqs_split[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-                freqs_split[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-            ],
-                dim=-1)
-            freqs_i = rearrange(
-                freqs_grid,
-                '(f fs) (h hs) (w ws) d -> (f h w fs hs ws) 1 d',
-                fs=pool_f,
-                hs=pool_h,
-                ws=pool_w
-            )
+        freqs_i = position_factor(freqs, c, f, h, w, start_frame, pool_f, pool_h, pool_w)
         # apply rotary embedding
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
         # ``rope_tail`` / ``rope_finish`` elide the empty-tail cat and the
