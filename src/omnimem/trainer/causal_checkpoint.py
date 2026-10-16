@@ -1,20 +1,12 @@
 """Complete teacher-forcing checkpoint orchestration, including EMA weights."""
 
-import json
-import os
 from pathlib import Path
-import posixpath
 
 from omegaconf import OmegaConf
-import torch.distributed as dist
 
-from omnimem.utils.misc import is_main_process, unwrap_model
+from omnimem.trainer.complete_checkpoint import CompleteCheckpointMixin
 from omnimem.utils.ode_checkpoint_store import ODECheckpointStore, check_model_dir, config_differences
-from omnimem.utils.ode_training_state import (
-    call_on_all_ranks, capture_rng_state, load_training_state, read_training_metadata, restore_rng_state,
-    save_training_state,
-)
-from omnimem.utils.torch_utils import get_fsdp_state_dict, resume_model, save_sharded_safetensors
+from omnimem.utils.ode_training_state import read_training_metadata
 
 
 def _check_payload(path, step, world_size):
@@ -38,32 +30,10 @@ class CausalCheckpointStore(ODECheckpointStore):
     _check_payload = staticmethod(_check_payload)
 
 
-class CausalCheckpointMixin:
-    def _get_resume_dir(self):
-        return self.config.get("checkpoint_dir") or os.path.join(self.output_dir, "checkpoints")
-
-    def _checkpoint_rank0_call(self, operation):
-        result = [None]
-        if is_main_process():
-            try:
-                result[0] = {"value": operation(), "error": None}
-            except Exception as exc:
-                result[0] = {"value": None, "error": f"{type(exc).__name__}: {exc}"}
-        if dist.is_initialized():
-            dist.broadcast_object_list(result, src=0)
-        if result[0]["error"] is not None:
-            raise RuntimeError(f"Causal checkpoint operation failed: {result[0]['error']}")
-        return result[0]["value"]
-
-    def _checkpoint_all_ranks_call(self, operation):
-        return call_on_all_ranks(operation, "complete the causal checkpoint step")
-
-    def _scheduler_config(self):
-        config = {"type": self.lr_scheduler_type, "warmup_steps": self.lr_warmup_steps,
-                  "kwargs": dict(self.lr_scheduler_kwargs)}
-        if self.lr_scheduler_type not in ("constant", "constant_with_warmup"):
-            config["max_train_steps"] = self.max_train_steps
-        return OmegaConf.to_container(OmegaConf.create(config), resolve=True)
+class CausalCheckpointMixin(CompleteCheckpointMixin):
+    _checkpoint_label = "causal"
+    _checkpoint_store_cls = CausalCheckpointStore
+    _legacy_checkpoint_names = ("checkpoint.pth", "model", "checkpoint_dcp")
 
     def _training_config(self):
         # Exclude storage and initialization paths: nodes stage them at different
@@ -77,103 +47,12 @@ class CausalCheckpointMixin:
         config["scheduler"] = self._scheduler_config()
         return OmegaConf.to_container(OmegaConf.create(config), resolve=True)
 
-    def resume_state(self):
-        client = self.s3.s3_client if self.upload else None
-        prefix = self.config.get("checkpoint_s3_prefix")
-        if client is not None and prefix is None:
-            if os.path.isabs(self.config.output_dir):
-                raise ValueError("An absolute output_dir requires an explicit checkpoint_s3_prefix")
-            prefix = posixpath.join(self.s3_dir, self.output_dir, "checkpoints")
-        self._checkpoint_store = CausalCheckpointStore(
-            Path(self.resume_dir), s3_client=client,
-            bucket=self.s3_bucket if client is not None else None,
-            s3_prefix=prefix if client is not None else None,
-        )
-        self._resume_rng_state = None
-        keep = self.config.get("checkpoint_keep_local")
-        if keep is not None and client is not None:
-            # Free space before the first save; the newest local copy is kept for resume.
-            removed = self._checkpoint_rank0_call(
-                lambda: [str(p) for p in self._checkpoint_store.prune_local(max(keep, 1))])
-            self.logger.info(f"Pruned local checkpoints already on S3 before resume: {removed}")
+    def _check_resume_recipe(self, checkpoint):
+        if read_training_metadata(checkpoint, {"causal"})["extra_state"]["training_config"] != self._training_config():
+            raise ValueError("Training configuration differs from the completed causal checkpoint")
 
-        def select_checkpoint():
-            checkpoint = self._checkpoint_store.latest()
-            if checkpoint is None:
-                if any((Path(self.resume_dir) / name).exists() for name in ("checkpoint.pth", "model", "checkpoint_dcp")):
-                    raise ValueError("Legacy causal checkpoint cannot be resumed as complete state; use a new run and explicit weight initialization")
-                return None
-            manifest = json.loads((checkpoint / "COMPLETED.json").read_text())
-            world_size = dist.get_world_size() if dist.is_initialized() else 1
-            if manifest["world_size"] != world_size:
-                raise ValueError("Full causal resume requires the original number of training ranks")
-            if read_training_metadata(checkpoint, {"causal"})["extra_state"]["training_config"] != self._training_config():
-                raise ValueError("Training configuration differs from the completed causal checkpoint")
-            return {"path": str(checkpoint), "step": manifest["global_step"]}
+    def _checkpoint_extra_state(self):
+        return {"trainer_family": "causal", "training_config": self._training_config()}
 
-        selected = self._checkpoint_rank0_call(select_checkpoint)
-        self._resume_checkpoint = Path(selected["path"]) if selected else None
-        self.logger.info(f"Resume complete causal checkpoint {self._resume_checkpoint}" if selected
-                         else "No completed causal checkpoint; starting a new run.")
-        return selected["step"] if selected else 0
-
-    def _restore_checkpoint_weights(self, role, module):
-        def restore():
-            directory = self._resume_checkpoint / role
-            different = config_differences(json.loads((directory / "config.json").read_text()),
-                                           json.loads(json.dumps(dict(module.config))))
-            if different:
-                raise ValueError(f"{role} configuration differs from the resume checkpoint: {different}")
-            resume_model(str(directory), module, strict=True)
-        self._checkpoint_all_ranks_call(restore)
-
-    def resume_from_checkpoint(self):
-        if self._resume_checkpoint is not None:
-            self._restore_checkpoint_weights("model", self.model)
-
-    def _restore_training_state(self):
-        if self._resume_checkpoint is not None:
-            state = load_training_state(self._resume_checkpoint, self.model, self.optimizer,
-                                        self.lr_scheduler, expected_step=self.global_step)
-            self._resume_rng_state = state["rng_state"]
-            self.logger.info("Restored causal optimizer/scheduler; data stream will resample on resume.")
-
-    def save_models(self):
-        staging = Path(self._checkpoint_rank0_call(lambda: str(self._checkpoint_store.begin(self.global_step))))
-
-        def require_shared():
-            if not staging.is_dir():
-                raise FileNotFoundError(f"Checkpoint staging {staging} must be shared by all training ranks")
-            if self.ema_model != (self.ema is not None):
-                raise ValueError("EMA state does not match the configured EMA policy")
-        self._checkpoint_all_ranks_call(require_shared)
-        for role, module in (("model", self.model), ("ema", self.ema)):
-            if module is None:
-                continue
-            state = get_fsdp_state_dict(unwrap_model(module))
-
-            def save_weights():
-                directory = str(staging / role)
-                module.save_config(save_directory=directory)
-                save_sharded_safetensors(state_dict=state, save_dir=directory)
-            self._checkpoint_rank0_call(save_weights)
-            del state
-        save_training_state(staging, self.model, self.optimizer, self.lr_scheduler, self.global_step,
-                            extra_state={"trainer_family": "causal", "training_config": self._training_config()})
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        checkpoint = Path(self._checkpoint_rank0_call(
-            lambda: str(self._checkpoint_store.commit(staging, self.global_step, world_size))))
-        self.logger.info(f"Saved complete causal checkpoint: {checkpoint}")
-        if self._checkpoint_store.s3 is not None:
-            self._checkpoint_rank0_call(lambda: self._checkpoint_store.upload(checkpoint))
-            keep = self.config.get("checkpoint_keep_local")
-            if keep is not None:
-                removed = self._checkpoint_rank0_call(lambda: [str(p) for p in self._checkpoint_store.prune_local(keep)])
-                self.logger.info(f"Pruned local checkpoints already on S3 (keep {keep}): {removed}")
-
-    def _evaluate_without_rng_change(self):
-        state = capture_rng_state()
-        try:
-            self.evaluate()
-        finally:
-            restore_rng_state(state)
+    def _ema_active(self):
+        return self.ema_model

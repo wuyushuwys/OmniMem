@@ -1,8 +1,4 @@
-import os
 import math
-import json
-import posixpath
-from pathlib import Path
 import wandb
 
 import torch
@@ -17,24 +13,20 @@ from omnimem.models.flex_attention_utils import create_causal_block_mask_cached
 from omnimem.models.transformers.causal_wan_model import CausalWanModel, CausalWanAttentionBlock
 from omnimem.pipelines import CausalWanT2VPipeline
 from omnimem.schedulers import RectifiedFlowScheduler
-from omnimem.utils.torch_utils import get_fsdp_state_dict, load_and_broadcast_diffuser, resume_model, save_sharded_safetensors
-from omnimem.utils.ode_checkpoint_store import ODECheckpointStore, config_differences
-from omnimem.utils.ode_training_state import (
-    call_on_all_ranks, capture_rng_state, restore_rng_state, save_training_state, load_training_state,
-)
+from omnimem.utils.torch_utils import load_and_broadcast_diffuser
+from omnimem.utils.ode_training_state import restore_rng_state
 from omnimem.utils.meter import TimerMeter
 from omnimem.evaluate import evaluation_wan
 from omnimem.utils.misc import (
-    is_main_process,
     wait_for_everyone,
     reduce_dict,
-    unwrap_model,
 )
 
 from omnimem.trainer.base_wan_trainer import BaseWanTrainer
+from omnimem.trainer.complete_checkpoint import CompleteCheckpointMixin
 
 
-class WanODETrainer(BaseWanTrainer):
+class WanODETrainer(CompleteCheckpointMixin, BaseWanTrainer):
     model: CausalWanModel
 
     optimizer: torch.optim.Optimizer
@@ -95,84 +87,13 @@ class WanODETrainer(BaseWanTrainer):
         self.count_model_parameter(model, name="Model")
         self.model = model
 
-    def _get_resume_dir(self):
-        return self.config.get("checkpoint_dir") or os.path.join(self.output_dir, "checkpoints")
-
-    def _checkpoint_rank0_call(self, operation):
-        """Propagate coordinator I/O failures before peers enter a collective."""
-        result = [None]
-        if is_main_process():
-            try:
-                result[0] = {"value": operation(), "error": None}
-            except Exception as exc:
-                result[0] = {"value": None, "error": f"{type(exc).__name__}: {exc}"}
-        if dist.is_initialized():
-            dist.broadcast_object_list(result, src=0)
-        if result[0]["error"] is not None:
-            raise RuntimeError(f"ODE checkpoint operation failed: {result[0]['error']}")
-        return result[0]["value"]
-
-    def _checkpoint_all_ranks_call(self, operation):
-        return call_on_all_ranks(operation, "complete the ODE checkpoint step")
-
-    def resume_state(self):
-        prefix = self.config.get("checkpoint_s3_prefix")
-        client = self.s3.s3_client if self.upload else None
-        if client is not None and prefix is None:
-            if os.path.isabs(self.config.output_dir):
-                raise ValueError("An absolute output_dir requires an explicit checkpoint_s3_prefix")
-            prefix = posixpath.join(self.s3_dir, self.output_dir, "checkpoints")
-        self._checkpoint_store = ODECheckpointStore(
-            Path(self.resume_dir), s3_client=client,
-            bucket=self.s3_bucket if client is not None else None,
-            s3_prefix=prefix if client is not None else None,
-        )
-        self._resume_rng_state = None
-        keep = self.config.get("checkpoint_keep_local")
-        if keep is not None and client is not None:
-            # Free space before the first save; the newest local copy is kept for resume.
-            removed = self._checkpoint_rank0_call(
-                lambda: [str(p) for p in self._checkpoint_store.prune_local(max(keep, 1))])
-            self.logger.info(f"Pruned local checkpoints already on S3 before resume: {removed}")
-
-        def select_checkpoint():
-            checkpoint = self._checkpoint_store.latest()
-            if checkpoint is None:
-                if (Path(self.resume_dir) / "checkpoint.pth").exists() or (Path(self.resume_dir) / "model").exists():
-                    raise RuntimeError(
-                        "Legacy ODE checkpoint has no complete optimizer state. Use its model/ directory "
-                        "as model_path or model_checkpoint_path with a new run name to initialize a new run."
-                    )
-                return None
-            # latest() already verified all hashes; published directories are immutable.
-            manifest = json.loads((checkpoint / "COMPLETED.json").read_text())
-            world_size = dist.get_world_size() if dist.is_initialized() else 1
-            if manifest["world_size"] != world_size:
-                raise ValueError("Full ODE resume requires the original number of training ranks")
-            return {"path": str(checkpoint), "step": manifest["global_step"]}
-
-        selected = self._checkpoint_rank0_call(select_checkpoint)
-        self._resume_checkpoint = Path(selected["path"]) if selected is not None else None
-        if selected is None:
-            self.logger.info("No completed ODE checkpoint; starting a new run.")
-            return 0
-        self.logger.info(f"Resume complete ODE checkpoint {self._resume_checkpoint}")
-        return selected["step"]
+    def _checkpoint_extra_state(self):
+        return {"scheduler_config": self._scheduler_config()}
 
     def resume_from_checkpoint(self):
-        if self._resume_checkpoint is None:
-            return
-
-        def restore_weights():
-            model_dir = self._resume_checkpoint / "model"
-            different = config_differences(json.loads((model_dir / "config.json").read_text()),
-                                           json.loads(json.dumps(dict(self.model.config))))
-            if different:
-                raise ValueError(f"Model configuration differs from the resume checkpoint: {different}")
-            resume_model(str(model_dir), self.model, strict=True)
-
-        self._checkpoint_all_ranks_call(restore_weights)
-        self._check_model(self.model, 'after resume ckpt')
+        if self._resume_checkpoint is not None:
+            self._restore_checkpoint_weights("model", self.model, name="Model")
+            self._check_model(self.model, 'after resume ckpt')
 
     def wrap_model_fsdp(self):
         if dist.is_initialized():
@@ -205,29 +126,9 @@ class WanODETrainer(BaseWanTrainer):
             **self.lr_scheduler_kwargs
         )
 
-        if self._resume_checkpoint is not None:
-            state = load_training_state(
-                self._resume_checkpoint, self.model, self.optimizer, self.lr_scheduler,
-                expected_step=self.global_step,
-            )
-            self._resume_rng_state = state["rng_state"]
-            saved_schedule = state["extra_state"].get("scheduler_config")
-            if saved_schedule != self._scheduler_config():
-                raise ValueError("The LR schedule configuration differs from the completed checkpoint")
-            self.logger.info("Restored optimizer and LR scheduler; ODE data stream will resample on resume.")
-
-    def _scheduler_config(self):
-        # LambdaLR restores counters, but its lambda is rebuilt from this configuration.
-        from omegaconf import OmegaConf
-        config = {
-            "type": self.lr_scheduler_type,
-            "warmup_steps": self.lr_warmup_steps,
-            "kwargs": dict(self.lr_scheduler_kwargs),
-        }
-        if self.lr_scheduler_type not in ("constant", "constant_with_warmup"):
-            config["max_train_steps"] = self.max_train_steps
-        return OmegaConf.to_container(OmegaConf.create(config), resolve=True)
-
+        state = self._restore_training_state()
+        if state is not None and state["extra_state"].get("scheduler_config") != self._scheduler_config():
+            raise ValueError("The LR schedule configuration differs from the completed checkpoint")
 
     def setup_timers(self):
         super().setup_timers()
@@ -270,51 +171,6 @@ class WanODETrainer(BaseWanTrainer):
             self.logger.info(f"step: {self.global_step}/{max_train_steps}[{self.global_step / max_train_steps:.02%}]||"
                              f'time:[{time_log}]'
                              f" loss: {self.loss_meter.mavg.get('train/loss', 0):.04f}")
-
-    def save_models(self):
-        staging = Path(self._checkpoint_rank0_call(lambda: str(self._checkpoint_store.begin(self.global_step))))
-
-        def require_shared_directory():
-            if not staging.is_dir():
-                raise FileNotFoundError(
-                    f"Checkpoint directory {staging} is not visible on this rank. "
-                    "Multi-node ODE training requires a shared checkpoint_dir."
-                )
-
-        self._checkpoint_all_ranks_call(require_shared_directory)
-        model_state_dict = get_fsdp_state_dict(unwrap_model(self.model))
-
-        def save_weights():
-            save_dir = str(staging / "model")
-            self.model.save_config(save_directory=save_dir)
-            save_sharded_safetensors(state_dict=model_state_dict, save_dir=save_dir)
-
-        self._checkpoint_rank0_call(save_weights)
-        del model_state_dict
-        save_training_state(
-            staging, self.model, self.optimizer, self.lr_scheduler, self.global_step,
-            extra_state={
-                "scheduler_config": self._scheduler_config(),
-            },
-        )
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        checkpoint = Path(self._checkpoint_rank0_call(
-            lambda: str(self._checkpoint_store.commit(staging, self.global_step, world_size))
-        ))
-        self.logger.info(f"Saved complete ODE checkpoint: {checkpoint}")
-        if self._checkpoint_store.s3 is not None:
-            self._checkpoint_rank0_call(lambda: self._checkpoint_store.upload(checkpoint))
-            keep = self.config.get("checkpoint_keep_local")
-            if keep is not None:
-                removed = self._checkpoint_rank0_call(lambda: [str(p) for p in self._checkpoint_store.prune_local(keep)])
-                self.logger.info(f"Pruned local checkpoints already on S3 (keep {keep}): {removed}")
-
-    def _evaluate_without_rng_change(self, initial=False):
-        state = capture_rng_state()
-        try:
-            self.evaluate_init() if initial else self.evaluate()
-        finally:
-            restore_rng_state(state)
 
     def evaluate_init(self):
         evaluation_wan(

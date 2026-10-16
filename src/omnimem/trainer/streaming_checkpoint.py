@@ -7,7 +7,7 @@ from omegaconf import OmegaConf
 import torch
 import torch.distributed as dist
 
-from omnimem.utils.ode_training_state import capture_rng_state, restore_rng_state
+from omnimem.utils.ode_training_state import call_on_all_ranks, capture_rng_state, restore_rng_state
 from omnimem.models.cache import MMCache
 
 
@@ -174,7 +174,7 @@ class StreamingCheckpointMixin:
                 batch_size = cache_state["configuration"]["available_shape"]["k_cache"][0]
                 self._ensure_streaming_kv_cache(self._streaming_cache_shape_tensor(batch_size))
                 self.streaming_kv_cache.load_checkpoint_state_dict(cache_state)
-        self._checkpoint_all_ranks_call(restore)
+        call_on_all_ranks(restore, "restore the streaming rollout")
         self._pending_streaming_resume = None
 
     def _streaming_cache_shape_tensor(self, batch_size):

@@ -154,7 +154,7 @@ class WanNSASelfForcingTrainer(SelfForcingCheckpointMixin, WanSelfForcingTrainer
 
     def resume_from_checkpoint(self):
         if getattr(self, "complete_sf_resume", False):
-            return self._sf_restore_weights()
+            return super().resume_from_checkpoint()
         checkpoint_path = self.resume_dir
         if self.is_lora_enabled:
             lora_path = self.lora_ckpt or os.path.join(checkpoint_path, "lora_weights.pt")
@@ -176,7 +176,7 @@ class WanNSASelfForcingTrainer(SelfForcingCheckpointMixin, WanSelfForcingTrainer
 
     def save_models(self):
         if getattr(self, "complete_sf_resume", False):
-            return self._sf_save_models()
+            return super().save_models()
         output_dir = self.output_dir
         checkpoint_path = os.path.join(output_dir, "checkpoints")
 
@@ -257,7 +257,7 @@ class WanNSASelfForcingTrainer(SelfForcingCheckpointMixin, WanSelfForcingTrainer
         )
 
         if getattr(self, "complete_sf_resume", False):
-            return self._sf_restore_training_state()
+            return self._restore_training_state()
         checkpoint_path = self.resume_dir
         resume_dcp_checkpoint(
             self.generator, self.generator_optimizer,
@@ -274,7 +274,7 @@ class WanNSASelfForcingTrainer(SelfForcingCheckpointMixin, WanSelfForcingTrainer
 
     def setup_ema_model(self, try_resume=False):
         if getattr(self, "complete_sf_resume", False):
-            return self._sf_setup_ema(try_resume=try_resume)
+            return super().setup_ema_model(try_resume=try_resume)
         if self.is_lora_enabled:
             return
         if self.ema_model and self.ema_start_step <= self.global_step and self.ema is None:
