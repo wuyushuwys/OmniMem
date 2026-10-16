@@ -4,8 +4,6 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 import torch
-import torch.distributed as dist
-from torch.distributed.fsdp import fully_shard
 
 from omnimem.trainer.complete_checkpoint import CompleteCheckpointMixin
 from omnimem.utils.misc import unwrap_model
@@ -221,12 +219,7 @@ class SelfForcingCheckpointMixin(CompleteCheckpointMixin):
             if try_resume and self._resume_checkpoint is not None:
                 self._restore_checkpoint_weights("ema", self.ema)
             self.ema.requires_grad_(False).eval()
-            if dist.is_initialized():
-                for block in self.ema.blocks:
-                    fully_shard(block, **self.fsdp_kwargs)
-                fully_shard(self.ema, **self.fsdp_kwargs.root_kwargs)
-            else:
-                self.ema.to(self.device)
+            self.wrap_ema_fsdp()
         if (try_resume and self._resume_checkpoint is not None
                 and getattr(self, "_sf_resume_state_loaded", False)
                 and self.config.get("checkpoint_keep_local") == 0):

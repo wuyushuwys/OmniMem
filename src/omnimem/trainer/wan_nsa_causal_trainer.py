@@ -18,6 +18,7 @@ from omnimem.utils.torch_utils import (
 from omnimem.utils.meter import TimerMeter
 from omnimem.evaluate import evaluation_wan
 from omnimem.utils.misc import (
+    clip_grad_norm,
     reduce_dict,
     unwrap_model,
 )
@@ -222,10 +223,7 @@ class WanCausalNSATrainer(WanCausalTrainer):
         loss.backward()
 
         if self.accumulation_index == 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            log_dict["train/grad_norm"] = (
-                grad_norm.to_local() if hasattr(grad_norm, "to_local") else grad_norm
-            ).item()
+            log_dict["train/grad_norm"] = clip_grad_norm(self.model.parameters(), self.max_grad_norm)
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
             self.lr_scheduler.step()

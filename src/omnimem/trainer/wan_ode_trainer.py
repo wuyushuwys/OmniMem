@@ -14,10 +14,10 @@ from omnimem.models.transformers.causal_wan_model import CausalWanModel, CausalW
 from omnimem.pipelines import CausalWanT2VPipeline
 from omnimem.schedulers import RectifiedFlowScheduler
 from omnimem.utils.torch_utils import load_and_broadcast_diffuser
-from omnimem.utils.ode_training_state import restore_rng_state
 from omnimem.utils.meter import TimerMeter
 from omnimem.evaluate import evaluation_wan
 from omnimem.utils.misc import (
+    clip_grad_norm,
     wait_for_everyone,
     reduce_dict,
 )
@@ -317,10 +317,7 @@ class WanODETrainer(CompleteCheckpointMixin, BaseWanTrainer):
         loss.backward()
 
         if self.accumulation_index == 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            log_dict["train/grad_norm"] = (
-                grad_norm.to_local() if hasattr(grad_norm, "to_local") else grad_norm
-            ).item()
+            log_dict["train/grad_norm"] = clip_grad_norm(self.model.parameters(), self.max_grad_norm)
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
             self.lr_scheduler.step()
@@ -335,8 +332,7 @@ class WanODETrainer(CompleteCheckpointMixin, BaseWanTrainer):
         return log_dict
 
     def train(self):
-        if self.global_step >= self.max_train_steps:
-            self.logger.info(f"Training already complete at step {self.global_step}; nothing to run.")
+        if self._already_trained():
             return
         # evaluate initial model
         self._evaluate_without_rng_change(initial=True)
@@ -349,9 +345,7 @@ class WanODETrainer(CompleteCheckpointMixin, BaseWanTrainer):
             data_iterator = iter(self.train_dataloader)
             for step, tuple_batch in enumerate(data_iterator, start=1):
                 # WebDataset starts its workers lazily on the first next(), not iter().
-                if self._resume_rng_state is not None:
-                    restore_rng_state(self._resume_rng_state)
-                    self._resume_rng_state = None
+                self._restore_resume_rng()
                 self.accumulation_index = step % self.gradient_accumulation_steps
 
                 # load data

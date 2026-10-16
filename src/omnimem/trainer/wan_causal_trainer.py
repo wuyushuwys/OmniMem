@@ -22,6 +22,7 @@ from omnimem.utils.torch_utils import (
 from omnimem.utils.meter import TimerMeter
 from omnimem.evaluate import evaluation_wan
 from omnimem.utils.misc import (
+    clip_grad_norm,
     wait_for_everyone,
     reduce_dict,
     unwrap_model,
@@ -29,7 +30,6 @@ from omnimem.utils.misc import (
 
 from omnimem.trainer.base_wan_trainer import BaseWanTrainer
 from omnimem.trainer.causal_checkpoint import CausalCheckpointMixin
-from omnimem.utils.ode_training_state import restore_rng_state
 
 
 class WanCausalTrainer(CausalCheckpointMixin, BaseWanTrainer):
@@ -192,14 +192,7 @@ class WanCausalTrainer(CausalCheckpointMixin, BaseWanTrainer):
         if try_resume and self._resume_checkpoint is not None:
             self._restore_checkpoint_weights("ema", self.ema)
         self.ema.requires_grad_(False).eval()
-        if dist.is_initialized():
-            for block in self.ema.blocks:
-                fully_shard(block, **self.fsdp_kwargs)
-            fully_shard(self.ema, **self.fsdp_kwargs.root_kwargs)
-        else:
-            self.ema.to(self.device)
-        
-            
+        self.wrap_ema_fsdp()
 
     def evaluate(self):
         if self.ema is not None:
@@ -333,10 +326,7 @@ class WanCausalTrainer(CausalCheckpointMixin, BaseWanTrainer):
         loss.backward()
 
         if self.accumulation_index == 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            log_dict["train/grad_norm"] = (
-                grad_norm.to_local() if hasattr(grad_norm, "to_local") else grad_norm
-            ).item()
+            log_dict["train/grad_norm"] = clip_grad_norm(self.model.parameters(), self.max_grad_norm)
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
             self.lr_scheduler.step()
@@ -353,8 +343,7 @@ class WanCausalTrainer(CausalCheckpointMixin, BaseWanTrainer):
         return log_dict
 
     def train(self):
-        if self.global_step >= self.max_train_steps:
-            self.logger.info(f"Training already complete at step {self.global_step}; nothing to run.")
+        if self._already_trained():
             return
         # Validation and lazy data-loader startup must not consume resumed RNG.
         self._evaluate_without_rng_change()
@@ -365,9 +354,7 @@ class WanCausalTrainer(CausalCheckpointMixin, BaseWanTrainer):
             self.loss_meter.reset()
             self.data_timer.tic()
             for step, tuple_batch in enumerate(self.train_dataloader, start=1):
-                if self._resume_rng_state is not None:
-                    restore_rng_state(self._resume_rng_state)
-                    self._resume_rng_state = None
+                self._restore_resume_rng()
                 self.accumulation_index = step % self.gradient_accumulation_steps
 
                 # load data

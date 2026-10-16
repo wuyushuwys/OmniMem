@@ -281,9 +281,7 @@ class WanNSASelfForcingTrainer(SelfForcingCheckpointMixin, WanSelfForcingTrainer
             self.ema, info = create_ema_model(unwrap_model(self.generator), module_cls=CausalWanNSAModel)
             if try_resume:
                 resume_model(path=os.path.join(self.resume_dir, 'ema'), module=self.ema)
-            for block in self.ema.blocks:
-                fully_shard(block, **self.fsdp_kwargs)
-            fully_shard(self.ema, **self.fsdp_kwargs.root_kwargs)
+            self.wrap_ema_fsdp()
 
     def build_kv_cache(
             self,

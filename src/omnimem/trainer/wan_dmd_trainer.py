@@ -26,6 +26,7 @@ from omnimem.utils.torch_utils import (
 )
 from omnimem.utils.train_utils import pred_x0
 from omnimem.utils.misc import (
+    clip_grad_norm,
     is_main_process,
     wait_for_everyone,
     unwrap_model,
@@ -34,7 +35,6 @@ from omnimem.utils.misc import (
 from omnimem.utils.meter import TimerMeter
 from omnimem.evaluate import evaluation_wan
 from omnimem.trainer.base_wan_trainer import BaseWanTrainer
-from omnimem.utils.ode_training_state import capture_rng_state, restore_rng_state
 
 
 class WanDMDTrainer(BaseWanTrainer):
@@ -234,12 +234,7 @@ class WanDMDTrainer(BaseWanTrainer):
             self.ema, info = create_ema_model(unwrap_model(self.generator), module_cls=WanModel)
             if try_resume:
                 resume_model(path=os.path.join(self.output_dir, "checkpoints", 'ema'), module=self.ema)
-            if dist.is_initialized():
-                for block in self.ema.blocks:
-                    fully_shard(block, **self.fsdp_kwargs)
-                fully_shard(self.ema, **self.fsdp_kwargs.root_kwargs)
-            else:
-                self.ema.to(self.device)
+            self.wrap_ema_fsdp()
 
     def setup_timers(self):
         super().setup_timers()
@@ -665,8 +660,7 @@ class WanDMDTrainer(BaseWanTrainer):
 
 
             if self.accumulation_index == 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.generator.parameters(), self.max_grad_norm)
-                log_dict["train/g_grad_norm"] = (grad_norm.to_local() if hasattr(grad_norm, "to_local") else grad_norm).item()
+                log_dict["train/g_grad_norm"] = clip_grad_norm(self.generator.parameters(), self.max_grad_norm)
                 self.generator_optimizer.step()
                 self.generator_optimizer.zero_grad(set_to_none=True)
                 if not getattr(self, "complete_sf_resume", False):
@@ -700,8 +694,7 @@ class WanDMDTrainer(BaseWanTrainer):
         critic_loss.backward()
 
         if self.accumulation_index == 0:
-            critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.fake_net.parameters(), self.max_grad_norm)
-            log_dict["train/critic_grad_norm"] = (critic_grad_norm.to_local() if hasattr(critic_grad_norm, "to_local") else critic_grad_norm).item()
+            log_dict["train/critic_grad_norm"] = clip_grad_norm(self.fake_net.parameters(), self.max_grad_norm)
             self.critic_optimizer.step()
             self.critic_optimizer.zero_grad(set_to_none=True)
             self.critic_lr_scheduler.step()
@@ -717,16 +710,11 @@ class WanDMDTrainer(BaseWanTrainer):
 
     def train(self):
         complete_resume = getattr(self, "complete_sf_resume", False)
-        if complete_resume and self.global_step >= self.max_train_steps:
-            self.logger.info("Requested self-forcing training is already complete.")
+        if complete_resume and self._already_trained():
             return
         # evaluate initial model
         if complete_resume:
-            rng_state = capture_rng_state()
-            try:
-                self.evaluate_init()
-            finally:
-                restore_rng_state(rng_state)
+            self._evaluate_without_rng_change(initial=True)
         else:
             self.evaluate_init()
         # main training loop
@@ -741,9 +729,7 @@ class WanDMDTrainer(BaseWanTrainer):
 
                 # Lazy prompt workers may consume parent RNG while obtaining the
                 # first batch. Restore only after that startup work has finished.
-                if complete_resume and self._resume_rng_state is not None:
-                    restore_rng_state(self._resume_rng_state)
-                    self._resume_rng_state = None
+                self._restore_resume_rng()
 
                 self.setup_ema_model()
 

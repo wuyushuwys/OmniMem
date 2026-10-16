@@ -81,6 +81,12 @@ def reduce_dict(dictionary, op=dist.ReduceOp.AVG):
                 dist.all_reduce(v, op=op)
 
 
+def clip_grad_norm(parameters, max_norm) -> float:
+    """Clip gradients in place and return the total norm, also when FSDP returns it as a DTensor."""
+    norm = torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+    return (norm.to_local() if hasattr(norm, "to_local") else norm).item()
+
+
 def format_numel_str(numel: int) -> str:
     B = 1024 ** 3
     M = 1024 ** 2

@@ -12,12 +12,11 @@ from omnimem.models.cache import MMCache
 from omnimem.models.transformers.causal_wan_nsa_model import CausalWanNSAModel
 from omnimem.schedulers import RectifiedFlowScheduler
 from omnimem.utils.train_utils import pred_x0, vae_encode
-from omnimem.utils.misc import reduce_dict, unwrap_model
+from omnimem.utils.misc import clip_grad_norm, reduce_dict, unwrap_model
 from omnimem.utils.torch_utils import update_ema_fsdp, unsharded_param_dtype
 from omnimem.trainer.wan_nsa_self_forcing_trainer import WanNSASelfForcingTrainer
 from omnimem.trainer.streaming_checkpoint import StreamingCheckpointMixin
 from omnimem.trainer.streaming_generator_schedule import generator_update_due
-from omnimem.utils.ode_training_state import restore_rng_state
 
 
 class WanNSASelfForcingStreamingTrainer(StreamingCheckpointMixin, WanNSASelfForcingTrainer):
@@ -556,11 +555,8 @@ class WanNSASelfForcingStreamingTrainer(StreamingCheckpointMixin, WanNSASelfForc
                 self.streaming_kv_cache.flush_offload()
 
             if self.accumulation_index == 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    [p for p in self.generator.parameters() if p.requires_grad],
-                    self.max_grad_norm
-                )
-                log_dict["train/g_grad_norm"] = grad_norm.to_local().item() if hasattr(grad_norm, 'to_local') else grad_norm.item()
+                log_dict["train/g_grad_norm"] = clip_grad_norm(
+                    [p for p in self.generator.parameters() if p.requires_grad], self.max_grad_norm)
                 self.generator_optimizer.step()
                 self.generator_optimizer.zero_grad(set_to_none=True)
                 self.generator_lr_scheduler.step()
@@ -584,11 +580,8 @@ class WanNSASelfForcingStreamingTrainer(StreamingCheckpointMixin, WanNSASelfForc
         (c_loss / self.gradient_accumulation_steps).backward()
 
         if self.accumulation_index == 0:
-            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-                [p for p in self.fake_net.parameters() if p.requires_grad],
-                self.max_grad_norm
-            )
-            log_dict["train/critic_grad_norm"] = critic_grad_norm.to_local().item() if hasattr(critic_grad_norm, 'to_local') else critic_grad_norm.item()
+            log_dict["train/critic_grad_norm"] = clip_grad_norm(
+                [p for p in self.fake_net.parameters() if p.requires_grad], self.max_grad_norm)
             self.critic_optimizer.step()
             self.critic_optimizer.zero_grad(set_to_none=True)
             self.critic_lr_scheduler.step()
@@ -691,8 +684,7 @@ class WanNSASelfForcingStreamingTrainer(StreamingCheckpointMixin, WanNSASelfForc
                     return
 
     def _train_with_complete_resume(self):
-        if self.global_step >= self.max_train_steps:
-            self.logger.info("Requested streaming training is already complete.")
+        if self._already_trained():
             return
         if self.checkpointing_steps <= 0 or self.validation_steps <= 0:
             raise ValueError("Streaming checkpoint/validation intervals must be positive")
@@ -702,9 +694,7 @@ class WanNSASelfForcingStreamingTrainer(StreamingCheckpointMixin, WanNSASelfForc
         # point preserves both training RNG and the persistent rollout cache.
         if self._resume_checkpoint is None:
             self.evaluate_init()
-        if self._resume_rng_state is not None:
-            restore_rng_state(self._resume_rng_state)
-            self._resume_rng_state = None
+        self._restore_resume_rng()
         self.data_timer.tic()
         micro_step = 0
         save_pending = False
