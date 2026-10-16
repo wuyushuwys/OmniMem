@@ -207,7 +207,9 @@ def run(args, dit_device, decode_device=None) -> int:
             validate_request(args.nframes, args.frame_per_block,
                              switch_prompts=switch_prompts,
                              switch_frame_indices=switch_frame_indices,
-                             queue_depth=args.queue_depth)
+                             queue_depth=args.queue_depth,
+                             slice_last_frames=args.slice_last_frames,
+                             recache_mode=args.recache_mode)
         if args.repeat < 1:
             raise ValueError(f"--repeat must be >= 1, got {args.repeat}")
         outputs = [args.output if name is None else os.path.join(args.output, name + ".mp4")

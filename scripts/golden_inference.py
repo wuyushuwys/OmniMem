@@ -146,7 +146,9 @@ def make_runtime(args):
         validate_request(spec["nframes"], recipe.frame_per_block,
                          switch_prompts=spec["switch_prompts"],
                          switch_frame_indices=spec["switch_frame_indices"],
-                         queue_depth=spec["queue_depth"])
+                         queue_depth=spec["queue_depth"],
+                         slice_last_frames=recipe.slice_last_frames,
+                         recache_mode=recipe.recache_mode)
     except ValueError as exc:
         raise SystemExit(f"error: {exc}")
     # The recompile limit is reached by design; keep dynamo's two warnings off the log.

@@ -83,6 +83,19 @@ _KV_OPTION_NAMES = {
 }
 
 
+def validate_recache(slice_last_frames: int, recache_mode: str, frame_per_block: int,
+                     has_switches: bool) -> None:
+    """``ValueError`` unless every prompt-switch recache starts on a chunk boundary."""
+    # A recache that starts inside a chunk leaves a partial KV chunk the selection reads past.
+    if (has_switches and recache_mode != "none" and frame_per_block
+            and slice_last_frames % frame_per_block):
+        raise ValueError(
+            f"slice_last_frames={slice_last_frames} must be a multiple of frame_per_block="
+            f"{frame_per_block} when prompt switches recache the KV cache "
+            f"(recache_mode={recache_mode!r}); use a multiple of {frame_per_block} "
+            f"or recache_mode='none'")
+
+
 def validate_kv_policy(policy, dedup, *, enable_kv_evict, tier, pool, scratch,
                        finite_window=True, per_head_cache=True, unit="bytes"):
     """``ValueError`` unless the KV options make one cache policy; returns the block budgets, given in ``unit``, in bytes."""
@@ -347,6 +360,8 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
                            tier=kv_tier_device is not None, pool=kv_block_pool_bytes,
                            scratch=kv_block_scratch_bytes,
                            per_head_cache=enable_chunk_per_head_cache)
+        validate_recache(slice_last_frames, recache_mode, self.frame_per_block,
+                         has_switches=bool(switch_prompts is not None and switch_frame_indices))
         block_policy = kv_cache_policy == "block_lru"
         if return_latents and offload_model:
             raise ValueError("return_latents=True does not support offload_model=True "

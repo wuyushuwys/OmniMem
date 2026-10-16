@@ -21,7 +21,7 @@ import torch
 from omnimem.models.cache import EXACT_PINNED_KV_ENV, exact_pinned_kv_enabled
 from omnimem.pipelines import compile_state
 from omnimem.pipelines.pipeline_wan import NEG_PROMPT
-from omnimem.pipelines.pipeline_wan_causal import validate_kv_policy
+from omnimem.pipelines.pipeline_wan_causal import validate_kv_policy, validate_recache
 from omnimem.pipelines.streaming_decode import (
     LatentChunk,
     StreamingSession,
@@ -64,7 +64,8 @@ def actual_frames(nframes: int, temporal_stride: int = 4) -> int:
 def validate_request(nframes: int, frame_per_block: int, *,
                      switch_prompts: Optional[Sequence[str]] = None,
                      switch_frame_indices: Optional[Sequence[int]] = None,
-                     queue_depth: int = 2) -> None:
+                     queue_depth: int = 2, slice_last_frames: int,
+                     recache_mode: str) -> None:
     """Fail early (``ValueError``) for a request the streaming path cannot run."""
     if nframes < 1:
         raise ValueError(f"nframes must be >= 1, got {nframes}")
@@ -98,6 +99,7 @@ def validate_request(nframes: int, frame_per_block: int, *,
             f"invalid prompt switch (switch_frame_indices={list(switch_frame_indices)}): "
             f"{str(exc).split(': ', 1)[-1]}; they are latent frame indices, increasing "
             f"multiples of frame_per_block={frame_per_block} inside 1..{t - 1}") from None
+    validate_recache(slice_last_frames, recache_mode, frame_per_block, has_switches=True)
 
 
 def check_token_grid(height: int, width: int, frame_per_block: int,
@@ -654,7 +656,8 @@ class StreamingRuntime:
                 f"new runtime, preferably in a new process")
         r = self.recipe
         validate_request(nframes, r.frame_per_block, switch_prompts=switch_prompts,
-                         switch_frame_indices=switch_frame_indices, queue_depth=queue_depth)
+                         switch_frame_indices=switch_frame_indices, queue_depth=queue_depth,
+                         slice_last_frames=r.slice_last_frames, recache_mode=r.recache_mode)
         check_output_target(output_path, preview_dir)
         config = self.configure()
         config["queue_depth"] = queue_depth
