@@ -2,84 +2,40 @@
 
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import posixpath
 
 from omegaconf import OmegaConf
-import torch
 import torch.distributed as dist
 
 from omnimem.utils.misc import is_main_process, unwrap_model
-from omnimem.utils.ode_checkpoint_store import ODECheckpointStore
-from omnimem.utils.ode_training_state import capture_rng_state, restore_rng_state, save_training_state, load_training_state
+from omnimem.utils.ode_checkpoint_store import ODECheckpointStore, check_model_dir, config_differences
+from omnimem.utils.ode_training_state import (
+    call_on_all_ranks, capture_rng_state, load_training_state, read_training_metadata, restore_rng_state,
+    save_training_state,
+)
 from omnimem.utils.torch_utils import get_fsdp_state_dict, resume_model, save_sharded_safetensors
 
 
-def _training_metadata(path):
-    metadata = torch.load(Path(path) / "training_state.pt", map_location="cpu", weights_only=True)
-    if not isinstance(metadata, dict):
-        raise ValueError("Checkpoint training metadata is not a dictionary")
-    extra = metadata.get("extra_state")
-    if not isinstance(extra, dict) or extra.get("trainer_family") != "causal":
-        raise ValueError("Checkpoint is not a complete causal/teacher-forcing training checkpoint")
-    if not isinstance(extra.get("training_config"), dict):
-        raise ValueError("Checkpoint is missing its training configuration")
-    return metadata
-
-
-def _check_ema_payload(path):
-    """EMA is mandatory when the saved training recipe enables it."""
-    path = Path(path)
-    metadata = _training_metadata(path)
+def _check_payload(path, step, world_size):
+    """Require causal training metadata and the EMA weights its recipe enables."""
+    metadata = read_training_metadata(path, {"causal"})
+    if (metadata["global_step"], metadata["world_size"]) != (step, world_size):
+        raise ValueError("Training-state step/world size differs from the checkpoint")
     enabled = metadata["extra_state"]["training_config"].get("ema_model")
     if type(enabled) is not bool:
         raise ValueError("Checkpoint has no valid EMA policy")
     if not enabled:
-        if (path / "ema").exists():
+        if (Path(path) / "ema").exists():
             raise ValueError("Checkpoint contains EMA weights but its EMA policy is disabled")
         return
-    directory = path / "ema"
-    saved_config = json.loads((directory / "config.json").read_text())
-    model_config = json.loads((path / "model/config.json").read_text())
-    if not isinstance(saved_config, dict) or not isinstance(model_config, dict):
-        raise ValueError("Model and EMA configurations must be dictionaries")
-    semantic = lambda config: {key: value for key, value in config.items() if not key.startswith("_")}
-    if semantic(saved_config) != semantic(model_config):
+    if config_differences(check_model_dir(Path(path) / "ema"), check_model_dir(Path(path) / "model")):
         raise ValueError("EMA configuration differs from the saved model configuration")
-    single = directory / "diffusion_pytorch_model.safetensors"
-    index = directory / "diffusion_pytorch_model.safetensors.index.json"
-    if index.exists():
-        weights = json.loads(index.read_text()).get("weight_map")
-        if not isinstance(weights, dict) or not weights:
-            raise ValueError("EMA shard index has no weight_map")
-        for name in weights.values():
-            if (not isinstance(name, str) or not name or "\\" in name or "\x00" in name
-                    or PurePosixPath(name).is_absolute()
-                    or any(part in ("", ".", "..") for part in name.split("/"))
-                    or not name.endswith(".safetensors") or not (directory / name).is_file()):
-                raise ValueError(f"EMA index references a missing or unsafe shard: {name!r}")
-    elif not single.is_file():
-        raise ValueError("EMA-enabled checkpoint has no EMA weights")
 
 
 class CausalCheckpointStore(ODECheckpointStore):
     """Use the existing atomic store, adding required causal metadata and EMA."""
-
-    def commit(self, staging, step, world_size):
-        _check_ema_payload(staging)
-        metadata = _training_metadata(staging)
-        if (metadata["global_step"], metadata["world_size"]) != (step, world_size):
-            raise ValueError("Training-state step/world size differs from the proposed checkpoint")
-        return super().commit(staging, step, world_size)
-
-    def validate(self, path):
-        manifest = super().validate(path)
-        _check_ema_payload(path)
-        metadata = _training_metadata(path)
-        if (metadata["global_step"], metadata["world_size"]) != (
-                manifest["global_step"], manifest["world_size"]):
-            raise ValueError("Training-state step/world size differs from the completion manifest")
-        return manifest
+    _check_payload = staticmethod(_check_payload)
 
 
 class CausalCheckpointMixin:
@@ -100,18 +56,7 @@ class CausalCheckpointMixin:
         return result[0]["value"]
 
     def _checkpoint_all_ranks_call(self, operation):
-        result, error = None, None
-        try:
-            result = operation()
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-        errors = [error]
-        if dist.is_initialized():
-            errors = [None] * dist.get_world_size()
-            dist.all_gather_object(errors, error)
-        if any(errors):
-            raise RuntimeError(f"Causal checkpoint rank errors: {errors}")
-        return result
+        return call_on_all_ranks(operation, "complete the causal checkpoint step")
 
     def _scheduler_config(self):
         config = {"type": self.lr_scheduler_type, "warmup_steps": self.lr_warmup_steps,
@@ -162,7 +107,7 @@ class CausalCheckpointMixin:
             world_size = dist.get_world_size() if dist.is_initialized() else 1
             if manifest["world_size"] != world_size:
                 raise ValueError("Full causal resume requires the original number of training ranks")
-            if _training_metadata(checkpoint)["extra_state"]["training_config"] != self._training_config():
+            if read_training_metadata(checkpoint, {"causal"})["extra_state"]["training_config"] != self._training_config():
                 raise ValueError("Training configuration differs from the completed causal checkpoint")
             return {"path": str(checkpoint), "step": manifest["global_step"]}
 
@@ -175,11 +120,10 @@ class CausalCheckpointMixin:
     def _restore_checkpoint_weights(self, role, module):
         def restore():
             directory = self._resume_checkpoint / role
-            saved = json.loads((directory / "config.json").read_text())
-            current = json.loads(json.dumps(dict(module.config)))
-            semantic = lambda config: {key: value for key, value in config.items() if not key.startswith("_")}
-            if semantic(saved) != semantic(current):
-                raise ValueError(f"{role} configuration differs from the resume checkpoint")
+            different = config_differences(json.loads((directory / "config.json").read_text()),
+                                           json.loads(json.dumps(dict(module.config))))
+            if different:
+                raise ValueError(f"{role} configuration differs from the resume checkpoint: {different}")
             resume_model(str(directory), module, strict=True)
         self._checkpoint_all_ranks_call(restore)
 

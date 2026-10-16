@@ -8,12 +8,14 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
-from typing import Any
+from typing import Any, Callable
 import uuid
 
 
 logger = logging.getLogger(__name__)
 COMPLETED = "COMPLETED.json"
+WEIGHTS = "diffusion_pytorch_model.safetensors"
+WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
 _STEP = re.compile(r"step_(\d{8,})\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -29,6 +31,39 @@ def _relative(name: str) -> PurePosixPath:
             or name.startswith("/") or any(p in ("", ".", "..") for p in name.split("/"))):
         raise ValueError(f"Unsafe checkpoint relative path: {name!r}")
     return PurePosixPath(name)
+
+
+def config_differences(first: dict[str, Any], second: dict[str, Any]) -> list[str]:
+    """Keys whose values differ between two model configurations, ignoring private ``_`` keys."""
+    keys = {key for key in first.keys() | second.keys() if not key.startswith("_")}
+    return sorted(key for key in keys if key not in first or key not in second or first[key] != second[key])
+
+
+def check_shard_index(directory: Path, has_shard: Callable[[str], bool]) -> None:
+    """Require the weight index in ``directory`` to name only safe shards that ``has_shard`` accepts."""
+    index = json.loads((directory / WEIGHTS_INDEX).read_text())
+    weights = index.get("weight_map") if isinstance(index, dict) else None
+    if not isinstance(weights, dict) or not weights:
+        raise ValueError(f"Shard index has no weight_map: {directory}")
+    for shard in weights.values():
+        try:
+            name = str(_relative(shard))
+        except ValueError:
+            name = None
+        if name is None or not name.endswith(".safetensors") or not has_shard(name):
+            raise ValueError(f"Shard index in {directory} references missing/invalid shard: {shard!r}")
+
+
+def check_model_dir(path: Path) -> dict[str, Any]:
+    """Return a saved model's configuration after checking that all of its weight files exist."""
+    config = json.loads((path / "config.json").read_text())
+    if not isinstance(config, dict):
+        raise ValueError(f"Invalid model configuration: {path}")
+    if (path / WEIGHTS_INDEX).exists():
+        check_shard_index(path, lambda name: (path / name).is_file())
+    elif not (path / WEIGHTS).is_file():
+        raise ValueError(f"Missing model weights: {path}")
+    return config
 
 
 def _fingerprint(path: Path) -> dict[str, Any]:
@@ -79,8 +114,7 @@ def _manifest(data: Any) -> dict[str, Any]:
         raise ValueError(f"Missing required checkpoint files: {sorted(required - files.keys())}")
     if not any(name.startswith("optimizer/") and name != "optimizer/.metadata" for name in files):
         raise ValueError("Checkpoint has optimizer metadata but no optimizer shards")
-    if not ({"model/diffusion_pytorch_model.safetensors",
-             "model/diffusion_pytorch_model.safetensors.index.json"} & files.keys()):
+    if not ({f"model/{WEIGHTS}", f"model/{WEIGHTS_INDEX}"} & files.keys()):
         raise ValueError("Checkpoint has no model weights or model shard index")
     ranks = [int(match.group(1)) for name in files
              if (match := re.fullmatch(r"rng/rank_(\d+)\.pt", name))]
@@ -116,8 +150,13 @@ class ODECheckpointStore:
         staging.mkdir()
         return staging
 
+    @staticmethod
+    def _check_payload(path: Path, step: int, world_size: int) -> None:
+        """Hook for trainer-specific payload checks on commit and validation."""
+
     def commit(self, staging: Path, step: int, world_size: int) -> Path:
         staging = Path(staging)
+        self._check_payload(staging, step, world_size)
         name = self._name(step)
         if (staging.parent.resolve() != self.root.resolve()
                 or not staging.name.startswith(f".incomplete-{name}-") or staging.is_symlink()):
@@ -145,17 +184,8 @@ class ODECheckpointStore:
 
     @staticmethod
     def _check_model_index(path: Path, manifest: dict[str, Any]) -> None:
-        index_name = "model/diffusion_pytorch_model.safetensors.index.json"
-        if index_name not in manifest["files"]:
-            return
-        index = json.loads((path / index_name).read_text())
-        weights = index.get("weight_map") if isinstance(index, dict) else None
-        if not isinstance(weights, dict) or not weights:
-            raise ValueError("Model shard index has no weight_map")
-        for shard in weights.values():
-            name = "model/" + str(_relative(shard))
-            if not name.endswith(".safetensors") or name not in manifest["files"]:
-                raise ValueError(f"Model shard index references missing/invalid shard: {shard}")
+        if f"model/{WEIGHTS_INDEX}" in manifest["files"]:
+            check_shard_index(path / "model", lambda name: f"model/{name}" in manifest["files"])
 
     def validate(self, path: Path) -> dict[str, Any]:
         path = Path(path)
@@ -169,6 +199,7 @@ class ODECheckpointStore:
             if _fingerprint(payload) != manifest["files"][name]:
                 raise ValueError(f"Checkpoint checksum/size mismatch: {name}")
         self._check_model_index(path, manifest)
+        self._check_payload(path, manifest["global_step"], manifest["world_size"])
         return manifest
 
     def _remote_names(self) -> set[str]:

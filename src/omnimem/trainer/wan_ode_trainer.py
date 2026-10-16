@@ -18,9 +18,9 @@ from omnimem.models.transformers.causal_wan_model import CausalWanModel, CausalW
 from omnimem.pipelines import CausalWanT2VPipeline
 from omnimem.schedulers import RectifiedFlowScheduler
 from omnimem.utils.torch_utils import get_fsdp_state_dict, load_and_broadcast_diffuser, resume_model, save_sharded_safetensors
-from omnimem.utils.ode_checkpoint_store import ODECheckpointStore
+from omnimem.utils.ode_checkpoint_store import ODECheckpointStore, config_differences
 from omnimem.utils.ode_training_state import (
-    capture_rng_state, restore_rng_state, save_training_state, load_training_state,
+    call_on_all_ranks, capture_rng_state, restore_rng_state, save_training_state, load_training_state,
 )
 from omnimem.utils.meter import TimerMeter
 from omnimem.evaluate import evaluation_wan
@@ -113,18 +113,7 @@ class WanODETrainer(BaseWanTrainer):
         return result[0]["value"]
 
     def _checkpoint_all_ranks_call(self, operation):
-        result, error = None, None
-        try:
-            result = operation()
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-        errors = [error]
-        if dist.is_initialized():
-            errors = [None] * dist.get_world_size()
-            dist.all_gather_object(errors, error)
-        if any(errors):
-            raise RuntimeError(f"ODE checkpoint rank errors: {errors}")
-        return result
+        return call_on_all_ranks(operation, "complete the ODE checkpoint step")
 
     def resume_state(self):
         prefix = self.config.get("checkpoint_s3_prefix")
@@ -176,12 +165,8 @@ class WanODETrainer(BaseWanTrainer):
 
         def restore_weights():
             model_dir = self._resume_checkpoint / "model"
-            saved_config = json.loads((model_dir / "config.json").read_text())
-            current_config = json.loads(json.dumps(dict(self.model.config)))
-            different = [
-                key for key, value in saved_config.items()
-                if not key.startswith("_") and current_config.get(key) != value
-            ]
+            different = config_differences(json.loads((model_dir / "config.json").read_text()),
+                                           json.loads(json.dumps(dict(self.model.config))))
             if different:
                 raise ValueError(f"Model configuration differs from the resume checkpoint: {different}")
             resume_model(str(model_dir), self.model, strict=True)

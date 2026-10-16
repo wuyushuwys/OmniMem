@@ -1,8 +1,7 @@
 """Complete checkpoints for NSA self-forcing trainers: models, EMA, schedulers, RNG, KV cache."""
 import hashlib
-import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import posixpath
 
 from omegaconf import OmegaConf
@@ -12,23 +11,12 @@ from torch.distributed.fsdp import fully_shard
 
 from omnimem.trainer.causal_checkpoint import CausalCheckpointMixin
 from omnimem.utils.misc import unwrap_model
-from omnimem.utils.ode_checkpoint_store import ODECheckpointStore
-from omnimem.utils.ode_training_state import save_training_state, load_training_state
+from omnimem.utils.ode_checkpoint_store import ODECheckpointStore, check_model_dir, config_differences
+from omnimem.utils.ode_training_state import load_training_state, read_training_metadata, save_training_state
 from omnimem.utils.torch_utils import create_ema_model, get_fsdp_state_dict, save_sharded_safetensors
 
 
 _SF_FAMILIES = {"nsa-self-forcing", "nsa-self-forcing-streaming", "nsa-self-forcing-switch"}
-
-
-def _metadata(path):
-    value = torch.load(Path(path) / "training_state.pt", map_location="cpu", weights_only=True)
-    if not isinstance(value, dict) or value.get("format_version") != 1:
-        raise ValueError("Invalid self-forcing training metadata")
-    extra = value.get("extra_state", {})
-    if (not isinstance(extra, dict) or extra.get("trainer_family") not in _SF_FAMILIES
-            or not isinstance(extra.get("training_config"), dict)):
-        raise ValueError("Checkpoint is not complete NSA self-forcing state")
-    return value
 
 
 def _without_removed_options(recipe):
@@ -40,29 +28,10 @@ def _without_removed_options(recipe):
     return recipe
 
 
-def _model_payload(path):
-    config = json.loads((path / "config.json").read_text())
-    if not isinstance(config, dict):
-        raise ValueError(f"Invalid model configuration: {path}")
-    index = path / "diffusion_pytorch_model.safetensors.index.json"
-    if index.exists():
-        weights = json.loads(index.read_text()).get("weight_map")
-        if not isinstance(weights, dict) or not weights:
-            raise ValueError(f"Missing model weight map: {path}")
-        for name in weights.values():
-            if (not isinstance(name, str) or not name or "\\" in name or "\x00" in name
-                    or PurePosixPath(name).is_absolute()
-                    or any(part in ("", ".", "..") for part in name.split("/"))
-                    or not name.endswith(".safetensors") or not (path / name).is_file()):
-                raise ValueError(f"Missing or unsafe model shard: {name!r}")
-    elif not (path / "diffusion_pytorch_model.safetensors").is_file():
-        raise ValueError(f"Missing model weights: {path}")
-    return {key: value for key, value in config.items() if not key.startswith("_")}
-
-
 def _check_payload_contents(path, step, world_size):
     path = Path(path)
-    generator, critic = _metadata(path), _metadata(path / "critic_state")
+    generator = read_training_metadata(path, _SF_FAMILIES)
+    critic = read_training_metadata(path / "critic_state", _SF_FAMILIES)
     for role, metadata in (("generator", generator), ("critic", critic)):
         if (metadata["global_step"], metadata["world_size"]) != (step, world_size):
             raise ValueError(f"{role} step/world size differs from the checkpoint")
@@ -87,10 +56,10 @@ def _check_payload_contents(path, step, world_size):
         raise ValueError("EMA activation state disagrees with the completed step")
     if critic["extra_state"].get("ema_active") != active:
         raise ValueError("Critic EMA activation metadata differs")
-    generator_config = _model_payload(path / "model")
-    _model_payload(path / "fake_net")
+    generator_config = check_model_dir(path / "model")
+    check_model_dir(path / "fake_net")
     if active:
-        if _model_payload(path / "ema") != generator_config:
+        if config_differences(check_model_dir(path / "ema"), generator_config):
             raise ValueError("EMA configuration differs from the generator")
     elif (path / "ema").exists():
         raise ValueError("Checkpoint contains EMA before its activation boundary")
@@ -136,14 +105,7 @@ def _check_payload(path, step, world_size):
 
 
 class SelfForcingCheckpointStore(ODECheckpointStore):
-    def commit(self, staging, step, world_size):
-        _check_payload(staging, step, world_size)
-        return super().commit(staging, step, world_size)
-
-    def validate(self, path):
-        manifest = super().validate(path)
-        _check_payload(path, manifest["global_step"], manifest["world_size"])
-        return manifest
+    _check_payload = staticmethod(_check_payload)
 
 
 class SelfForcingCheckpointMixin(CausalCheckpointMixin):
@@ -218,7 +180,7 @@ class SelfForcingCheckpointMixin(CausalCheckpointMixin):
                        ("checkpoint.pth", "generator", "fake_net", "model", "checkpoint_dcp_generator")):
                     raise ValueError("Legacy self-forcing checkpoint cannot resume complete training; use explicit weight initialization in a new run")
                 return None
-            metadata = _metadata(checkpoint)
+            metadata = read_training_metadata(checkpoint, _SF_FAMILIES)
             world = dist.get_world_size() if dist.is_initialized() else 1
             if metadata["world_size"] != world:
                 raise ValueError("Full self-forcing resume requires the original number of training ranks")

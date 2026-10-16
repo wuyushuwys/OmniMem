@@ -5,7 +5,7 @@ import io
 import random
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -59,6 +59,31 @@ def _raise_collective_error(
     failures = [f"rank {rank}: {message}" for rank, message in enumerate(errors) if message]
     if failures:
         raise RuntimeError(f"Cannot {operation}: {'; '.join(failures)}")
+
+
+def call_on_all_ranks(operation: Callable[[], Any], description: str,
+                      process_group: dist.ProcessGroup | None = None) -> Any:
+    """Run ``operation`` on every rank; if any rank fails, all ranks raise."""
+    result, error = None, None
+    try:
+        result = operation()
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    _raise_collective_error(error, description, process_group)
+    return result
+
+
+def read_training_metadata(path: str | Path, families: set[str] | None = None) -> dict[str, Any]:
+    """Load ``training_state.pt``; with ``families``, also require one of them and its training config."""
+    metadata = torch.load(Path(path) / "training_state.pt", map_location="cpu", weights_only=True)
+    if (not isinstance(metadata, dict) or metadata.get("format_version") != _FORMAT_VERSION
+            or not isinstance(metadata.get("extra_state"), dict)):
+        raise ValueError(f"Invalid training metadata: {path}")
+    extra = metadata["extra_state"]
+    if families is not None and (extra.get("trainer_family") not in families
+                                 or not isinstance(extra.get("training_config"), dict)):
+        raise ValueError(f"Checkpoint is not complete {'/'.join(sorted(families))} training state: {path}")
+    return metadata
 
 
 def capture_rng_state() -> dict[str, Any]:
