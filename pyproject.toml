@@ -18,3 +18,7 @@ dependencies = { file = ["requirements.txt"] }
 # without `src` ever appearing in import paths.
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# JIT-compiled CUDA sources for the NSA backend must ship with the package.
+[tool.setuptools.package-data]
+"omnimem.nsa.cuda_backend" = ["csrc/*.cpp", "csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/README.md"]

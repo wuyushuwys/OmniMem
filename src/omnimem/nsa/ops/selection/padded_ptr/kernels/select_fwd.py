@@ -5,37 +5,14 @@ Q reads KV blocks via ptr table (pointer chasing: load int64 addr, then load [BL
 PtrTableK/V: [B, MG, H, T] int64; 0 = invalid sentinel (byte addresses to [BLOCK_SIZE, D] bf16 regions).
 stride_bn / stride_bd: element counts (Triton scales by element size on typed ptrs).
 """
-import torch
 import triton
 import triton.language as tl
 
-
-_capability = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
-_sm_version = _capability[0] * 10 + _capability[1]
-
 # num_stages=1: ptr-chasing breaks software pipelining (next-iter addr unknown until current load completes).
-if _sm_version >= 90:
-    _fwd_configs = [
-        triton.Config({}, num_warps=2, num_stages=1),
-        triton.Config({}, num_warps=4, num_stages=1),
-        triton.Config({}, num_warps=8, num_stages=1),
-        triton.Config({}, num_warps=2, num_stages=2),
-        triton.Config({}, num_warps=4, num_stages=2),
-        triton.Config({}, num_warps=8, num_stages=2),
-        triton.Config({}, num_warps=4, num_stages=3),
-        triton.Config({}, num_warps=8, num_stages=3),
-    ]
-else:
-    _fwd_configs = [
-        triton.Config({}, num_warps=2, num_stages=1),
-        triton.Config({}, num_warps=4, num_stages=1),
-    ]
-
-
-def _compute_tile_n(block_size, max_tile=128):
-    """Pick TILE_N: one tile if it fits, otherwise chunk into max_tile."""
-    padded = max(16, triton.next_power_of_2(block_size))
-    return padded if padded <= max_tile else max_tile
+# One pinned config: num_warps changes the reduction order and therefore the output bits.
+_fwd_configs = [
+    triton.Config({}, num_warps=2, num_stages=1),
+]
 
 
 @triton.autotune(

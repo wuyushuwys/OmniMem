@@ -7,7 +7,7 @@ from .autograd import (
     selection_attention_padded_ptr_train_fast,
 )
 from .varlen_dense import selection_attention_varlen_dense
-from .ptr_builder import build_ptr_table
+from ._dispatch import build_ptr_table
 
 __all__ = [
     "selection_attention_padded_ptr",

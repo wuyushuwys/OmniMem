@@ -10,7 +10,10 @@ import triton
 import triton.language as tl
 import triton.testing
 
-from .select_fwd import _sel_attn_fwd_kernel, _compute_tile_n
+from omnimem.nsa.ops._int_utils import compute_tile_n, padded_pow2
+
+from .. import _validate_common
+from .select_fwd import _sel_attn_fwd_kernel
 
 # Device-adaptive autotune configs (TILE_N / TILE_KV set by caller)
 _capability = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
@@ -608,31 +611,8 @@ class SelectionAttention2p(torch.autograd.Function):
         G = group_size
         MG = M // G
         _, _, _, T = top_idx.shape
-
-        assert q.shape == (B, M, H, D)
-        assert k.shape == (B, N, H, D)
-        assert v.shape == (B, N, H, D)
-        assert top_idx.shape == (B, MG, H, T), f"Expected top_idx {(B, MG, H, T)}, got {top_idx.shape}"
-        assert D >= 16, f"expected D >= 16, but got {D}"
-        assert M % G == 0, f"M ({M}) must be divisible by group_size ({G})"
-
-        if chunk_size <= 0:
-            raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
-        if causal and G > 1:
-            assert chunk_size % G == 0, (
-                f"causal + group requires chunk_size ({chunk_size}) "
-                f"divisible by group_size ({G})"
-            )
-        if top_idx.shape[-1] == 0:
-            raise ValueError("top_idx last dim T must be > 0")
-
-        num_blocks = math.ceil(N / selection_block_size)
-        valid_mask = top_idx >= 0
-        if valid_mask.any() and torch.any(top_idx[valid_mask] >= num_blocks):
-            raise ValueError(
-                f"top_idx out of range: expected in [-1, {num_blocks - 1}] "
-                f"but got [{top_idx.min()}, {top_idx.max()}]"
-            )
+        num_blocks = _validate_common(q, k, v, top_idx, selection_block_size, chunk_size,
+                                      G, causal)
 
         if softmax_scale is None:
             softmax_scale = 1.0 / (D ** 0.5)
@@ -644,9 +624,9 @@ class SelectionAttention2p(torch.autograd.Function):
 
         DP = triton.next_power_of_2(D)
         OFFSET_M = 0
-        padded_group_size = max(16, triton.next_power_of_2(G))
-        tile_n = _compute_tile_n(selection_block_size, max_tile=128)
-        tile_kv = _compute_tile_n(selection_block_size, max_tile=64)
+        padded_group_size = padded_pow2(G)
+        tile_n = compute_tile_n(selection_block_size, max_tile=128)
+        tile_kv = compute_tile_n(selection_block_size, max_tile=64)
 
         grid = (B, MG - OFFSET_M, H)
 

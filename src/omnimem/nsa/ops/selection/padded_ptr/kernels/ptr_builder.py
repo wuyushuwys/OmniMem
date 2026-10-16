@@ -83,7 +83,7 @@ def _build_ptr_table_kernel(
             safe_cids = tl.where(valid, cids, 0).to(tl.int64)
             base_k = tl.load(bbpk_base + safe_cids * stride_bbpb, mask=valid, other=0)
             base_v = tl.load(bbpv_base + safe_cids * stride_bbpb, mask=valid, other=0)
-            # base==0: chunk not GPU-resident; ptr must be 0 so fwd kernel's `if ptr != 0` skip works.
+            # base==0: chunk not GPU-resident; ptr must be 0 so the fwd kernel skips it.
             base_valid_k = valid & (base_k != 0)
             base_valid_v = valid & (base_v != 0)
             ptr_k = tl.where(base_valid_k, base_k + batch_off + in_chunk_off, 0)
@@ -102,7 +102,7 @@ def _build_ptr_table_kernel(
         tl.store(pv_base + offs_t * stride_ptt, ptr_v, mask=mask_t)
 
 
-def build_ptr_table(
+def build_ptr_table_triton(
     block_indices: torch.Tensor,
     block_base_ptrs_k: torch.Tensor,
     block_base_ptrs_v: torch.Tensor,
