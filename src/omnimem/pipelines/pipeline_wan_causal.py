@@ -72,6 +72,65 @@ def forward_positions(num_frames: int, frame_per_block: int, switch_frames,
     return positions
 
 
+# How a KV option is named in an error: as ``generate()`` takes it, or as the streaming CLI spells it.
+_KV_OPTION_NAMES = {
+    "bytes": dict(tier="kv_tier_device", pool="kv_block_pool_bytes",
+                  scratch="kv_block_scratch_bytes", scale=1, spell="{}={}"),
+    "gb": dict(tier="--kv_tier", pool="--kv_block_pool_gb",
+               scratch="--kv_block_scratch_gb", scale=2 ** 30, spell="{} {}"),
+}
+
+
+def validate_kv_policy(policy, dedup, *, enable_kv_evict, tier, pool, scratch,
+                       finite_window=True, per_head_cache=True, unit="bytes"):
+    """``ValueError`` unless the KV options make one cache policy; returns the block budgets, given in ``unit``, in bytes."""
+    names = _KV_OPTION_NAMES[unit]
+    if policy not in ("chunk_lru", "block_lru"):
+        raise ValueError(
+            f"unknown kv_cache_policy {policy!r}; expected 'chunk_lru' or 'block_lru'")
+    # Validated under every policy so a typo is rejected early.
+    if dedup not in ("unique", "device"):
+        raise ValueError(f"unknown kv_block_dedup {dedup!r}; expected 'unique' or 'device'")
+    if policy == "chunk_lru":
+        # The chunk LRU has no block pools: reject a budget rather than ignore it.
+        for name, value, kind in ((names["pool"], pool, "persistent"),
+                                  (names["scratch"], scratch, "scratch")):
+            if value:
+                raise ValueError(
+                    f"{names['spell'].format(name, value)} needs kv_cache_policy='block_lru' "
+                    f"(it is the block store's {kind} pool budget); the chunk-level policy "
+                    f"'chunk_lru' has no block pool")
+        return 0, 0
+    # One policy per cache: the store owns the whole history path.
+    if tier:
+        raise ValueError(
+            f"kv_cache_policy='block_lru' and {names['tier']} are mutually exclusive: the GPU "
+            f"tier never writes the pinned host backing the block store fetches blocks from")
+    # ``window_size=None`` is dense over all history, which the store would have to keep resident.
+    if not finite_window:
+        raise ValueError(
+            "kv_cache_policy='block_lru' needs a finite KV window (window_size=None is "
+            "dense over the whole history)")
+    if not enable_kv_evict:
+        raise ValueError(
+            "kv_cache_policy='block_lru' needs enable_kv_evict=True: history retirement at "
+            "every generation-chunk boundary replaces the chunk LRU, and without it the whole "
+            "history stays protected on the DiT GPU")
+    pool_bytes = int(pool * names["scale"])
+    if pool_bytes <= 0:
+        raise ValueError(
+            f"kv_cache_policy='block_lru' needs {names['pool']} > 0 (it is the persistent "
+            f"block pool budget, total across layers)")
+    scratch_bytes = int(scratch * names["scale"])
+    if scratch_bytes < 0:
+        raise ValueError(f"{names['scratch']} must be >= 0")
+    if not per_head_cache:
+        raise ValueError(
+            "kv_cache_policy='block_lru' requires the chunk_per_head K/V cache "
+            "(enable_chunk_per_head_cache=True)")
+    return pool_bytes, scratch_bytes
+
+
 def _snapshot_chunks(cache: MMCache, chunk_start: int, chunk_end: int) -> dict:
     """Save references to cache chunks [chunk_start, chunk_end) for all layers, with versions."""
     snap = {}
@@ -261,46 +320,11 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
             kv_resident_fast_path: opt-in, skip LRU touch and host sync while nothing is host-resident ('chunk_lru' only).
             kv_exact_pinned_host: page-lock exactly the bytes of each host KV buffer; None follows OMNIMEM_EXACT_PINNED_KV.
         """
-        if kv_cache_policy not in ("chunk_lru", "block_lru"):
-            raise ValueError(
-                f"unknown kv_cache_policy {kv_cache_policy!r}; expected 'chunk_lru' or 'block_lru'")
+        validate_kv_policy(kv_cache_policy, kv_block_dedup, enable_kv_evict=enable_kv_evict,
+                           tier=kv_tier_device is not None, pool=kv_block_pool_bytes,
+                           scratch=kv_block_scratch_bytes,
+                           per_head_cache=enable_chunk_per_head_cache)
         block_policy = kv_cache_policy == "block_lru"
-        # kv_block_dedup is validated unconditionally, same as kv_cache_policy itself,
-        # even though it is only applied below under 'block_lru'.
-        if kv_block_dedup not in ("unique", "device"):
-            raise ValueError(
-                f"unknown kv_block_dedup {kv_block_dedup!r}; expected 'unique' or 'device'")
-        if block_policy:
-            # One policy per cache: the store owns the whole history path.
-            if kv_tier_device is not None:
-                raise ValueError(
-                    "kv_cache_policy='block_lru' and kv_tier_device are mutually exclusive: "
-                    "the GPU tier never writes the pinned host backing the block store "
-                    "fetches blocks from")
-            if int(kv_block_pool_bytes) <= 0:
-                raise ValueError(
-                    "kv_cache_policy='block_lru' needs kv_block_pool_bytes > 0 (it is the "
-                    "persistent block pool budget)")
-            if int(kv_block_scratch_bytes) < 0:
-                raise ValueError("kv_block_scratch_bytes must be >= 0")
-            if not enable_chunk_per_head_cache:
-                raise ValueError(
-                    "kv_cache_policy='block_lru' requires the chunk_per_head K/V cache "
-                    "(enable_chunk_per_head_cache=True)")
-            if not enable_kv_evict:
-                raise ValueError(
-                    "kv_cache_policy='block_lru' needs enable_kv_evict=True: history "
-                    "retirement at every generation-chunk boundary replaces the chunk LRU, "
-                    "and without it the whole history stays protected on the DiT GPU")
-        else:
-            # The chunk LRU has no block pools: reject a budget rather than ignore it.
-            for name, value, pool in (("kv_block_pool_bytes", kv_block_pool_bytes, "persistent"),
-                                      ("kv_block_scratch_bytes", kv_block_scratch_bytes, "scratch")):
-                if value:
-                    raise ValueError(
-                        f"{name}={value} needs kv_cache_policy='block_lru' (it is the block "
-                        f"store's {pool} pool budget); the chunk-level policy 'chunk_lru' "
-                        f"has no block pool")
         if return_latents and offload_model:
             raise ValueError("return_latents=True does not support offload_model=True "
                              "(the streaming path never moves the VAE during generation)")

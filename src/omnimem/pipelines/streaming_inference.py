@@ -19,6 +19,7 @@ import torch
 
 from omnimem.models.cache import EXACT_PINNED_KV_ENV, exact_pinned_kv_enabled
 from omnimem.pipelines import compile_state
+from omnimem.pipelines.pipeline_wan_causal import validate_kv_policy
 from omnimem.pipelines.streaming_decode import (
     LatentChunk,
     StreamingSession,
@@ -286,6 +287,19 @@ class VideoFileSink:
 
 
 @dataclass
+class KVHistory:
+    """The recipe's KV history options resolved against the layout, as ``generate()`` takes them."""
+    kv_cache_policy: str
+    kv_tier_device: Optional[torch.device]
+    kv_tier_budget_bytes: int
+    kv_block_pool_bytes: int
+    kv_block_scratch_bytes: int
+    kv_block_resident_if_fits: bool
+    kv_block_dedup: str
+    kv_exact_pinned_host: bool
+
+
+@dataclass
 class RunResult:
     prompt: str
     seed: int
@@ -451,77 +465,30 @@ class StreamingRuntime:
     def _resolve_kv_history(self) -> None:
         """Resolve the recipe's KV history options against the layout; raises ``ValueError``."""
         r = self.recipe
-        # The policy owns the whole history path, so it is decided (and rejected) first.
-        policy = r.kv_cache_policy
-        if policy not in ("block_lru", "chunk_lru"):
-            raise ValueError(
-                f"unknown kv_cache_policy {policy!r}; expected 'block_lru' or 'chunk_lru'")
-        block_policy = policy == "block_lru"
-        # Validated under every policy so a typo is rejected early.
-        dedup = str(r.kv_block_dedup or "device")
-        if dedup not in ("unique", "device"):
-            raise ValueError(f"unknown kv_block_dedup {dedup!r}; expected 'unique' or 'device'")
-        # Page-lock host KV at exactly its size: torch's pinned allocator rounds up to 2**n.
-        exact_pinned = (True if not os.environ.get(EXACT_PINNED_KV_ENV)
-                        else exact_pinned_kv_enabled())
-        # GPU history tier: evict to the decode GPU instead of pinned host
-        # memory.  Needs two devices and peer access (asserted by the cache).
-        want_tier = bool(r.kv_tier)
-        if want_tier and self.gpus < 2:
+        # The GPU history tier lives on the decode GPU; the policy rules are the pipeline's.
+        if r.kv_tier and self.gpus < 2:
             raise ValueError(
                 f"--kv_tier needs the two-GPU layout: the KV history tier lives on the "
                 f"decode GPU, and here the VAE decodes on the DiT GPU ({self.dit_device})")
-        pool_bytes = scratch_bytes = 0
-        if block_policy:
-            # Mutually exclusive with the GPU tier: the tier never writes the pinned
-            # host slots the store fetches blocks from.
-            if want_tier:
-                raise ValueError(
-                    "--kv_tier needs kv_cache_policy='chunk_lru': the KV GPU tier and the "
-                    "block store of 'block_lru' are mutually exclusive")
-            # A finite SWA window: ``window_size=None`` is dense-over-all-history, which
-            # the store would have to keep fully resident.
-            if r.window_size is None:
-                raise ValueError(
-                    "kv_cache_policy='block_lru' needs a finite KV window "
-                    "(recipe.window_size is None = dense over the whole history)")
-            # Retirement IS the block-mode eviction; without it the whole history stays
-            # protected on the DiT GPU and the policy is pointless.
-            if not r.enable_kv_evict:
-                raise ValueError(
-                    "kv_cache_policy='block_lru' needs enable_kv_evict=True (history "
-                    "retirement at every generation-chunk boundary replaces the chunk LRU)")
+        pool_gb, scratch_gb = r.kv_block_pool_gb, r.kv_block_scratch_gb
+        if r.kv_cache_policy == "block_lru":
             # No explicit budget = the runtime defaults; an explicit 0 pool is rejected.
-            pool_gb = r.kv_block_pool_gb
-            if pool_gb is None:
-                pool_gb = DEFAULT_BLOCK_POOL_GB
-            pool_bytes = int(pool_gb * 2 ** 30)
-            if pool_bytes <= 0:
-                raise ValueError(
-                    "kv_cache_policy='block_lru' needs --kv_block_pool_gb > 0 (it is the "
-                    "PERSISTENT block pool budget, total across layers)")
-            scratch_gb = r.kv_block_scratch_gb
-            if scratch_gb is None:
-                scratch_gb = DEFAULT_BLOCK_SCRATCH_GB
-            scratch_bytes = int(scratch_gb * 2 ** 30)
-            if scratch_bytes < 0:
-                raise ValueError("--kv_block_scratch_gb must be >= 0")
-        else:
-            # The chunk LRU has no block pools: reject a budget rather than ignore it.
-            for name, pool in (("kv_block_pool_gb", "persistent"), ("kv_block_scratch_gb", "scratch")):
-                if getattr(r, name):
-                    raise ValueError(
-                        f"--{name} {getattr(r, name)} needs kv_cache_policy='block_lru' "
-                        f"(it is the block store's {pool} pool budget); the chunk-level "
-                        f"policy 'chunk_lru' has no block pool")
-        self._kv_tier_device = self.decode_device if want_tier else None
-        self._kv_tier_budget_bytes = int(r.kv_tier_budget_gb * 2 ** 30) if want_tier else 0
-        self._kv_cache_policy = policy
-        self._kv_block_pool_bytes = pool_bytes
-        self._kv_block_scratch_bytes = scratch_bytes
-        self._kv_block_resident_if_fits = bool(r.kv_block_resident_if_fits)
-        self._kv_block_dedup = dedup
-        self._kv_exact_pinned_host = exact_pinned
+            pool_gb = DEFAULT_BLOCK_POOL_GB if pool_gb is None else pool_gb
+            scratch_gb = DEFAULT_BLOCK_SCRATCH_GB if scratch_gb is None else scratch_gb
+        dedup = str(r.kv_block_dedup or "device")
+        pool_bytes, scratch_bytes = validate_kv_policy(
+            r.kv_cache_policy, dedup, enable_kv_evict=r.enable_kv_evict, tier=bool(r.kv_tier),
+            pool=pool_gb, scratch=scratch_gb, finite_window=r.window_size is not None, unit="gb")
+        # Page-lock host KV at exactly its size: torch's pinned allocator rounds up to 2**n.
+        exact_pinned = (True if not os.environ.get(EXACT_PINNED_KV_ENV)
+                        else exact_pinned_kv_enabled())
+        self._kv = KVHistory(
+            kv_cache_policy=r.kv_cache_policy,
+            kv_tier_device=self.decode_device if r.kv_tier else None,
+            kv_tier_budget_bytes=int(r.kv_tier_budget_gb * 2 ** 30) if r.kv_tier else 0,
+            kv_block_pool_bytes=pool_bytes, kv_block_scratch_bytes=scratch_bytes,
+            kv_block_resident_if_fits=bool(r.kv_block_resident_if_fits),
+            kv_block_dedup=dedup, kv_exact_pinned_host=exact_pinned)
 
     def configure(self) -> Dict[str, Any]:
         """Apply the recipe's switches and report the *actual* configuration."""
@@ -536,7 +503,8 @@ class StreamingRuntime:
         self._check_recipe()
         self._resolve_kv_history()
         check_token_grid(r.height, r.width, r.frame_per_block, dict(self.transformer.config))
-        block_policy = self._kv_cache_policy == "block_lru"
+        kv = self._kv
+        block_policy = kv.kv_cache_policy == "block_lru"
         # Model-side settings the pipeline reads at request time.  (Whether and how the
         # DiT is compiled was decided by ``load``; ``config['compile']`` reports that.)
         self.pipeline.frame_per_block = r.frame_per_block
@@ -551,15 +519,15 @@ class StreamingRuntime:
             # 1: the VAE shares the DiT GPU and each chunk is decoded in the DiT loop
             # ("sync"); 2: the decoder thread drives the VAE on the decode GPU ("async").
             "gpus": self.gpus, "decode": "sync" if self.gpus == 1 else "async",
-            "kv_tier_device": str(self._kv_tier_device) if self._kv_tier_device else None,
-            "kv_tier_budget_gb": self._kv_tier_budget_bytes / 2 ** 30,
-            "kv_block_pool_gb": self._kv_block_pool_bytes / 2 ** 30,
-            "kv_cache_policy": self._kv_cache_policy,
-            "kv_block_scratch_gb": self._kv_block_scratch_bytes / 2 ** 30,
-            "kv_block_resident_if_fits": self._kv_block_resident_if_fits,
-            "kv_block_dedup": self._kv_block_dedup,
+            "kv_tier_device": str(kv.kv_tier_device) if kv.kv_tier_device else None,
+            "kv_tier_budget_gb": kv.kv_tier_budget_bytes / 2 ** 30,
+            "kv_block_pool_gb": kv.kv_block_pool_bytes / 2 ** 30,
+            "kv_cache_policy": kv.kv_cache_policy,
+            "kv_block_scratch_gb": kv.kv_block_scratch_bytes / 2 ** 30,
+            "kv_block_resident_if_fits": kv.kv_block_resident_if_fits,
+            "kv_block_dedup": kv.kv_block_dedup,
             "kv_window_buffer": bool(self.recipe.kv_window_buffer),
-            "kv_exact_pinned_host": self._kv_exact_pinned_host,
+            "kv_exact_pinned_host": kv.kv_exact_pinned_host,
             "lru_max_size": "n/a (block_lru)" if block_policy else self.recipe.lru_max_size,
             "attention_schedule": get_nsa_attention_schedule(self.transformer),
             "attention_modules_set": n_set,
@@ -605,16 +573,9 @@ class StreamingRuntime:
             lru_max_size=r.lru_max_size,
             slice_last_frames=r.slice_last_frames,
             recache_mode=r.recache_mode,
-            kv_tier_device=self._kv_tier_device,
-            kv_tier_budget_bytes=self._kv_tier_budget_bytes,
-            kv_block_pool_bytes=self._kv_block_pool_bytes,
-            kv_cache_policy=self._kv_cache_policy,
-            kv_block_scratch_bytes=self._kv_block_scratch_bytes,
-            kv_block_resident_if_fits=self._kv_block_resident_if_fits,
-            kv_block_dedup=self._kv_block_dedup,
             kv_window_buffer=r.kv_window_buffer,
-            kv_resident_fast_path=self._kv_cache_policy == "chunk_lru",
-            kv_exact_pinned_host=self._kv_exact_pinned_host,
+            kv_resident_fast_path=self._kv.kv_cache_policy == "chunk_lru",
+            **asdict(self._kv),
         )
         if r.park_t5:
             kw["text_encoder_park_device"] = r.park_t5
@@ -772,9 +733,9 @@ class StreamingRuntime:
         config["writer"] = {"codec": "libx264", "crf": r.crf, "preset": r.preset, "pix_fmt": r.pix_fmt}
         n_actual = actual_frames(nframes)
         devices = {self.dit_device, self._vae_device}
-        if self._kv_tier_device is not None:
+        if self._kv.kv_tier_device is not None:
             # Peak allocated/reserved of the tier device must be recorded too.
-            devices.add(self._kv_tier_device)
+            devices.add(self._kv.kv_tier_device)
 
         self._reset_cache_counters()
         selection_trace = [] if trace_selection else None
