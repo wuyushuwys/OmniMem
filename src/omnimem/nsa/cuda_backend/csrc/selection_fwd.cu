@@ -891,6 +891,44 @@ void launch_sel_fwd(const at::Tensor& q, at::Tensor& out, at::Tensor& lse, const
   OMNIMEM_CHECK_LAUNCH();
 }
 
+// Checks shared by the dense and pointer forward ops (table: block ids or pointers); returns MG.
+int64_t check_sel_fwd(const char* op, const at::Tensor& q, const at::Tensor& table,
+                      const char* table_name, int64_t block_size, int64_t group_size) {
+  const int64_t B = q.size(0), M = q.size(1), H = q.size(2), D = q.size(3);
+  TORCH_CHECK(D >= 16 && D <= 256, op, ": D must be in [16, 256], got ", D);
+  TORCH_CHECK(group_size >= 1 && group_size <= 128, op, ": group_size must be in [1,128]");
+  TORCH_CHECK(M % group_size == 0, op, ": M (", M, ") must be divisible by group_size (",
+              group_size, ")");
+  TORCH_CHECK(block_size > 0, op, ": block_size must be > 0");
+  const int64_t MG = M / group_size;
+  TORCH_CHECK(table.size(0) == B && table.size(1) == MG && table.size(2) == H, op, ": ",
+              table_name, " must be [", B, ",", MG, ",", H, ",T], got ", table.sizes());
+  return MG;
+}
+
+// Allocates out / lse and launches; many single-query groups visit KV in first-block order.
+template <typename scalar_t, typename ACC>
+std::tuple<at::Tensor, at::Tensor> run_sel_fwd(const at::Tensor& q, const at::Tensor& table,
+                                               const ACC& kv, int64_t group_size, int64_t MG,
+                                               int chunk_size, double scale, bool tf32) {
+  const int64_t B = q.size(0), M = q.size(1), H = q.size(2), D = q.size(3);
+  const at::cuda::CUDAGuard guard(q.device());
+  auto out = at::empty_like(q);
+  auto lse = at::empty({B, H, M}, q.options().dtype(at::kFloat));
+  if (B == 0 || M == 0 || H == 0) return std::make_tuple(out, lse);
+
+  const int64_t T = table.size(3);
+  auto stream = current_stream(q);
+  at::Tensor order;
+  if (group_size == 1 && MG >= 256 && T > 0)
+    order = at::argsort(table.select(3, 0), /*dim=*/static_cast<int64_t>(1), /*descending=*/false)
+                .to(at::kInt)
+                .contiguous();
+  launch_sel_fwd<scalar_t, ACC>(q, out, lse, kv, B, M, H, D, static_cast<int>(group_size),
+                                static_cast<int>(T), chunk_size, scale, tf32, order, stream);
+  return std::make_tuple(out, lse);
+}
+
 }  // namespace
 
 std::tuple<at::Tensor, at::Tensor> sel_fwd_cuda(
@@ -901,53 +939,30 @@ std::tuple<at::Tensor, at::Tensor> sel_fwd_cuda(
               "sel_fwd: all tensors must be CUDA tensors");
   TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "sel_fwd: q/k/v must be 4-D");
   TORCH_CHECK(k.sizes() == v.sizes(), "sel_fwd: k and v must have the same shape");
-  const int64_t B = q.size(0), M = q.size(1), H = q.size(2), D = q.size(3);
-  const int64_t N = k.size(1);
-  TORCH_CHECK(k.size(0) == B && k.size(2) == H && k.size(3) == D,
+  TORCH_CHECK(k.size(0) == q.size(0) && k.size(2) == q.size(2) && k.size(3) == q.size(3),
               "sel_fwd: expected k/v [B,N,H,D] compatible with q");
   TORCH_CHECK(k.scalar_type() == q.scalar_type() && v.scalar_type() == q.scalar_type(),
               "sel_fwd: q/k/v must share one dtype, got ", q.scalar_type(), "/", k.scalar_type(),
               "/", v.scalar_type());
   TORCH_CHECK(block_indices.scalar_type() == at::kInt, "sel_fwd: block_indices must be int32");
   TORCH_CHECK(block_indices.dim() == 4, "sel_fwd: block_indices must be [B,MG,H,T]");
-  TORCH_CHECK(D >= 16 && D <= 256, "sel_fwd: D must be in [16, 256], got ", D);
-  TORCH_CHECK(group_size >= 1 && group_size <= 128, "sel_fwd: group_size must be in [1,128]");
-  TORCH_CHECK(M % group_size == 0, "sel_fwd: M (", M, ") must be divisible by group_size (",
-              group_size, ")");
   TORCH_CHECK(chunk_size > 0, "sel_fwd: chunk_size must be > 0");
-  TORCH_CHECK(block_size > 0, "sel_fwd: block_size must be > 0");
-  const int64_t MG = M / group_size;
-  TORCH_CHECK(block_indices.size(0) == B && block_indices.size(1) == MG &&
-                  block_indices.size(2) == H,
-              "sel_fwd: block_indices must be [", B, ",", MG, ",", H, ",T], got ",
-              block_indices.sizes());
+  const int64_t MG = check_sel_fwd("sel_fwd", q, block_indices, "block_indices", block_size,
+                                   group_size);
 
-  const at::cuda::CUDAGuard guard(q.device());
-  auto out = at::empty_like(q);
-  auto lse = at::empty({B, H, M}, q.options().dtype(at::kFloat));
-  if (B == 0 || M == 0 || H == 0) return std::make_tuple(out, lse);
-
-  const int64_t T = block_indices.size(3);
-  auto stream = current_stream(q);
-  // Sort groups by first selected block (small argsort) for L2 hits; only for many groups.
-  at::Tensor order;
-  if (group_size == 1 && MG >= 256 && T > 0)
-    order = at::argsort(block_indices.select(3, 0), /*dim=*/static_cast<int64_t>(1), /*descending=*/false).to(at::kInt).contiguous();
+  std::tuple<at::Tensor, at::Tensor> res;
   OMNIMEM_DISPATCH_FLOAT_TYPES(q.scalar_type(), "sel_fwd", [&] {
     DenseKV<scalar_t> kv{make_strided4_const<scalar_t>(k),
                          make_strided4_const<scalar_t>(v),
                          block_indices.data_ptr<int32_t>(),
                          block_indices.stride(0), block_indices.stride(1),
                          block_indices.stride(2), block_indices.stride(3),
-                         static_cast<int>(N), static_cast<int>(block_size),
+                         static_cast<int>(k.size(1)), static_cast<int>(block_size),
                          static_cast<int>(chunk_size), causal};
-    launch_sel_fwd<scalar_t, DenseKV<scalar_t>>(q, out, lse, kv, B, M, H, D,
-                                                static_cast<int>(group_size),
-                                                static_cast<int>(T),
-                                                static_cast<int>(chunk_size), scale,
-                                                allow_tf32, order, stream);
+    res = run_sel_fwd<scalar_t>(q, block_indices, kv, group_size, MG,
+                                static_cast<int>(chunk_size), scale, allow_tf32);
   });
-  return std::make_tuple(out, lse);
+  return res;
 }
 
 std::tuple<at::Tensor, at::Tensor> sel_fwd_ptr_cuda(
@@ -966,36 +981,14 @@ std::tuple<at::Tensor, at::Tensor> sel_fwd_ptr_cuda(
   TORCH_CHECK(ptr_k.dim() == 4 && ptr_v.sizes() == ptr_k.sizes() &&
                   ptr_v.strides() == ptr_k.strides(),
               "sel_fwd_ptr: ptr_k / ptr_v must be [B,MG,H,T] with identical layout");
-  const int64_t B = q.size(0), M = q.size(1), H = q.size(2), D = q.size(3);
-  TORCH_CHECK(D >= 16 && D <= 256, "sel_fwd_ptr: D must be in [16, 256], got ", D);
-  TORCH_CHECK(group_size >= 1 && group_size <= 128,
-              "sel_fwd_ptr: group_size must be in [1,128]");
-  TORCH_CHECK(M % group_size == 0, "sel_fwd_ptr: M (", M, ") must be divisible by group_size (",
-              group_size, ")");
-  TORCH_CHECK(block_size > 0, "sel_fwd_ptr: block_size must be > 0");
-  const int64_t MG = M / group_size;
-  TORCH_CHECK(ptr_k.size(0) == B && ptr_k.size(1) == MG && ptr_k.size(2) == H,
-              "sel_fwd_ptr: ptr tables must be [", B, ",", MG, ",", H, ",T], got ",
-              ptr_k.sizes());
+  const int64_t MG = check_sel_fwd("sel_fwd_ptr", q, ptr_k, "ptr tables", block_size,
+                                   group_size);
 
-  const at::cuda::CUDAGuard guard(q.device());
-  auto out = at::empty_like(q);
-  auto lse = at::empty({B, H, M}, q.options().dtype(at::kFloat));
-  if (B == 0 || M == 0 || H == 0) return std::make_tuple(out, lse);
-
-  const int64_t T = ptr_k.size(3);
-  auto stream = current_stream(q);
-  at::Tensor order;
-  if (group_size == 1 && MG >= 256 && T > 0)
-    order = at::argsort(ptr_k.select(3, 0), /*dim=*/static_cast<int64_t>(1), /*descending=*/false).to(at::kInt).contiguous();
   using scalar_t = c10::BFloat16;
   PtrKV<scalar_t> kv{ptr_k.data_ptr<int64_t>(), ptr_v.data_ptr<int64_t>(),
                      ptr_k.stride(0), ptr_k.stride(1), ptr_k.stride(2), ptr_k.stride(3),
                      stride_bn, stride_bd, static_cast<int>(block_size)};
-  launch_sel_fwd<scalar_t, PtrKV<scalar_t>>(q, out, lse, kv, B, M, H, D,
-                                            static_cast<int>(group_size), static_cast<int>(T),
-                                            /*chunk_size=*/1, scale, tf32, order, stream);
-  return std::make_tuple(out, lse);
+  return run_sel_fwd<scalar_t>(q, ptr_k, kv, group_size, MG, /*chunk_size=*/1, scale, tf32);
 }
 
 }  // namespace omnimem_nsa

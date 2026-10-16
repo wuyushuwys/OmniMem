@@ -1256,6 +1256,74 @@ void launch_dkv_mma(const at::Tensor& q, const at::Tensor& d_out, const at::Tens
   OMNIMEM_CHECK_LAUNCH();
 }
 
+// Checks shared by the dense and pointer backward ops; returns MG.
+int64_t check_sel_bwd(const char* op, const at::Tensor& q, const at::Tensor& out,
+                      const at::Tensor& lse, const at::Tensor& d_out,
+                      const at::Tensor& block_indices, int64_t block_size, int64_t group_size) {
+  TORCH_CHECK(q.dim() == 4 && out.dim() == 4 && d_out.dim() == 4, op,
+              ": q/out/d_out must be 4-D");
+  TORCH_CHECK(q.scalar_type() == out.scalar_type() && q.scalar_type() == d_out.scalar_type(), op,
+              ": q/out/d_out must share one dtype");
+  TORCH_CHECK(out.sizes() == q.sizes() && d_out.sizes() == q.sizes(), op,
+              ": out/d_out must have q's shape");
+  TORCH_CHECK(block_indices.scalar_type() == at::kInt && block_indices.dim() == 4, op,
+              ": block_indices must be int32 [B, MG, H, T]");
+  TORCH_CHECK(lse.dim() == 3 && lse.scalar_type() == at::kFloat, op,
+              ": lse must be fp32 [B, H, M]");
+  TORCH_CHECK(block_size > 0 && group_size >= 1, op, ": need block_size > 0 and group_size >= 1");
+  const int64_t B = q.size(0), M = q.size(1), H = q.size(2), D = q.size(3);
+  TORCH_CHECK(M % group_size == 0, op, ": M (", M, ") must be divisible by group_size (",
+              group_size, ")");
+  const int64_t MG = M / group_size;
+  TORCH_CHECK(block_indices.size(0) == B && block_indices.size(1) == MG &&
+                  block_indices.size(2) == H,
+              op, ": block_indices must be [B, ", MG, ", ", H, ", T]");
+  TORCH_CHECK(lse.size(0) == B && lse.size(1) == H && lse.size(2) == M, op,
+              ": lse must be [B, H, M]");
+  TORCH_CHECK(D >= 1 && D <= 256, op, ": head dim must be in [1, 256], got ", D);
+  TORCH_CHECK(M <= 2147483647LL, op, ": M exceeds the int32 index range");
+  return MG;
+}
+
+// dQ kernel choice: TF32 MMA when it pays off, a warp per small group, else FP32 SIMT.
+template <typename scalar_t, typename AccT>
+void launch_dq_auto(bool use_mma, const at::Tensor& q, const at::Tensor& o,
+                    const at::Tensor& d_out, at::Tensor& dq, const at::Tensor& lse,
+                    at::Tensor& delta, const at::Tensor& order, AccT acc, int64_t k_sn,
+                    int64_t k_sd, int64_t v_sn, int64_t v_sd, int64_t B, int64_t H, int64_t MG,
+                    int64_t G, int64_t T, int64_t D, int64_t chunk_size, double scale,
+                    int64_t block_size, cudaStream_t stream, const std::string& op) {
+  if (use_mma && dq_mma_profitable(static_cast<int>(G))) {
+    launch_dq_mma<scalar_t>(q, o, d_out, dq, lse, delta, order, acc, k_sn, k_sd, v_sn, v_sd, B,
+                            H, MG, G, T, D, chunk_size, scale, stream,
+                            (op + " dQ (tf32)").c_str());
+  } else if (use_mma && G <= 7) {
+    launch_dq_warp<scalar_t>(q, o, d_out, dq, lse, delta, order, acc, k_sn, k_sd, v_sn, v_sd, B,
+                             H, MG, G, T, D, chunk_size, scale, stream,
+                             (op + " dQ (warp)").c_str());
+  } else {
+    launch_dq<scalar_t>(q, o, d_out, dq, lse, delta, order, acc, B, H, MG, G, T, D, chunk_size,
+                        scale, block_size, stream, (op + " dQ").c_str());
+  }
+}
+
+// dK/dV kernel choice: TF32 MMA (cp.async staging when kv_ok) or FP32 SIMT.
+template <typename scalar_t, typename ResT>
+void launch_dkv_auto(bool use_mma, bool kv_ok, const at::Tensor& q, const at::Tensor& d_out,
+                     const at::Tensor& lse, const at::Tensor& delta, const at::Tensor& groups,
+                     const at::Tensor& offsets, ResT res, int64_t B, int64_t H, int64_t NS,
+                     int64_t G, int64_t D, int64_t chunk_size, double scale,
+                     int64_t block_size, cudaStream_t stream, const std::string& op) {
+  if (use_mma) {
+    launch_dkv_mma<scalar_t>(q, d_out, lse, delta, groups, offsets, res, B, H, NS, G, D,
+                             chunk_size, scale, block_size, kv_ok, stream,
+                             (op + " dK/dV (tf32)").c_str());
+  } else {
+    launch_dkv<scalar_t>(q, d_out, lse, delta, groups, offsets, res, B, H, NS, G, D, chunk_size,
+                         scale, block_size, stream, (op + " dK/dV").c_str());
+  }
+}
+
 }  // namespace
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> sel_bwd_cuda(
@@ -1265,35 +1333,20 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> sel_bwd_cuda(
     int64_t group_size, bool allow_tf32) {
   // allow_tf32 == false selects the FP32 SIMT kernels, true the TF32 MMA ones.
   TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "sel_bwd: q/k/v must be CUDA tensors");
-  TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "sel_bwd: q/k/v must be 4-D");
-  TORCH_CHECK(out.dim() == 4 && d_out.dim() == 4, "sel_bwd: out/d_out must be 4-D");
-  TORCH_CHECK(q.scalar_type() == k.scalar_type() && q.scalar_type() == v.scalar_type() &&
-                  q.scalar_type() == out.scalar_type() && q.scalar_type() == d_out.scalar_type(),
+  TORCH_CHECK(k.dim() == 4 && v.dim() == 4, "sel_bwd: k/v must be 4-D");
+  TORCH_CHECK(q.scalar_type() == k.scalar_type() && q.scalar_type() == v.scalar_type(),
               "sel_bwd: q/k/v/out/d_out must share one dtype");
-  TORCH_CHECK(out.sizes() == q.sizes() && d_out.sizes() == q.sizes(),
-              "sel_bwd: out/d_out must have q's shape");
   TORCH_CHECK(k.sizes() == v.sizes(), "sel_bwd: k and v must have the same shape");
-  TORCH_CHECK(block_indices.scalar_type() == at::kInt && block_indices.dim() == 4,
-              "sel_bwd: block_indices must be int32 [B, MG, H, T]");
-  TORCH_CHECK(lse.dim() == 3 && lse.scalar_type() == at::kFloat, "sel_bwd: lse must be fp32 [B,H,M]");
-  TORCH_CHECK(block_size > 0 && chunk_size > 0, "sel_bwd: block_size/chunk_size must be > 0");
-  TORCH_CHECK(group_size >= 1, "sel_bwd: group_size must be >= 1");
-
+  TORCH_CHECK(chunk_size > 0, "sel_bwd: block_size/chunk_size must be > 0");
+  const int64_t MG = check_sel_bwd("sel_bwd", q, out, lse, d_out, block_indices, block_size,
+                                   group_size);
   const int64_t B = q.size(0), M = q.size(1), H = q.size(2), D = q.size(3);
   const int64_t N = k.size(1);
   const int64_t G = group_size;
-  TORCH_CHECK(M % G == 0, "sel_bwd: M (", M, ") must be divisible by group_size (", G, ")");
-  const int64_t MG = M / G;
   const int64_t T = block_indices.size(3);
   TORCH_CHECK(k.size(0) == B && k.size(2) == H && k.size(3) == D,
               "sel_bwd: k must be [B, N, H, D]");
-  TORCH_CHECK(block_indices.size(0) == B && block_indices.size(1) == MG &&
-                  block_indices.size(2) == H,
-              "sel_bwd: block_indices must be [B, ", MG, ", ", H, ", T]");
-  TORCH_CHECK(lse.size(0) == B && lse.size(1) == H && lse.size(2) == M,
-              "sel_bwd: lse must be [B, H, M]");
-  TORCH_CHECK(D >= 1 && D <= 256, "sel_bwd: head dim must be in [1, 256], got ", D);
-  TORCH_CHECK(M <= 2147483647LL && N <= 2147483647LL, "sel_bwd: M/N exceed the int32 index range");
+  TORCH_CHECK(N <= 2147483647LL, "sel_bwd: M/N exceed the int32 index range");
 
   const at::cuda::CUDAGuard guard(q.device());
   const auto stream = current_stream(q);
@@ -1323,18 +1376,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> sel_bwd_cuda(
     acc.block_size = static_cast<int>(block_size);
     acc.chunk_size = static_cast<int>(chunk_size);
     acc.causal = causal;
-    if (use_mma && dq_mma_profitable(static_cast<int>(G))) {
-      launch_dq_mma<scalar_t>(q, out, d_out, dq, lse, delta, order, acc, k.stride(1),
-                              k.stride(3), v.stride(1), v.stride(3), B, H, MG, G, T, D,
-                              chunk_size, scale, stream, "sel_bwd dQ (tf32)");
-    } else if (use_mma && G <= 7) {
-      launch_dq_warp<scalar_t>(q, out, d_out, dq, lse, delta, order, acc, k.stride(1),
-                               k.stride(3), v.stride(1), v.stride(3), B, H, MG, G, T, D,
-                               chunk_size, scale, stream, "sel_bwd dQ (warp)");
-    } else {
-      launch_dq<scalar_t>(q, out, d_out, dq, lse, delta, order, acc, B, H, MG, G, T, D,
-                          chunk_size, scale, block_size, stream, "sel_bwd dQ");
-    }
+    launch_dq_auto<scalar_t>(use_mma, q, out, d_out, dq, lse, delta, order, acc, k.stride(1),
+                             k.stride(3), v.stride(1), v.stride(3), B, H, MG, G, T, D,
+                             chunk_size, scale, block_size, stream, "sel_bwd");
 
     at::Tensor groups, offsets;
     std::tie(groups, offsets) = build_inverted_index_impl(block_indices, empty_bound, NS,
@@ -1352,17 +1396,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> sel_bwd_cuda(
     res.block_size = static_cast<int>(block_size);
     res.chunk_size = static_cast<int>(chunk_size);
     res.causal = causal;
-    if (use_mma) {
-      const bool kv_ok = k.stride(3) == 1 && v.stride(3) == 1 &&
-                         k.stride(1) % cp_vec<scalar_t>() == 0 &&
-                         v.stride(1) % cp_vec<scalar_t>() == 0;
-      launch_dkv_mma<scalar_t>(q, d_out, lse, delta, groups, offsets, res, B, H, NS, G, D,
-                               chunk_size, scale, block_size, kv_ok, stream,
-                               "sel_bwd dK/dV (tf32)");
-    } else {
-      launch_dkv<scalar_t>(q, d_out, lse, delta, groups, offsets, res, B, H, NS, G, D,
-                           chunk_size, scale, block_size, stream, "sel_bwd dK/dV");
-    }
+    const bool kv_ok = k.stride(3) == 1 && v.stride(3) == 1 &&
+                       k.stride(1) % cp_vec<scalar_t>() == 0 &&
+                       v.stride(1) % cp_vec<scalar_t>() == 0;
+    launch_dkv_auto<scalar_t>(use_mma, kv_ok, q, d_out, lse, delta, groups, offsets, res, B, H,
+                              NS, G, D, chunk_size, scale, block_size, stream, "sel_bwd");
   });
 
   return std::make_tuple(dq, dk32.to(k.scalar_type()), dv32.to(v.scalar_type()));
@@ -1384,38 +1422,22 @@ std::tuple<at::Tensor, at::Tensor> sel_bwd_ptr_cuda(
   const Precision prec = parse_precision(input_precision);
 
   TORCH_CHECK(q.is_cuda(), "sel_bwd_ptr: q must be a CUDA tensor");
-  TORCH_CHECK(q.dim() == 4 && out.dim() == 4 && d_out.dim() == 4, "sel_bwd_ptr: q/out/d_out must be 4-D");
-  TORCH_CHECK(q.scalar_type() == out.scalar_type() && q.scalar_type() == d_out.scalar_type(),
-              "sel_bwd_ptr: q/out/d_out must share one dtype");
   TORCH_CHECK(q.scalar_type() == at::kBFloat16, "sel_bwd_ptr: q must be bfloat16, got ",
               q.scalar_type());
-  TORCH_CHECK(out.sizes() == q.sizes() && d_out.sizes() == q.sizes(),
-              "sel_bwd_ptr: out/d_out must have q's shape");
   TORCH_CHECK(ptr_k.scalar_type() == at::kLong && ptr_v.scalar_type() == at::kLong,
               "sel_bwd_ptr: ptr tables must be int64 byte addresses");
   TORCH_CHECK(ptr_k.dim() == 4 && ptr_v.sizes() == ptr_k.sizes() &&
                   ptr_v.strides() == ptr_k.strides(),
               "sel_bwd_ptr: ptr_k / ptr_v must share shape and strides");
-  TORCH_CHECK(block_indices.scalar_type() == at::kInt && block_indices.dim() == 4,
-              "sel_bwd_ptr: block_indices must be int32 [B, MG, H, T]");
-  TORCH_CHECK(lse.dim() == 3 && lse.scalar_type() == at::kFloat,
-              "sel_bwd_ptr: lse must be fp32 [B, H, M]");
-  TORCH_CHECK(block_size > 0 && group_size >= 1, "sel_bwd_ptr: bad block_size / group_size");
-
+  const int64_t MG = check_sel_bwd("sel_bwd_ptr", q, out, lse, d_out, block_indices, block_size,
+                                   group_size);
   const int64_t B = q.size(0), M = q.size(1), H = q.size(2), D = q.size(3);
   const int64_t G = group_size;
-  TORCH_CHECK(M % G == 0, "sel_bwd_ptr: M (", M, ") must be divisible by group_size (", G, ")");
-  const int64_t MG = M / G;
   const int64_t T = ptr_k.size(3);
   TORCH_CHECK(ptr_k.size(0) == B && ptr_k.size(1) == MG && ptr_k.size(2) == H,
               "sel_bwd_ptr: ptr tables must be [B, MG, H, T]");
-  TORCH_CHECK(block_indices.size(0) == B && block_indices.size(1) == MG &&
-                  block_indices.size(2) == H && block_indices.size(3) == T,
+  TORCH_CHECK(block_indices.size(3) == T,
               "sel_bwd_ptr: block_indices must match the ptr table shape");
-  TORCH_CHECK(lse.size(0) == B && lse.size(1) == H && lse.size(2) == M,
-              "sel_bwd_ptr: lse must be [B, H, M]");
-  TORCH_CHECK(D >= 1 && D <= 256, "sel_bwd_ptr: head dim must be in [1, 256], got ", D);
-  TORCH_CHECK(M <= 2147483647LL, "sel_bwd_ptr: M exceeds the int32 index range");
 
   const at::cuda::CUDAGuard guard(q.device());
   const auto stream = current_stream(q);
@@ -1439,18 +1461,9 @@ std::tuple<at::Tensor, at::Tensor> sel_bwd_ptr_cuda(
     acc.stride_d = stride_bd;
     acc.block_size = static_cast<int>(block_size);
     // chunk_size == 1, causal == false: the pointer path has no token ids.
-    if (use_mma && dq_mma_profitable(static_cast<int>(G))) {
-      launch_dq_mma<scalar_t>(q, out, d_out, dq, lse, delta, order, acc, stride_bn, stride_bd,
-                              stride_bn, stride_bd, B, H, MG, G, T, D, /*chunk_size=*/1, scale,
-                              stream, "sel_bwd_ptr dQ (tf32)");
-    } else if (use_mma && G <= 7) {
-      launch_dq_warp<scalar_t>(q, out, d_out, dq, lse, delta, order, acc, stride_bn, stride_bd,
-                               stride_bn, stride_bd, B, H, MG, G, T, D, /*chunk_size=*/1,
-                               scale, stream, "sel_bwd_ptr dQ (warp)");
-    } else {
-      launch_dq<scalar_t>(q, out, d_out, dq, lse, delta, order, acc, B, H, MG, G, T, D,
-                          /*chunk_size=*/1, scale, block_size, stream, "sel_bwd_ptr dQ");
-    }
+    launch_dq_auto<scalar_t>(use_mma, q, out, d_out, dq, lse, delta, order, acc, stride_bn,
+                             stride_bd, stride_bn, stride_bd, B, H, MG, G, T, D,
+                             /*chunk_size=*/1, scale, block_size, stream, "sel_bwd_ptr");
   }();
 
   if (!compute_dkv) return std::make_tuple(dq, delta);  // LRU dq-only training path
@@ -1504,15 +1517,10 @@ std::tuple<at::Tensor, at::Tensor> sel_bwd_ptr_cuda(
     res.s_bd = stride_bd;
     res.s_dbn = stride_dbn;
     res.s_dbd = stride_dbd;
-    if (use_mma) {
-      const bool kv_ok = stride_bd == 1 && stride_bn % cp_vec<scalar_t>() == 0;
-      launch_dkv_mma<scalar_t>(q, d_out, lse, delta, groups, offsets, res, B, H, max_n, G, D,
-                               /*chunk_size=*/1, scale, block_size, kv_ok, stream,
-                               "sel_bwd_ptr dK/dV (tf32)");
-    } else {
-      launch_dkv<scalar_t>(q, d_out, lse, delta, groups, offsets, res, B, H, max_n, G, D,
-                           /*chunk_size=*/1, scale, block_size, stream, "sel_bwd_ptr dK/dV");
-    }
+    const bool kv_ok = stride_bd == 1 && stride_bn % cp_vec<scalar_t>() == 0;
+    launch_dkv_auto<scalar_t>(use_mma, kv_ok, q, d_out, lse, delta, groups, offsets, res, B, H,
+                              max_n, G, D, /*chunk_size=*/1, scale, block_size, stream,
+                              "sel_bwd_ptr");
   }();
 
   return std::make_tuple(dq, delta);
