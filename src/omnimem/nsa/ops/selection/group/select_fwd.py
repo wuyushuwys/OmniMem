@@ -29,12 +29,6 @@ else:
     ]
 
 
-def _compute_tile_n(selection_block_size, max_tile=128):
-    """Pick TILE_N: use one tile if it fits, otherwise chunk into max_tile."""
-    padded = max(16, triton.next_power_of_2(selection_block_size))
-    return padded if padded <= max_tile else max_tile
-
-
 @triton.autotune(
     configs=_sel_attn_fwd_configs,
     key=['M', 'N', 'D', 'SELECTION_BLOCK_SIZE', 'T', 'causal', 'TILE_N'],

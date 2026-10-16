@@ -6,7 +6,7 @@ from typing import Optional
 import numpy as np
 import torch
 
-from omnimem.nsa.backend import get_backend
+from omnimem.nsa.backend import get_backend, resolve_backend
 from omnimem.nsa.ops._int_utils import cdiv
 
 __all__ = [
@@ -30,23 +30,19 @@ def _check_table(table: torch.Tensor, n_valid: torch.Tensor):
         f"n_valid must be int32 [H={table.shape[1]}], got {n_valid.dtype} {tuple(n_valid.shape)}"
 
 
-def _dispatch_block_range(backend: str, table: torch.Tensor, n_valid: torch.Tensor,
-                          first_bid: int, n_blocks: int, k_base: int, v_base: int,
-                          head_stride_bytes: int, block_bytes: int,
-                          n_valid_value: int, write_k: bool, write_v: bool,
-                          clear: bool) -> None:
-    if backend == "triton":
-        from .block_kv_kernels_triton import launch_block_range_triton
-        launch_block_range_triton(
-            table, n_valid, first_bid, n_blocks, k_base, v_base,
-            head_stride_bytes, block_bytes, n_valid_value, write_k, write_v, clear)
-    elif backend == "cuda":
+def _resolve(backend: Optional[str]) -> str:
+    """An explicit backend name, checked, else the active NSA backend."""
+    return resolve_backend(backend or get_backend(), what="unknown block KV backend")
+
+
+def _dispatch_block_range(backend: Optional[str], *args) -> None:
+    """One K2 launch; ``args`` are ``block_kv_ops.block_range``'s."""
+    if _resolve(backend) == "cuda":
         from omnimem.nsa.cuda_backend import block_kv_ops
-        block_kv_ops.block_range(
-            table, n_valid, first_bid, n_blocks, k_base, v_base,
-            head_stride_bytes, block_bytes, n_valid_value, write_k, write_v, clear)
+        block_kv_ops.block_range(*args)
     else:
-        raise ValueError(f"unknown block KV backend {backend!r}")
+        from .block_kv_kernels_triton import launch_block_range_triton
+        launch_block_range_triton(*args)
 
 
 # K2: range register / clear
@@ -69,7 +65,6 @@ def register_block_range(table: torch.Tensor, n_valid: torch.Tensor,
             n_valid.fill_(int(n_valid_value))
         return
     assert int(k_base) != 0 or int(v_base) != 0, "nothing to register"
-    backend = backend or get_backend()
     _dispatch_block_range(
         backend, table, n_valid, first_bid, n_blocks, int(k_base), int(v_base),
         int(head_stride_bytes), int(block_bytes), int(n_valid_value),
@@ -94,7 +89,6 @@ def clear_block_range(table: torch.Tensor, n_valid: torch.Tensor,
         if int(n_valid_value) >= 0:
             n_valid.fill_(int(n_valid_value))
         return
-    backend = backend or get_backend()
     _dispatch_block_range(
         backend, table, n_valid, first_bid, n_blocks, 0, 0, 0, 0,
         int(n_valid_value), "k" in which, "v" in which, True)
@@ -133,16 +127,13 @@ def gather_publish_clear(desc: torch.Tensor, n_fetch: int, n_clear: int,
     else:
         assert not wide or block_bytes % 8 == 0, (
             f"wide copy needs block_bytes ({block_bytes}) to be a multiple of 8")
-    backend = backend or get_backend()
-    if backend == "triton":
-        from .block_kv_kernels_triton import launch_gather_publish_clear_triton
-        launch_gather_publish_clear_triton(
-            desc, typed, n_fetch, n_clear, int(block_tokens), int(head_dim),
-            bool(wide), int(num_warps))
-    elif backend == "cuda":
+    if _resolve(backend) == "cuda":
         from omnimem.nsa.cuda_backend import block_kv_ops
         block_kv_ops.gather_publish_clear(
             desc, n_fetch, n_clear, block_bytes, bool(wide), int(num_warps))
     else:
-        raise ValueError(f"unknown block KV backend {backend!r}")
+        from .block_kv_kernels_triton import launch_gather_publish_clear_triton
+        launch_gather_publish_clear_triton(
+            desc, typed, n_fetch, n_clear, int(block_tokens), int(head_dim),
+            bool(wide), int(num_warps))
     return n_fetch + cdiv(n_clear, _CLR_BLOCK)

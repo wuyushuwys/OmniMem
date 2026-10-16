@@ -12,6 +12,7 @@ import triton
 import triton.language as tl
 import triton.testing
 
+from .. import _validate_common
 from .select_fwd import _sel_attn_fwd_kernel
 
 # Device-adaptive autotune configs
@@ -649,25 +650,8 @@ class SelectionAttention2p(torch.autograd.Function):
         B, M, H, D = q.shape
         _, N, _, _ = k.shape
         _, _, _, T = top_idx.shape
-
-        assert q.shape == (B, M, H, D)
-        assert k.shape == (B, N, H, D)
-        assert v.shape == (B, N, H, D)
-        assert top_idx.shape == (B, M, H, T)
-        assert D >= 16, f"expected D >= 16, but got {D}"
-
-        if chunk_size <= 0:
-            raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
-        if top_idx.shape[-1] == 0:
-            raise ValueError("top_idx last dim T must be > 0")
-
-        num_blocks = math.ceil(N / selection_block_size)
-        valid_mask = top_idx >= 0
-        if valid_mask.any() and torch.any(top_idx[valid_mask] >= num_blocks):
-            raise ValueError(
-                f"top_idx out of range: expected in [-1, {num_blocks - 1}] "
-                f"but got [{top_idx.min()}, {top_idx.max()}]"
-            )
+        num_blocks = _validate_common(q, k, v, top_idx, selection_block_size, chunk_size,
+                                      1, causal)
 
         if softmax_scale is None:
             softmax_scale = 1.0 / (D ** 0.5)

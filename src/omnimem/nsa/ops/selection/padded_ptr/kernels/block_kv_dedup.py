@@ -79,18 +79,14 @@ class DeviceBlockDedup:
             self.stamp.fill_(-1)
             self.epoch = 1
         flat = block_indices.view(-1)
-        if self.backend == "triton":
-            from .block_kv_dedup_triton import launch_dedup_triton
-            n_launched = launch_dedup_triton(
-                flat, self.stamp, self.counts, self.offsets, self.out,
+        args = (flat, self.stamp, self.counts, self.offsets, self.out,
                 self.epoch, self.MB, self.H, self.T, self.bpc, self.cap)
-        elif self.backend == "cuda":
+        if self.backend == "cuda":
             from omnimem.nsa.cuda_backend import block_kv_ops
-            n_launched = block_kv_ops.dedup_run(
-                flat, self.stamp, self.counts, self.offsets, self.out,
-                self.epoch, self.MB, self.H, self.T, self.bpc, self.cap)
+            n_launched = block_kv_ops.dedup_run(*args)
         else:
-            raise ValueError(f"unknown block KV backend {self.backend!r}")
+            from .block_kv_dedup_triton import launch_dedup_triton
+            n_launched = launch_dedup_triton(*args)
         # The D2H is enqueued on the current stream of ``self.device``; the event must
         # be recorded on that very stream to be its completion point.
         self.pinned.copy_(self.out, non_blocking=True)

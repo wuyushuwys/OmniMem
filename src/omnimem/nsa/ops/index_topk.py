@@ -21,16 +21,6 @@ def _launch_topk(
         bt_chunk, allow_tf32, exclude_window_chunks, exclude_sink_chunks,
         progressive_exclude, tf_mask, q_chunk_offset,
 ):
-    if backend == "triton":
-        from .index_topk_triton import topk_triton
-        return topk_triton(
-            q, k, S, scale, block_size, chunk_size, chunk_size_k, causal,
-            bt_chunk=bt_chunk, allow_tf32=allow_tf32,
-            exclude_window_chunks=exclude_window_chunks,
-            exclude_sink_chunks=exclude_sink_chunks,
-            progressive_exclude=progressive_exclude,
-            tf_mask=tf_mask, q_chunk_offset=q_chunk_offset,
-        )
     if backend == "cuda":
         from omnimem.nsa.cuda_backend import ops as cuda_ops
         return cuda_ops.topk(
@@ -39,7 +29,15 @@ def _launch_topk(
             prog_excl=progressive_exclude, tf_mask=tf_mask,
             q_chunk_offset=q_chunk_offset, allow_tf32=allow_tf32,
         )
-    raise ValueError(f"unknown NSA backend {backend!r}")
+    from .index_topk_triton import topk_triton
+    return topk_triton(
+        q, k, S, scale, block_size, chunk_size, chunk_size_k, causal,
+        bt_chunk=bt_chunk, allow_tf32=allow_tf32,
+        exclude_window_chunks=exclude_window_chunks,
+        exclude_sink_chunks=exclude_sink_chunks,
+        progressive_exclude=progressive_exclude,
+        tf_mask=tf_mask, q_chunk_offset=q_chunk_offset,
+    )
 
 
 def parallel_nsa_topk(

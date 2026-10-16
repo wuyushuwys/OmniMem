@@ -13,7 +13,8 @@ def _debug_checks_enabled() -> bool:
     return os.environ.get("OMNIMEM_NSA_DEBUG", "0") not in ("", "0", "false", "False")
 
 
-def _validate_common(q, k, v, block_indices, block_size, chunk_size, group_size):
+def _validate_common(q, k, v, block_indices, block_size, chunk_size, group_size, causal):
+    """Argument checks shared by the CUDA facade and the Triton forwards; returns num_blocks."""
     B, M, H, D = q.shape
     N = k.shape[1]
     G = group_size
@@ -27,18 +28,19 @@ def _validate_common(q, k, v, block_indices, block_size, chunk_size, group_size)
         f"Expected block_indices {(B, MG, H, '*')}, got {tuple(block_indices.shape)}")
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
+    if causal and G > 1:
+        assert chunk_size % G == 0, (
+            f"causal + group requires chunk_size ({chunk_size}) divisible by group_size ({G})")
     if block_indices.shape[-1] == 0:
         raise ValueError("top_idx last dim T must be > 0")
     num_blocks = math.ceil(N / block_size)
-    # One host sync per call, matching the Triton facade's out-of-range check.
+    # One host sync per call.
     valid_mask = block_indices >= 0
     if valid_mask.any() and torch.any(block_indices[valid_mask] >= num_blocks):
         raise ValueError(
             f"top_idx out of range: expected in [-1, {num_blocks - 1}] "
             f"but got [{block_indices.min()}, {block_indices.max()}]"
         )
-    if _debug_checks_enabled():
-        _debug_check_unique(block_indices)
     return num_blocks
 
 
@@ -74,33 +76,25 @@ def selection_attention(
     if bwd_method not in ('auto', 'mask', 'inverted'):
         raise ValueError(f"Unknown bwd_method '{bwd_method}', expected 'auto', 'inverted' or 'mask'")
 
-    backend = get_backend()
-    if backend == 'triton':
-        if group_size > 1:
-            from .group.selection_two_pass import SelectionAttention2p as SelectionAttention2pGroup
-            return SelectionAttention2pGroup.apply(
-                q, k, v, block_indices, block_size, chunk_size,
-                scale, causal, return_lse, allow_tf32, bwd_method, group_size,
-            )
-        from .token.selection_two_pass import SelectionAttention2p as SelectionAttention2pToken
-        return SelectionAttention2pToken.apply(
-            q, k, v, block_indices, block_size, chunk_size,
-            scale, causal, return_lse, allow_tf32, bwd_method,
-        )
-
-    if backend == 'cuda':
+    if get_backend() == 'cuda':
         from omnimem.nsa.cuda_backend.autograd import SelectionAttentionCUDA
-        _validate_common(q, k, v, block_indices, block_size, chunk_size, group_size)
-        if causal and group_size > 1:
-            assert chunk_size % group_size == 0, (
-                f"causal + group requires chunk_size ({chunk_size}) "
-                f"divisible by group_size ({group_size})"
-            )
+        _validate_common(q, k, v, block_indices, block_size, chunk_size, group_size, causal)
+        if _debug_checks_enabled():
+            _debug_check_unique(block_indices)
         if block_indices.dtype != torch.int32:
             block_indices = block_indices.to(torch.int32)
         return SelectionAttentionCUDA.apply(
             q, k, v, block_indices, block_size, chunk_size,
             scale, causal, return_lse, allow_tf32, bwd_method, group_size,
         )
-
-    raise ValueError(f"unknown NSA backend {backend!r}")
+    if group_size > 1:
+        from .group.selection_two_pass import SelectionAttention2p as SelectionAttention2pGroup
+        return SelectionAttention2pGroup.apply(
+            q, k, v, block_indices, block_size, chunk_size,
+            scale, causal, return_lse, allow_tf32, bwd_method, group_size,
+        )
+    from .token.selection_two_pass import SelectionAttention2p as SelectionAttention2pToken
+    return SelectionAttention2pToken.apply(
+        q, k, v, block_indices, block_size, chunk_size,
+        scale, causal, return_lse, allow_tf32, bwd_method,
+    )

@@ -4,6 +4,8 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
+from omnimem.nsa.ops._int_utils import padded_pow2
+
 from .block_kv_kernels import _CLR_BLOCK
 
 __all__ = [
@@ -147,9 +149,9 @@ def launch_gather_publish_clear_triton(desc, typed, n_fetch: int, n_clear: int,
     _gather_publish_clear_kernel[grid](
         desc, typed, n_fetch, n_clear,
         ROWS=int(block_tokens), D=int(head_dim),
-        ROWS_P=max(16, triton.next_power_of_2(int(block_tokens))),
+        ROWS_P=padded_pow2(int(block_tokens)),
         NWORDS=block_bytes // 8,
-        NWORDS_P=max(16, triton.next_power_of_2(max(1, block_bytes // 8))),
+        NWORDS_P=padded_pow2(max(1, block_bytes // 8)),
         WIDE=bool(wide),
         CLR_BLOCK=_CLR_BLOCK, num_warps=num_warps,
     )

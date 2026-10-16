@@ -73,15 +73,16 @@ def topk(
 # Pointer table
 @torch.compiler.disable()
 def build_ptr_table(
-    block_indices: torch.Tensor, base_k: torch.Tensor, base_v: torch.Tensor,
-    n_blocks_per_head: torch.Tensor, batch_stride: int, blocks_per_chunk: int = 0,
-    in_chunk_block_bytes: int = 0,
+    block_indices: torch.Tensor, block_base_ptrs_k: torch.Tensor,
+    block_base_ptrs_v: torch.Tensor, n_blocks_per_head: torch.Tensor, batch_stride: int,
+    blocks_per_chunk: int = 0, in_chunk_block_bytes: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Pointer-table build; raw int64 addresses make every pointer op an eager boundary."""
     return _call(
         "build_ptr_table",
-        block_indices, _contig_meta(base_k), _contig_meta(base_v), _contig_meta(n_blocks_per_head),
-        int(batch_stride), int(blocks_per_chunk), int(in_chunk_block_bytes),
+        block_indices, _contig_meta(block_base_ptrs_k), _contig_meta(block_base_ptrs_v),
+        _contig_meta(n_blocks_per_head), int(batch_stride), int(blocks_per_chunk),
+        int(in_chunk_block_bytes),
     )
 
 
@@ -121,12 +122,12 @@ def sel_bwd(
 # Pointer selection attention
 @torch.compiler.disable()
 def sel_fwd_ptr(
-    q: torch.Tensor, ptr_k: torch.Tensor, ptr_v: torch.Tensor, block_size: int,
-    group_size: int, stride_bn: int, stride_bd: int, scale: float, input_precision: str,
-    owners: Sequence[torch.Tensor] = (),
+    q: torch.Tensor, ptr_table_k: torch.Tensor, ptr_table_v: torch.Tensor, block_size: int,
+    group_size: int, stride_bn: int, stride_bd: int, softmax_scale: float,
+    input_precision: str, owners: Sequence[torch.Tensor] = (),
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Pointer forward; eager boundary because K/V blocks are reached through raw addresses."""
-    _check_cuda((q, "q"), (ptr_k, "ptr_k"), (ptr_v, "ptr_v"),
+    _check_cuda((q, "q"), (ptr_table_k, "ptr_table_k"), (ptr_table_v, "ptr_table_v"),
                 *[(o, f"owners[{i}]") for i, o in enumerate(owners) if isinstance(o, torch.Tensor)])
     for o in owners:
         if isinstance(o, torch.Tensor) and o.dtype != torch.bfloat16:
@@ -135,26 +136,30 @@ def sel_fwd_ptr(
     _check_int("stride_bn", stride_bn); _check_int("stride_bd", stride_bd)
     return _call(
         "sel_fwd_ptr",
-        q, ptr_k, ptr_v, int(block_size), int(group_size), int(stride_bn), int(stride_bd),
-        float(scale), str(input_precision), list(owners),
+        q, ptr_table_k, ptr_table_v, int(block_size), int(group_size), int(stride_bn),
+        int(stride_bd), float(softmax_scale), str(input_precision), list(owners),
     )
 
 
 @torch.compiler.disable()
 def sel_bwd_ptr(
     q: torch.Tensor, out: torch.Tensor, lse: torch.Tensor, d_out: torch.Tensor,
-    block_indices: torch.Tensor, ptr_k: torch.Tensor, ptr_v: torch.Tensor,
-    base_k: torch.Tensor, base_v: torch.Tensor, base_dk: torch.Tensor, base_dv: torch.Tensor,
+    block_indices: torch.Tensor, ptr_table_k: torch.Tensor, ptr_table_v: torch.Tensor,
+    block_base_ptrs_k: torch.Tensor, block_base_ptrs_v: torch.Tensor,
+    block_base_ptrs_dk: torch.Tensor, block_base_ptrs_dv: torch.Tensor,
     n_blocks_per_head: torch.Tensor, block_size: int, group_size: int,
     batch_stride_kv_bytes: int, batch_stride_dkv_bytes: int, stride_bn: int, stride_bd: int,
     stride_dbn: int, stride_dbd: int, blocks_per_chunk: int, in_chunk_block_bytes_kv: int,
-    in_chunk_block_bytes_dkv: int, scale: float, input_precision: str, compute_dkv: bool,
-    owners: Sequence[torch.Tensor] = (), grad_buffers: Sequence[torch.Tensor] = (),
+    in_chunk_block_bytes_dkv: int, softmax_scale: float, input_precision: str,
+    compute_dkv: bool, owners: Sequence[torch.Tensor] = (),
+    grad_buffers: Sequence[torch.Tensor] = (),
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pointer backward; arguments as in the Triton ``selection_attention_padded_ptr_bwd``."""
     _check_cuda((q, "q"), (out, "out"), (lse, "lse"), (d_out, "d_out"),
-                (block_indices, "block_indices"), (ptr_k, "ptr_k"), (ptr_v, "ptr_v"),
-                (base_k, "base_k"), (base_v, "base_v"), (base_dk, "base_dk"), (base_dv, "base_dv"),
-                (n_blocks_per_head, "n_blocks_per_head"),
+                (block_indices, "block_indices"), (ptr_table_k, "ptr_table_k"),
+                (ptr_table_v, "ptr_table_v"), (block_base_ptrs_k, "block_base_ptrs_k"),
+                (block_base_ptrs_v, "block_base_ptrs_v"), (block_base_ptrs_dk, "block_base_ptrs_dk"),
+                (block_base_ptrs_dv, "block_base_ptrs_dv"), (n_blocks_per_head, "n_blocks_per_head"),
                 *[(o, f"owners[{i}]") for i, o in enumerate(owners) if isinstance(o, torch.Tensor)],
                 *[(g, f"grad_buffers[{i}]") for i, g in enumerate(grad_buffers) if isinstance(g, torch.Tensor)])
     if d_out.dtype != q.dtype:
@@ -166,16 +171,16 @@ def sel_bwd_ptr(
                     ("stride_bd", stride_bd), ("stride_dbn", stride_dbn), ("stride_dbd", stride_dbd),
                     ("blocks_per_chunk", blocks_per_chunk)):
         _check_int(name, v)
-    base_k, base_v, base_dk, base_dv = map(_contig_meta, (base_k, base_v, base_dk, base_dv))
-    n_blocks_per_head = _contig_meta(n_blocks_per_head)
+    metas = map(_contig_meta, (block_base_ptrs_k, block_base_ptrs_v, block_base_ptrs_dk,
+                               block_base_ptrs_dv, n_blocks_per_head))
     return _call(
         "sel_bwd_ptr",
-        q, out, lse, d_out, block_indices, ptr_k, ptr_v, base_k, base_v, base_dk, base_dv,
-        n_blocks_per_head, int(block_size), int(group_size), int(batch_stride_kv_bytes),
+        q, out, lse, d_out, block_indices, ptr_table_k, ptr_table_v, *metas,
+        int(block_size), int(group_size), int(batch_stride_kv_bytes),
         int(batch_stride_dkv_bytes), int(stride_bn), int(stride_bd), int(stride_dbn),
         int(stride_dbd), int(blocks_per_chunk), int(in_chunk_block_bytes_kv),
-        int(in_chunk_block_bytes_dkv), float(scale), str(input_precision), bool(compute_dkv),
-        list(owners), list(grad_buffers),
+        int(in_chunk_block_bytes_dkv), float(softmax_scale), str(input_precision),
+        bool(compute_dkv), list(owners), list(grad_buffers),
     )
 
 

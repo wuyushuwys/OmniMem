@@ -16,7 +16,7 @@ import torch
 import triton
 import triton.language as tl
 
-from omnimem.nsa.ops._int_utils import compute_tile_n
+from omnimem.nsa.ops._int_utils import compute_tile_n, padded_pow2
 
 
 _capability = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
@@ -624,7 +624,7 @@ def selection_attention_padded_ptr_bwd(
     if stride_dbd is None:
         stride_dbd = stride_bd
 
-    DP = max(16, triton.next_power_of_2(D))
+    DP = padded_pow2(D)
 
     delta = torch.empty_like(lse)
 
@@ -641,8 +641,8 @@ def selection_attention_padded_ptr_bwd(
 
     dq = torch.empty_like(q)
 
-    PADDED_BLOCK_SIZE = max(16, triton.next_power_of_2(block_size))
-    PADDED_GROUP_SIZE = max(16, triton.next_power_of_2(G))
+    PADDED_BLOCK_SIZE = padded_pow2(block_size)
+    PADDED_GROUP_SIZE = padded_pow2(G)
     TILE_N = compute_tile_n(block_size, max_tile=128)
 
     grid_dq = (B, MG, H)

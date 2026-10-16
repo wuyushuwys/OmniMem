@@ -5,8 +5,8 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
-from omnimem.nsa.backend import get_backend
-from omnimem.nsa.ops._int_utils import compute_tile_n, next_power_of_2
+from omnimem.nsa.backend import get_backend, resolve_backend
+from omnimem.nsa.ops._int_utils import compute_tile_n, padded_pow2
 
 __all__ = ["launch_ptr_fwd", "launch_ptr_bwd", "build_ptr_table", "get_backend"]
 
@@ -21,20 +21,13 @@ def build_ptr_table(
     in_chunk_block_bytes: int = 0,
     backend: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    backend = backend or get_backend()
-    if backend == "triton":
-        from .kernels.ptr_builder import build_ptr_table_triton
-        return build_ptr_table_triton(
-            block_indices, block_base_ptrs_k, block_base_ptrs_v, n_blocks_per_head,
-            batch_stride, blocks_per_chunk, in_chunk_block_bytes,
-        )
-    if backend == "cuda":
+    args = (block_indices, block_base_ptrs_k, block_base_ptrs_v, n_blocks_per_head,
+            batch_stride, blocks_per_chunk, in_chunk_block_bytes)
+    if resolve_backend(backend or get_backend()) == "cuda":
         from omnimem.nsa.cuda_backend import ops as cuda_ops
-        return cuda_ops.build_ptr_table(
-            block_indices, block_base_ptrs_k, block_base_ptrs_v, n_blocks_per_head,
-            batch_stride, blocks_per_chunk, in_chunk_block_bytes,
-        )
-    raise ValueError(f"unknown NSA backend {backend!r}")
+        return cuda_ops.build_ptr_table(*args)
+    from .kernels.ptr_builder import build_ptr_table_triton
+    return build_ptr_table_triton(*args)
 
 
 def launch_ptr_fwd(
@@ -52,7 +45,7 @@ def launch_ptr_fwd(
     backend: Optional[str] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run the pointer forward kernel.  Returns ``(out, lse_or_None)``."""
-    backend = backend or get_backend()
+    backend = resolve_backend(backend or get_backend())
     B, M, H, D = q.shape
     G = group_size
     MG = M // G
@@ -61,14 +54,21 @@ def launch_ptr_fwd(
     # The grid is (B, MG, H): rows [MG*G, M) would never be written and `out` is uninitialised.
     assert M % G == 0, f"selection attention requires M ({M}) divisible by group_size ({G})"
 
-    if backend == "triton":
+    if backend == "cuda":
+        from omnimem.nsa.cuda_backend import ops as cuda_ops
+
+        out, lse = cuda_ops.sel_fwd_ptr(
+            q, ptr_table_k, ptr_table_v, block_size, G, stride_bn, stride_bd,
+            softmax_scale, input_precision, owners,
+        )
+    else:
         from .kernels.select_fwd import _sel_attn_fwd_padded_ptr_kernel
 
         out = torch.empty_like(q)
         lse = torch.empty(B, H, M, dtype=torch.float32, device=device) if return_lse else q
-        DP = max(16, next_power_of_2(D))
-        PADDED_BLOCK_SIZE = max(16, next_power_of_2(block_size))
-        PADDED_GROUP_SIZE = max(16, next_power_of_2(G))
+        DP = padded_pow2(D)
+        PADDED_BLOCK_SIZE = padded_pow2(block_size)
+        PADDED_GROUP_SIZE = padded_pow2(G)
         TILE_N = compute_tile_n(block_size)
         _sel_attn_fwd_padded_ptr_kernel[(B, MG, H)](
             q, ptr_table_k, ptr_table_v, out, lse,
@@ -90,90 +90,25 @@ def launch_ptr_fwd(
             RETURN_LSE=return_lse,
             INPUT_PRECISION=input_precision,
         )
-        return out, (lse if return_lse else None)
-
-    if backend == "cuda":
-        from omnimem.nsa.cuda_backend import ops as cuda_ops
-
-        out, lse = cuda_ops.sel_fwd_ptr(
-            q, ptr_table_k, ptr_table_v, block_size, G, stride_bn, stride_bd,
-            softmax_scale, input_precision, owners,
-        )
-        return out, (lse if return_lse else None)
-
-    raise ValueError(f"unknown NSA backend {backend!r}")
+    return out, (lse if return_lse else None)
 
 
 def launch_ptr_bwd(
     *,
     backend: str,
-    q: torch.Tensor,
-    out: torch.Tensor,
-    lse: torch.Tensor,
-    d_out: torch.Tensor,
-    block_indices: torch.Tensor,
-    ptr_table_k: torch.Tensor,
-    ptr_table_v: torch.Tensor,
-    block_base_ptrs_k: torch.Tensor,
-    block_base_ptrs_v: torch.Tensor,
-    block_base_ptrs_dk: torch.Tensor,
-    block_base_ptrs_dv: torch.Tensor,
-    n_blocks_per_head: torch.Tensor,
-    block_size: int,
-    group_size: int,
-    batch_stride_kv_bytes: int,
-    batch_stride_dkv_bytes: int,
-    stride_bn: int,
-    stride_bd: int,
-    stride_dbn: int,
-    stride_dbd: int,
-    blocks_per_chunk: int,
-    in_chunk_block_bytes_kv: int,
-    in_chunk_block_bytes_dkv: int,
-    softmax_scale: float,
-    input_precision: str,
     compute_dkv: bool = True,
     owners: Sequence[torch.Tensor] = (),
     grad_buffers: Sequence[torch.Tensor] = (),
+    **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Run the pointer backward; returns (dq, delta), dK/dV go to the fp32 scratch."""
-    if backend == "triton":
-        from .kernels.select_bwd import selection_attention_padded_ptr_bwd
+    """Run the pointer backward; returns (dq, delta), dK/dV go to the fp32 scratch.
 
-        return selection_attention_padded_ptr_bwd(
-            q=q, out=out, lse=lse, d_out=d_out,
-            block_indices=block_indices,
-            ptr_table_k=ptr_table_k, ptr_table_v=ptr_table_v,
-            block_base_ptrs_k=block_base_ptrs_k,
-            block_base_ptrs_v=block_base_ptrs_v,
-            block_base_ptrs_dk=block_base_ptrs_dk,
-            block_base_ptrs_dv=block_base_ptrs_dv,
-            n_blocks_per_head=n_blocks_per_head,
-            block_size=block_size,
-            group_size=group_size,
-            batch_stride_kv_bytes=batch_stride_kv_bytes,
-            batch_stride_dkv_bytes=batch_stride_dkv_bytes,
-            stride_bn=stride_bn,
-            stride_bd=stride_bd,
-            stride_dbn=stride_dbn,
-            stride_dbd=stride_dbd,
-            blocks_per_chunk=blocks_per_chunk,
-            in_chunk_block_bytes_kv=in_chunk_block_bytes_kv,
-            in_chunk_block_bytes_dkv=in_chunk_block_bytes_dkv,
-            softmax_scale=softmax_scale,
-            input_precision=input_precision,
-        )
-
-    if backend == "cuda":
+    ``kwargs`` are ``selection_attention_padded_ptr_bwd``'s; ``compute_dkv``, ``owners`` and
+    ``grad_buffers`` are for the CUDA backend only.
+    """
+    if resolve_backend(backend or get_backend()) == "cuda":
         from omnimem.nsa.cuda_backend import ops as cuda_ops
-
-        return cuda_ops.sel_bwd_ptr(
-            q, out, lse, d_out, block_indices, ptr_table_k, ptr_table_v,
-            block_base_ptrs_k, block_base_ptrs_v, block_base_ptrs_dk, block_base_ptrs_dv,
-            n_blocks_per_head, block_size, group_size, batch_stride_kv_bytes,
-            batch_stride_dkv_bytes, stride_bn, stride_bd, stride_dbn, stride_dbd,
-            blocks_per_chunk, in_chunk_block_bytes_kv, in_chunk_block_bytes_dkv,
-            softmax_scale, input_precision, compute_dkv, owners, grad_buffers,
-        )
-
-    raise ValueError(f"unknown NSA backend {backend!r}")
+        return cuda_ops.sel_bwd_ptr(**kwargs, compute_dkv=compute_dkv, owners=owners,
+                                    grad_buffers=grad_buffers)
+    from .kernels.select_bwd import selection_attention_padded_ptr_bwd
+    return selection_attention_padded_ptr_bwd(**kwargs)

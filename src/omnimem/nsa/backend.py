@@ -20,13 +20,12 @@ class BlockKVBackendError(NSABackendError):
     """Raised when the requested block-KV cache kernel backend cannot serve a request."""
 
 
-def _normalize(name: str) -> str:
-    name = (name or "").strip().lower()
+def _normalize(name: str, error: type = NSABackendError, what: str = "invalid NSA backend",
+               hint: str = f" (set via {ENV_VAR} or omnimem.nsa.backend.set_backend)") -> str:
+    """The stripped, lower-cased name; raises ``error`` unless it is one of VALID_BACKENDS."""
+    name = str(name or "").strip().lower()
     if name not in VALID_BACKENDS:
-        raise NSABackendError(
-            f"invalid NSA backend {name!r}; expected one of {VALID_BACKENDS} "
-            f"(set via {ENV_VAR} or omnimem.nsa.backend.set_backend)"
-        )
+        raise error(f"{what} {name!r}; expected one of {VALID_BACKENDS}{hint}")
     return name
 
 
@@ -49,12 +48,12 @@ def set_backend(name: str) -> str:
     return name
 
 
+def resolve_backend(name: Optional[str] = None, error: type = ValueError,
+                    what: str = "unknown NSA backend") -> str:
+    """An explicit kernel backend name, checked; the active backend when it is None."""
+    return get_backend() if name is None else _normalize(name, error, what, hint="")
+
+
 def resolve_block_kv_backend(name: Optional[str] = None) -> str:
     """Backend of a block store's cache kernels; an explicit name wins over the active backend."""
-    if name is None:
-        return get_backend()
-    name = str(name).strip().lower()
-    if name not in VALID_BACKENDS:
-        raise BlockKVBackendError(
-            f"invalid block KV backend {name!r}; expected one of {VALID_BACKENDS}")
-    return name
+    return resolve_backend(name, BlockKVBackendError, "invalid block KV backend")
