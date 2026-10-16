@@ -10,9 +10,10 @@ import os
 import shutil
 import socket
 import sysconfig
+import threading
 import time
 from pathlib import Path
-from typing import Any, Iterator, List, Optional, Tuple, Type
+from typing import Any, Callable, Iterator, List, Optional, Tuple, Type
 
 import torch
 
@@ -180,6 +181,61 @@ class Extension:
         finally:
             with contextlib.suppress(FileNotFoundError):
                 os.remove(path)
+
+
+class LazyExtension:
+    """Loads one extension on first use; a build error is kept and re-raised, an interrupt is not."""
+
+    def __init__(self, extension: Extension, op_names: Tuple[str, ...],
+                 namespace: Optional[str] = None,
+                 on_load: Optional[Callable[[], None]] = None):
+        self.extension = extension
+        self.op_names = op_names
+        self.namespace = namespace          # torch.ops namespace; None for a pybind11 module
+        self._on_load = on_load
+        self._lock = threading.Lock()
+        self._handle: Optional[Any] = None
+        self._load_error: Optional[Exception] = None
+        self.library_path: Optional[str] = None
+
+    def is_loaded(self) -> bool:
+        return self._handle is not None
+
+    def load(self, verbose: bool = False) -> Any:
+        """Compile (if needed) and load; returns the ops namespace or the module."""
+        if self._handle is not None:
+            return self._handle
+        ext = self.extension
+        with self._lock:
+            if self._handle is not None:
+                return self._handle
+            if self._load_error is not None:
+                raise ext.error(
+                    f"{ext.what} previously failed to load: {self._load_error}"
+                ) from self._load_error
+            try:
+                handle = self._load(verbose)
+            except ext.error:
+                raise
+            except Exception as e:  # noqa: BLE001 - surface build errors verbatim
+                self._load_error = e
+                raise ext.error(
+                    f"failed to build/load the {ext.what} (no Triton fallback). "
+                    f"Original error: {type(e).__name__}: {e}"
+                ) from e
+            self._handle = handle
+            return handle
+
+    def _load(self, verbose: bool) -> Any:
+        module, self.library_path = self.extension.build_and_load(verbose=verbose)
+        handle = module if self.namespace is None else getattr(torch.ops, self.namespace)
+        missing = [n for n in self.op_names if not hasattr(handle, n)]
+        if missing:
+            where = "it" if self.namespace is None else f"torch.ops.{self.namespace}"
+            raise self.extension.error(f"{self.extension.what} loaded but {where} lacks {missing}")
+        if self._on_load is not None:
+            self._on_load()
+        return handle
 
 
 def _import_module(name: str, library: str) -> Any:

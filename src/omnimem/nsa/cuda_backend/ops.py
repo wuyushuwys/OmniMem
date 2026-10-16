@@ -8,9 +8,6 @@ import torch
 from omnimem.nsa.backend import NSABackendError
 from . import _loader
 
-_SUPPORTED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
-_PRECISIONS = ("tf32", "ieee", "tf32x3")
-
 
 def _ops():
     return _loader.ops()
@@ -25,11 +22,6 @@ def _call(name: str, *args):
         raise
     except RuntimeError as e:
         raise NSABackendError(str(e)) from e
-
-
-def _check_dtype(t: torch.Tensor, name: str) -> None:
-    if t.dtype not in _SUPPORTED_DTYPES:
-        raise NSABackendError(f"{name}: dtype {t.dtype} not supported by the CUDA NSA backend")
 
 
 def _check_cuda(*ts: Tuple[torch.Tensor, str]) -> None:
@@ -66,18 +58,7 @@ def topk(
     prog_excl: bool = False, tf_mask: bool = False, q_chunk_offset: int = 0,
     allow_tf32: bool = True,
 ) -> torch.Tensor:
-    _check_cuda((q, "q"), (k, "k"))
-    _check_dtype(q, "q")
-    _check_dtype(k, "k")
-    if q.dim() != 4 or k.dim() != 4:
-        raise NSABackendError("topk expects q [B,MG,H,D] and k [B,NC,H,D]")
-    if q.shape[0] != k.shape[0] or q.shape[2] != k.shape[2] or q.shape[3] != k.shape[3]:
-        raise NSABackendError(f"topk: incompatible shapes q={tuple(q.shape)} k={tuple(k.shape)}")
-    if topk <= 0:
-        raise NSABackendError(f"topk must be > 0, got {topk}")
-    if block_size <= 0 or chunk_size <= 0 or chunk_size_k <= 0:
-        raise NSABackendError("block_size / chunk_size / chunk_size_k must be > 0")
-    for name, v in (("topk", topk), ("block_size", block_size), ("chunk_size", chunk_size),
+    for name, v in (("block_size", block_size), ("chunk_size", chunk_size),
                     ("chunk_size_k", chunk_size_k), ("ex_win", ex_win), ("ex_sink", ex_sink),
                     ("q_chunk_offset", q_chunk_offset)):
         _check_int(name, v)
@@ -97,9 +78,6 @@ def build_ptr_table(
     in_chunk_block_bytes: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Pointer-table build; raw int64 addresses make every pointer op an eager boundary."""
-    _check_cuda((block_indices, "block_indices"), (base_k, "base_k"), (base_v, "base_v"),
-                (n_blocks_per_head, "n_blocks_per_head"))
-    _check_int("blocks_per_chunk", blocks_per_chunk)
     return _call(
         "build_ptr_table",
         block_indices, _contig_meta(base_k), _contig_meta(base_v), _contig_meta(n_blocks_per_head),
@@ -114,14 +92,7 @@ def sel_fwd(
     allow_tf32: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     _check_cuda((q, "q"), (k, "k"), (v, "v"), (block_indices, "block_indices"))
-    _check_dtype(q, "q")
-    if k.dtype != q.dtype or v.dtype != q.dtype:
-        raise NSABackendError(
-            f"CUDA NSA backend requires q/k/v of one dtype, got {q.dtype}/{k.dtype}/{v.dtype}")
-    if block_indices.dtype != torch.int32:
-        raise NSABackendError(f"block_indices must be int32, got {block_indices.dtype}")
     _check_int("block_size", block_size, 1); _check_int("chunk_size", chunk_size, 1)
-    _check_int("group_size", group_size, 1)
     return _call(
         "sel_fwd",
         q, k, v, block_indices, int(block_size), int(chunk_size), float(scale), bool(causal),
@@ -138,8 +109,6 @@ def sel_bwd(
                 (out, "out"), (lse, "lse"), (d_out, "d_out"))
     if d_out.dtype != q.dtype:
         d_out = d_out.to(q.dtype)
-    if lse.dtype != torch.float32:
-        raise NSABackendError("lse must be float32")
     _check_int("block_size", block_size, 1); _check_int("chunk_size", chunk_size, 1)
     _check_int("group_size", group_size, 1)
     return _call(
@@ -150,13 +119,6 @@ def sel_bwd(
 
 
 # Pointer selection attention
-def _check_precision(p: str) -> str:
-    if p not in _PRECISIONS:
-        raise NSABackendError(
-            f"input_precision={p!r} not supported by the CUDA NSA backend (expected one of {_PRECISIONS})")
-    return p
-
-
 @torch.compiler.disable()
 def sel_fwd_ptr(
     q: torch.Tensor, ptr_k: torch.Tensor, ptr_v: torch.Tensor, block_size: int,
@@ -166,15 +128,10 @@ def sel_fwd_ptr(
     """Pointer forward; eager boundary because K/V blocks are reached through raw addresses."""
     _check_cuda((q, "q"), (ptr_k, "ptr_k"), (ptr_v, "ptr_v"),
                 *[(o, f"owners[{i}]") for i, o in enumerate(owners) if isinstance(o, torch.Tensor)])
-    if q.dtype != torch.bfloat16:
-        raise NSABackendError(f"pointer selection attention requires bf16 q, got {q.dtype}")
-    if ptr_k.dtype != torch.int64 or ptr_v.dtype != torch.int64:
-        raise NSABackendError("ptr tables must be int64 byte addresses")
     for o in owners:
         if isinstance(o, torch.Tensor) and o.dtype != torch.bfloat16:
             raise NSABackendError(f"pointer selection attention requires bf16 K/V storage, got {o.dtype}")
-    _check_precision(input_precision)
-    _check_int("block_size", block_size, 1); _check_int("group_size", group_size, 1)
+    _check_int("block_size", block_size, 1)
     _check_int("stride_bn", stride_bn); _check_int("stride_bd", stride_bd)
     return _call(
         "sel_fwd_ptr",
@@ -200,14 +157,11 @@ def sel_bwd_ptr(
                 (n_blocks_per_head, "n_blocks_per_head"),
                 *[(o, f"owners[{i}]") for i, o in enumerate(owners) if isinstance(o, torch.Tensor)],
                 *[(g, f"grad_buffers[{i}]") for i, g in enumerate(grad_buffers) if isinstance(g, torch.Tensor)])
-    if q.dtype != torch.bfloat16:
-        raise NSABackendError(f"pointer selection attention requires bf16 q, got {q.dtype}")
     if d_out.dtype != q.dtype:
         d_out = d_out.to(q.dtype)
     for g in grad_buffers:
         if isinstance(g, torch.Tensor) and g.dtype != torch.float32:
             raise NSABackendError(f"pointer dK/dV scratch must be float32, got {g.dtype}")
-    _check_precision(input_precision)
     for name, v in (("block_size", block_size), ("group_size", group_size), ("stride_bn", stride_bn),
                     ("stride_bd", stride_bd), ("stride_dbn", stride_dbn), ("stride_dbd", stride_dbd),
                     ("blocks_per_chunk", blocks_per_chunk)):

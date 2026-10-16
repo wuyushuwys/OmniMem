@@ -1,13 +1,12 @@
 """Lazy loader of the NSA CUDA extension (torch.ops.omnimem_nsa.*); no Triton fallback."""
 from __future__ import annotations
 
-import threading
 from typing import Optional
 
 import torch
 
 from omnimem.nsa.backend import NSABackendError
-from ._extension import Extension
+from ._extension import Extension, LazyExtension
 
 LIB_NAMESPACE = "omnimem_nsa"
 #: The operators the library registers under ``torch.ops.omnimem_nsa``.
@@ -34,55 +33,26 @@ EXTENSION = Extension(
     error=NSABackendError,
 )
 
-_lock = threading.Lock()
-_loaded = False
-_load_error: Optional[Exception] = None
-_library_path: Optional[str] = None
+
+def _register_fakes() -> None:
+    from . import ops as _ops_mod  # noqa: WPS433 - register the fake kernels once loaded
+    _ops_mod.register_fakes()
+
+
+_lazy = LazyExtension(EXTENSION, OP_NAMES, namespace=LIB_NAMESPACE, on_load=_register_fakes)
 
 
 def is_loaded() -> bool:
-    return _loaded
+    return _lazy.is_loaded()
 
 
 def library_path() -> Optional[str]:
-    return _library_path
+    return _lazy.library_path
 
 
 def load(verbose: bool = False) -> None:
     """Compile (if needed) and load the extension; idempotent."""
-    global _loaded, _load_error
-    if _loaded:
-        return
-    with _lock:
-        if _loaded:
-            return
-        if _load_error is not None:
-            raise NSABackendError(
-                f"NSA CUDA extension previously failed to load: {_load_error}"
-            ) from _load_error
-        try:
-            _do_load(verbose=verbose)
-        except NSABackendError:
-            raise
-        except Exception as e:  # noqa: BLE001 - surface build errors verbatim
-            _load_error = e
-            raise NSABackendError(
-                "failed to build/load the NSA CUDA extension (no Triton fallback). "
-                f"Original error: {type(e).__name__}: {e}"
-            ) from e
-        _loaded = True
-
-
-def _do_load(verbose: bool) -> None:
-    global _library_path
-    _, _library_path = EXTENSION.build_and_load(verbose=verbose)
-    namespace = getattr(torch.ops, LIB_NAMESPACE)
-    missing = [n for n in OP_NAMES if not hasattr(namespace, n)]
-    if missing:
-        raise NSABackendError(
-            f"NSA CUDA extension loaded but torch.ops.{LIB_NAMESPACE} lacks {missing}")
-    from . import ops as _ops_mod  # noqa: WPS433 - register the fake kernels once loaded
-    _ops_mod.register_fakes()
+    _lazy.load(verbose)
 
 
 def ops():
