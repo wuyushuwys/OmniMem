@@ -1,6 +1,6 @@
 # NSA self-forcing: complete resume
 
-Set `complete_sf_resume: true` for `nsa-self-forcing`, `nsa-self-forcing-streaming`, or `nsa-self-forcing-switch` with `dataset_type: text_dataset` and full parameter training. LoRA adapters are not supported by this mode. Set `torch_compile: false` when compilation is unwanted; all three trainers honor that flag.
+Set `complete_sf_resume: true` for `nsa-self-forcing`, `nsa-self-forcing-streaming`, or `nsa-self-forcing-switch` with `dataset_type: text_dataset` and full parameter training; the two streaming trainers refuse to start without it. LoRA adapters are not supported by this mode. Set `torch_compile: false` when compilation is unwanted; all three trainers honor that flag.
 
 An ODE checkpoint passed through `model_path` initializes generator weights only. A new SF checkpoint root starts at SF step 0 with fresh critic optimizer, generator optimizer, and schedulers. `checkpoint_dir` identifies the persistent, shared full-state SF checkpoint root; `checkpoint_s3_prefix` identifies its S3 mirror. Do not point either at an ODE run. `resume_ckpt_path` is rejected in this mode to avoid confusing weight initialization with full resume.
 
@@ -61,9 +61,9 @@ Resuming continues the saved rollout before drawing the next prompt. Prompt orde
 
 Streaming and switch checkpoints reject cross-task resumes and changes to streaming lengths, boundary policy, switch schedule or prompt-file contents, as well as the common training recipe.
 
-With `complete_sf_resume: false` the streaming trainers delay saves to rollout boundaries and their checkpoints are not complete: they lack the runtime/RNG state a complete resume needs and cannot be turned into one. To continue from such a checkpoint with complete resume, use its generator weights as `model_path` in a new checkpoint root.
+Checkpoints of the removed `complete_sf_resume: false` streaming loop are not complete: they lack the runtime/RNG state a complete resume needs and cannot be turned into one. To continue from such a checkpoint, use its generator weights as `model_path` in a new checkpoint root.
 
-The recipe records `streaming_boundary_mode: vae_roundtrip_block`. A complete checkpoint whose recipe does not record this boundary mode is rejected, even when it was saved between rollouts. To train from its weights, pass its `model/` or `ema/` directory as `model_path` and use a fresh `checkpoint_dir` and S3 checkpoint prefix; this starts a new training run with fresh optimizer and rollout state. `complete_sf_resume: false` does not select another boundary algorithm.
+The recipe records `streaming_boundary_mode: vae_roundtrip_block`. A complete checkpoint whose recipe does not record this boundary mode is rejected, even when it was saved between rollouts. To train from its weights, pass its `model/` or `ema/` directory as `model_path` and use a fresh `checkpoint_dir` and S3 checkpoint prefix; this starts a new training run with fresh optimizer and rollout state.
 
 ## Distributed checkpoint metadata backend
 

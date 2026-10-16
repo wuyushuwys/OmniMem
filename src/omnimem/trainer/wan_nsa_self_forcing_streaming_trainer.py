@@ -28,6 +28,8 @@ class WanNSASelfForcingStreamingTrainer(StreamingCheckpointMixin, WanNSASelfForc
     streaming_boundary_mode = "vae_roundtrip_block"
 
     def __init__(self, config):
+        if not config.get("complete_sf_resume", False):
+            raise ValueError("The streaming self-forcing trainers require complete_sf_resume: true")
         self.streaming_chunk_size = config.get("streaming_chunk_size", 21)
         self.streaming_max_length = config.get("streaming_max_length", 240)
         self.streaming_min_new_frame = config.get("streaming_min_new_frame", 18)
@@ -141,10 +143,7 @@ class WanNSASelfForcingStreamingTrainer(StreamingCheckpointMixin, WanNSASelfForc
         try:
             batch = next(self._streaming_data_iter)
         except StopIteration:
-            if self.complete_sf_resume:
-                raise RuntimeError("Streaming prompt epochs exhausted before max_train_steps") from None
-            self._streaming_data_iter = iter(self.train_dataloader)
-            batch = next(self._streaming_data_iter)
+            raise RuntimeError("Streaming prompt epochs exhausted before max_train_steps") from None
         text = batch["prompts"]
         text_embeddings, _ = self.text_encoder(texts=text, device=self.device)
         null_text_embeddings, _ = self.text_encoder(
@@ -596,99 +595,19 @@ class WanNSASelfForcingStreamingTrainer(StreamingCheckpointMixin, WanNSASelfForc
         return log_dict
 
     def evaluate_init(self):
-        if self.complete_sf_resume:
-            with self._preserve_streaming_evaluation_state():
-                super().evaluate_init()
-        else:
+        with self._preserve_streaming_evaluation_state():
             super().evaluate_init()
 
     def evaluate(self):
-        if self.complete_sf_resume:
-            with self._preserve_streaming_evaluation_state():
-                super().evaluate()
-            return
-        injected = self.streaming_kv_cache is not None
-        if injected:
-            self._eval_kwargs["_kv_cache"] = self.streaming_kv_cache
-        try:
+        with self._preserve_streaming_evaluation_state():
             super().evaluate()
-        finally:
-            if injected:
-                self._eval_kwargs.pop("_kv_cache", None)
-                # Eval overwrote the shared cache; reset so next train_step starts fresh.
-                self.streaming_active = False
 
     def train(self):
-        if self.complete_sf_resume:
-            return self._train_with_complete_resume()
-        self.logger.info("***** Running streaming training *****")
-        self.logger.info(
-            f"  chunk_size={self.streaming_chunk_size}, max_length={self.streaming_max_length}, "
-            f"min_new_frame={self.streaming_min_new_frame}"
-        )
-
-        self._streaming_data_iter = iter(self.train_dataloader)
-
-        self.evaluate_init()
-
-        # save/eval fire at sequence boundaries to avoid mid-sequence GPU pressure.
-        last_save_step = self.global_step
-        last_eval_step = self.global_step
-
-        step = 0
-        while self.global_step < self.max_train_steps:
-            step += 1
-            self.accumulation_index = step % self.gradient_accumulation_steps
-
-            self.setup_ema_model()
-            self.generator.train()
-            self.fake_net.train()
-
-            self.data_timer.toc()
-
-            log_dict = self.train_step()
-
-            self.data_timer.tic()
-
-            if self.accumulation_index == 0:
-                self.global_step += 1
-
-                self._log_progress(log_dict)
-
-                at_end = self.global_step >= self.max_train_steps
-                at_boundary = (not self.streaming_active) or (not self.can_generate_more())
-                save_due = (self.global_step - last_save_step) >= self.checkpointing_steps
-                eval_due = (self.global_step - last_eval_step) >= self.validation_steps
-
-                if (at_boundary or at_end) and (save_due or eval_due):
-                    if self.streaming_kv_cache is not None:
-                        self._reset_streaming_state()
-                    torch.cuda.empty_cache()
-                    if save_due:
-                        self.logger.info(
-                            f"Sequence finished at step {self.global_step}; firing save "
-                            f"(last save at step {last_save_step}, interval={self.checkpointing_steps})"
-                        )
-                        self.save_models()
-                        last_save_step = self.global_step
-                    if eval_due:
-                        self.logger.info(
-                            f"Sequence finished at step {self.global_step}; firing eval "
-                            f"(last eval at step {last_eval_step}, interval={self.validation_steps})"
-                        )
-                        self.evaluate()
-                        last_eval_step = self.global_step
-
-                if at_end:
-                    self.logger.info("Finish streaming training")
-                    return
-
-    def _train_with_complete_resume(self):
         if self._already_trained():
             return
         if self.checkpointing_steps <= 0 or self.validation_steps <= 0:
             raise ValueError("Streaming checkpoint/validation intervals must be positive")
-        self.logger.info("***** Running streaming training with complete resume *****")
+        self.logger.info("***** Running streaming training *****")
         self._streaming_data_iter = iter(self._sf_training_batches())
         # Do not repeat startup evaluation after a restart. Evaluation at any
         # point preserves both training RNG and the persistent rollout cache.
