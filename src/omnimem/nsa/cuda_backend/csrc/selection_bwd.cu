@@ -31,10 +31,7 @@ __global__ void sel_bwd_dq_kernel(
   const int h = blockIdx.y;
   const int b = blockIdx.z;
   // order only permutes which group a CTA serves (bit-identical); CTAs then share KV in L2.
-  const int g = (order == nullptr)
-                    ? gs
-                    : order[static_cast<int64_t>(b) * ord_sb + static_cast<int64_t>(gs) * ord_sg +
-                            static_cast<int64_t>(h) * ord_sh];
+  const int g = group_of(order, ord_sb, ord_sg, ord_sh, b, gs, h);
 
   const int r0 = rt * BG;
   if (r0 >= G) return;
@@ -214,34 +211,15 @@ __global__ void sel_bwd_dkv_kernel(
     sDV[j * pitch + d] = 0.f;
   }
 
-  const int64_t obase = static_cast<int64_t>(b) * off_sb + static_cast<int64_t>(h) * off_sh;
-  const int start = offsets[obase + bid];
-  const int cnt = offsets[obase + bid + 1] - start;
-  const int64_t gbase =
-      static_cast<int64_t>(b) * groups_sb + static_cast<int64_t>(h) * groups_sh + start;
-  const int64_t total_q = static_cast<int64_t>(cnt) * G;
+  const CsrBucket bk = csr_bucket(offsets, off_sb, off_sh, groups_sb, groups_sh, b, h, bid, G);
+  const int64_t total_q = bk.total_q;
 
   for (int64_t qt = 0; qt < total_q; qt += BQ) {
     const int64_t left = total_q - qt;
     const int nq = static_cast<int>(left < BQ ? left : BQ);
     __syncthreads();
-    for (int i = tid; i < BQ; i += NT) {
-      int m = -1, qc = 0;
-      float l = kNegInf, dl = 0.f;
-      if (i < nq) {
-        const int64_t f = qt + i;
-        const int64_t e = f / G;
-        const int gid = groups[gbase + e];
-        m = static_cast<int>(static_cast<int64_t>(gid) * G + (f - e * G));
-        qc = static_cast<int>((static_cast<int64_t>(gid) * G) / chunk_size);
-        l = *lse.at(b, h, m);
-        dl = *delta.at(b, h, m);
-      }
-      sQidx[i] = m;
-      sQchunk[i] = qc;
-      sLse[i] = l;
-      sDel[i] = dl;
-    }
+    stage_bucket_queries(groups, bk.gbase, qt, nq, BQ, G, chunk_size, lse, delta, b, h, tid, NT,
+                         sQidx, sQchunk, sLse, sDel);
     __syncthreads();
     for (int idx = tid; idx < BQ * D; idx += NT) {
       const int i = idx / D;
@@ -347,10 +325,7 @@ __global__ __launch_bounds__(256) void sel_bwd_dq_mma_kernel(
   const int rt = blockIdx.x - gs * n_row_tiles;
   const int h = blockIdx.y;
   const int b = blockIdx.z;
-  const int g = (order == nullptr)
-                    ? gs
-                    : order[static_cast<int64_t>(b) * ord_sb + static_cast<int64_t>(gs) * ord_sg +
-                            static_cast<int64_t>(h) * ord_sh];
+  const int g = group_of(order, ord_sb, ord_sg, ord_sh, b, gs, h);
   const int r0 = rt * BGP;
   if (r0 >= G) return;
   const int rows = min(BGP, G - r0);
@@ -442,12 +417,7 @@ __global__ __launch_bounds__(256) void sel_bwd_dq_mma_kernel(
     for (int base = 0; base < T; base += kWarpSize) {
       const int t = base + lane;
       const int v = (t < T) ? sStart[t] : 0;
-      int x = v;
-#pragma unroll
-      for (int off = 1; off < kWarpSize; off <<= 1) {
-        const int y = __shfl_up_sync(0xffffffffu, x, off);
-        if (lane >= off) x += y;
-      }
+      const int x = warp_inclusive_scan(v);
       const int excl = run + x - v;
       run += __shfl_sync(0xffffffffu, x, kWarpSize - 1);
       __syncwarp();
@@ -559,7 +529,7 @@ __global__ __launch_bounds__(512) void sel_bwd_dq_wmma_kernel(
     const int chunk_size, const float scale) {
   extern __shared__ __align__(16) char smem_raw[];
   constexpr int TILE = 32;
-  const int ldq = mma_pitch_a(D);        // A-fragment pitch for Q / dO
+  const int ldq = pitch_4mod8(D);        // A-fragment pitch for Q / dO
   const int ldkv = mma_pitch((D + 7) & ~7);  // B-fragment pitch for K / V
   const int ldo = DN * 8 + 4;
   const int nm = (Gc + 15) >> 4, nmq = nm * 16;
@@ -575,10 +545,7 @@ __global__ __launch_bounds__(512) void sel_bwd_dq_wmma_kernel(
   const int bh = blockIdx.z;
   const int b = bh / H, h = bh - b * H;
   const int gs = blockIdx.x;
-  const int g = (order == nullptr)
-                    ? gs
-                    : order[static_cast<int64_t>(b) * ord_sb +
-                            static_cast<int64_t>(gs) * ord_sg + static_cast<int64_t>(h) * ord_sh];
+  const int g = group_of(order, ord_sb, ord_sg, ord_sh, b, gs, h);
   const int q0 = blockIdx.y * Gc;
   const int nq = min(Gc, G - q0);
   if (nq <= 0) return;
@@ -644,20 +611,9 @@ __global__ __launch_bounds__(512) void sel_bwd_dq_wmma_kernel(
   constexpr int kVec = cp_vec<scalar_t>();
   const int DPad = (D + 7) & ~7;
   const int cpr = DPad / kVec;
-  const int rpp = (cpr > 0 && cpr <= static_cast<int>(blockDim.x))
-                      ? static_cast<int>(blockDim.x) / cpr : 0;
-  const int crow = (rpp > 0) ? static_cast<int>(threadIdx.x) / cpr : 0;
-  const int cchunk = (rpp > 0) ? static_cast<int>(threadIdx.x) - crow * cpr : 0;
-  const int crow_a = (rpp > 0 && crow < rpp) ? crow : TILE;
+  const RowChunk rc = row_chunk(cpr, TILE);
+  const int rpp = rc.rpp, crow_a = rc.row, cchunk = rc.chunk;
   __syncthreads();
-
-  // Chunk-causal visibility is a prefix, so one division per block gives the visible count.
-  auto vis_of = [&](const BlockView<scalar_t>& bx) -> int {
-    if (bx.token0 < 0) return bx.n_valid;
-    const int64_t lim = static_cast<int64_t>(q_chunk + 1) * chunk_size - bx.token0;
-    if (lim <= 0) return 0;
-    return (lim < bx.n_valid) ? static_cast<int>(lim) : bx.n_valid;
-  };
 
   auto issue = [&](const BlockView<scalar_t>& bx, int tk0, int vis) {
     const int64_t vsn = acc.v_stride_n(), vsd = acc.v_stride_d();
@@ -696,12 +652,7 @@ __global__ __launch_bounds__(512) void sel_bwd_dq_wmma_kernel(
 
   int t = 0, tok0 = 0, bvis = 0;
   BlockView<scalar_t> bv{nullptr, nullptr, 0, 0, 0, -1};
-  bool have = false;
-  for (; t < Tb; ++t) {
-    bv = acc.block(b, g, h, t, q_chunk);
-    bvis = bv.valid() ? vis_of(bv) : 0;
-    if (bvis > 0) { have = true; break; }
-  }
+  const bool have = find_visible(acc, b, g, h, Tb, q_chunk, chunk_size, t, bv, bvis);
   if (have) issue(bv, 0, bvis);
 
   while (have) {
@@ -710,11 +661,8 @@ __global__ __launch_bounds__(512) void sel_bwd_dq_wmma_kernel(
     bool nhave = ntok0 < bvis;
     if (!nhave) {
       ntok0 = 0;
-      for (nt_ = t + 1; nt_ < Tb; ++nt_) {
-        nbv = acc.block(b, g, h, nt_, q_chunk);
-        nvis = nbv.valid() ? vis_of(nbv) : 0;
-        if (nvis > 0) { nhave = true; break; }
-      }
+      nt_ = t + 1;
+      nhave = find_visible(acc, b, g, h, Tb, q_chunk, chunk_size, nt_, nbv, nvis);
     }
     cp_async_wait_all();
     __syncthreads();
@@ -755,21 +703,8 @@ __global__ __launch_bounds__(512) void sel_bwd_dq_wmma_kernel(
       }
       // dQ += dS K (C -> A lane permutation, 8 shuffles per tile)
       {
-        const int s1 = (lane & ~3) + (t4 >> 1), s2 = s1 + 2;
-        const bool odd = (t4 & 1) != 0;
-        const float x0 = __shfl_sync(0xffffffffu, ds[0], s1);
-        const float x1 = __shfl_sync(0xffffffffu, ds[1], s1);
-        const float y0 = __shfl_sync(0xffffffffu, ds[2], s1);
-        const float y1 = __shfl_sync(0xffffffffu, ds[3], s1);
-        const float z0 = __shfl_sync(0xffffffffu, ds[0], s2);
-        const float z1 = __shfl_sync(0xffffffffu, ds[1], s2);
-        const float w0 = __shfl_sync(0xffffffffu, ds[2], s2);
-        const float w1 = __shfl_sync(0xffffffffu, ds[3], s2);
         uint32_t sa[4];
-        sa[0] = f2tf32(odd ? x1 : x0);
-        sa[1] = f2tf32(odd ? y1 : y0);
-        sa[2] = f2tf32(odd ? z1 : z0);
-        sa[3] = f2tf32(odd ? w1 : w0);
+        c_to_a_tf32(ds, lane, t4, sa);
         const scalar_t* kr0 = sK + static_cast<size_t>(t0 + t4) * ldkv;
         const scalar_t* kr1 = sK + static_cast<size_t>(t0 + t4 + 4) * ldkv;
 #pragma unroll
@@ -829,10 +764,7 @@ __global__ __launch_bounds__(256) void sel_bwd_dq_warp_kernel(
   if (gs >= MG) return;  // warp-uniform: this kernel has no __syncthreads at all
   const int h = blockIdx.y;
   const int b = blockIdx.z;
-  const int g = (order == nullptr)
-                    ? gs
-                    : order[static_cast<int64_t>(b) * ord_sb + static_cast<int64_t>(gs) * ord_sg +
-                            static_cast<int64_t>(h) * ord_sh];
+  const int g = group_of(order, ord_sb, ord_sg, ord_sh, b, gs, h);
 
   // Per-warp slice: pointers first (8-byte aligned), then ints, then the FP32 rows.
   char* wbase = reinterpret_cast<char*>(wsmem) + static_cast<size_t>(warp) * warp_bytes;
@@ -895,12 +827,7 @@ __global__ __launch_bounds__(256) void sel_bwd_dq_warp_kernel(
         sVp[t] = nullptr;
       }
     }
-    int x = nv;
-#pragma unroll
-    for (int off = 1; off < kWarpSize; off <<= 1) {
-      const int y = __shfl_up_sync(0xffffffffu, x, off);
-      if (lane >= off) x += y;
-    }
+    const int x = warp_inclusive_scan(nv);
     if (t < T) sStart[t] = total + x - nv;
     total += __shfl_sync(0xffffffffu, x, kWarpSize - 1);
   }
@@ -1022,7 +949,6 @@ __global__ __launch_bounds__(256) void sel_bwd_dkv_mma_kernel(
   scalar_t* sQ = sV + static_cast<size_t>(TKV) * pitch;
   scalar_t* sDO = sQ + static_cast<size_t>(BQ) * pitch;
 
-  constexpr int kVec = cp_vec<scalar_t>();
   const bool kvec = kv_vec && r.k_sd == 1 && r.v_sd == 1 &&
                     ((reinterpret_cast<uintptr_t>(r.k) | reinterpret_cast<uintptr_t>(r.v)) & 15) == 0;
   for (int idx = tid; idx < TKV * DP; idx += NT) {
@@ -1032,100 +958,51 @@ __global__ __launch_bounds__(256) void sel_bwd_dkv_mma_kernel(
     sDV[j * pitch + d] = 0.f;
   }
   if (kvec) {
-    const int cpr = DP / kVec;
-    const int adv_j = NT / cpr, adv_d = NT - (NT / cpr) * cpr;
-    int j = tid / cpr, dc = tid - (tid / cpr) * cpr;
-    for (int c = tid; c < TKV * cpr; c += NT) {
-      const int d = dc * kVec;
+    cp_async_rows16(sK, sV, pitch, TKV, DP, tid, NT,
+                    [&](int j, int d, const scalar_t*& ks, const scalar_t*& vs) {
       const bool live = j < ntok;
       const int64_t tk = live ? (tile0 + j) : tile0;
-      int nb = live ? (D - d) * static_cast<int>(sizeof(scalar_t)) : 0;
-      if (nb > 16) nb = 16;
-      if (nb < 0) nb = 0;
-      cp_async16(&sK[j * pitch + d], r.k + tk * r.k_sn + (live ? d : 0), nb);
-      cp_async16(&sV[j * pitch + d], r.v + tk * r.v_sn + (live ? d : 0), nb);
-      dc += adv_d;
-      j += adv_j;
-      if (dc >= cpr) { dc -= cpr; ++j; }
-    }
-    cp_async_fence();
-    cp_async_wait_all();
+      ks = r.k + tk * r.k_sn + (live ? d : 0);
+      vs = r.v + tk * r.v_sn + (live ? d : 0);
+      return cp_bytes16(live ? (D - d) * static_cast<int>(sizeof(scalar_t)) : 0);
+    });
   } else {
-    for (int idx = tid; idx < TKV * DP; idx += NT) {
-      const int j = idx / DP;
-      const int d = idx - j * DP;
-      float kv = 0.f, vv = 0.f;
+    copy_rows(sK, sV, pitch, TKV, DP, tid, NT, [&](int j, int d, float& kv, float& vv) {
       if (j < ntok && d < D) {
         const int64_t tk = tile0 + j;
         kv = to_f32(r.k[tk * r.k_sn + static_cast<int64_t>(d) * r.k_sd]);
         vv = to_f32(r.v[tk * r.v_sn + static_cast<int64_t>(d) * r.v_sd]);
       }
-      sK[j * pitch + d] = from_f32<scalar_t>(kv);
-      sV[j * pitch + d] = from_f32<scalar_t>(vv);
-    }
+    });
   }
 
-  const int64_t obase = static_cast<int64_t>(b) * off_sb + static_cast<int64_t>(h) * off_sh;
-  const int start = offsets[obase + bid];
-  const int cnt = offsets[obase + bid + 1] - start;
-  const int64_t gbase =
-      static_cast<int64_t>(b) * groups_sb + static_cast<int64_t>(h) * groups_sh + start;
-  const int64_t total_q = static_cast<int64_t>(cnt) * G;
+  const CsrBucket bk = csr_bucket(offsets, off_sb, off_sh, groups_sb, groups_sh, b, h, bid, G);
+  const int64_t total_q = bk.total_q;
 
   for (int64_t qt = 0; qt < total_q; qt += BQ) {
     const int64_t left = total_q - qt;
     const int nq = static_cast<int>(left < BQ ? left : BQ);
     __syncthreads();
-    for (int i = tid; i < BQ; i += NT) {
-      int m = -1, qc = 0;
-      float l = kNegInf, dl = 0.f;
-      if (i < nq) {
-        const int64_t f = qt + i;
-        const int64_t e = f / G;
-        const int gid = groups[gbase + e];
-        m = static_cast<int>(static_cast<int64_t>(gid) * G + (f - e * G));
-        qc = static_cast<int>((static_cast<int64_t>(gid) * G) / chunk_size);
-        l = *lse.at(b, h, m);
-        dl = *delta.at(b, h, m);
-      }
-      sQidx[i] = m;
-      sQchunk[i] = qc;
-      sLse[i] = l;
-      sDel[i] = dl;
-    }
+    stage_bucket_queries(groups, bk.gbase, qt, nq, BQ, G, chunk_size, lse, delta, b, h, tid, NT,
+                         sQidx, sQchunk, sLse, sDel);
     __syncthreads();
     if (q_vec) {
-      const int cpr = DP / kVec;
-      const int adv_i = NT / cpr, adv_d = NT - (NT / cpr) * cpr;
-      int i = tid / cpr, dc = tid - (tid / cpr) * cpr;
-      for (int c = tid; c < BQ * cpr; c += NT) {
-        const int d = dc * kVec;
+      cp_async_rows16(sQ, sDO, pitch, BQ, DP, tid, NT,
+                      [&](int i, int d, const scalar_t*& qs, const scalar_t*& os) {
         const int m = sQidx[i];
         const int mm = (m >= 0) ? m : 0;
-        int nb = (m >= 0) ? (D - d) * static_cast<int>(sizeof(scalar_t)) : 0;
-        if (nb > 16) nb = 16;
-        if (nb < 0) nb = 0;
-        cp_async16(&sQ[i * pitch + d], q.at(b, mm, h, 0) + ((m >= 0) ? d : 0), nb);
-        cp_async16(&sDO[i * pitch + d], dout.at(b, mm, h, 0) + ((m >= 0) ? d : 0), nb);
-        dc += adv_d;
-        i += adv_i;
-        if (dc >= cpr) { dc -= cpr; ++i; }
-      }
-      cp_async_fence();
-      cp_async_wait_all();
+        qs = q.at(b, mm, h, 0) + ((m >= 0) ? d : 0);
+        os = dout.at(b, mm, h, 0) + ((m >= 0) ? d : 0);
+        return cp_bytes16((m >= 0) ? (D - d) * static_cast<int>(sizeof(scalar_t)) : 0);
+      });
     } else {
-      for (int idx = tid; idx < BQ * DP; idx += NT) {
-        const int i = idx / DP;
-        const int d = idx - i * DP;
+      copy_rows(sQ, sDO, pitch, BQ, DP, tid, NT, [&](int i, int d, float& qv, float& ov) {
         const int m = sQidx[i];
-        float qv = 0.f, ov = 0.f;
         if (m >= 0 && d < D) {
           qv = to_f32(*q.at(b, m, h, d));
           ov = to_f32(*dout.at(b, m, h, d));
         }
-        sQ[i * pitch + d] = from_f32<scalar_t>(qv);
-        sDO[i * pitch + d] = from_f32<scalar_t>(ov);
-      }
+      });
     }
     __syncthreads();
     cta_mma_gemm<false>(sS, sp, sQ, pitch, 1, sK, 1, pitch, BQ, TKV, DP, warp, nwarps, lane);
@@ -1184,17 +1061,16 @@ void launch_dq(const at::Tensor& q, const at::Tensor& o, const at::Tensor& d_out
   check_grid(MG * n_row_tiles, H, B, what);
   auto kernel = sel_bwd_dq_kernel<scalar_t, AccT>;
   enable_large_smem(kernel, plan.smem, what);
+  const GroupOrder ord = make_group_order(order);
   const dim3 grid(static_cast<unsigned>(MG * n_row_tiles), static_cast<unsigned>(H),
                   static_cast<unsigned>(B));
   kernel<<<grid, kBwdThreads, plan.smem, stream>>>(
       make_strided4_const<scalar_t>(q), make_strided4_const<scalar_t>(o),
       make_strided4_const<scalar_t>(d_out), make_strided4<scalar_t>(dq),
       Strided3<const float>{lse.data_ptr<float>(), lse.stride(0), lse.stride(1), lse.stride(2)},
-      make_strided3<float>(delta), order.defined() ? order.data_ptr<int32_t>() : nullptr,
-      order.defined() ? order.stride(0) : 0, order.defined() ? order.stride(1) : 0,
-      order.defined() ? order.stride(2) : 0, acc, static_cast<int>(G), static_cast<int>(T),
-      static_cast<int>(D), static_cast<int>(chunk_size), static_cast<float>(scale),
-      plan.tile_q, plan.tile_n, pitch, n_row_tiles);
+      make_strided3<float>(delta), ord.p, ord.s0, ord.s1, ord.s2, acc, static_cast<int>(G),
+      static_cast<int>(T), static_cast<int>(D), static_cast<int>(chunk_size),
+      static_cast<float>(scale), plan.tile_q, plan.tile_n, pitch, n_row_tiles);
   OMNIMEM_CHECK_LAUNCH();
 }
 
@@ -1237,21 +1113,14 @@ __host__ inline at::Tensor group_order(const at::Tensor& block_indices, int64_t 
 // Shared-memory plan for the warp-private dQ kernel (mirrors the forward's layout).
 __host__ inline size_t dq_wmma_bytes(int Gc, int D, size_t esz) {
   const int nmq = ((Gc + 15) >> 4) * 16;
-  const int ldq = mma_pitch_a(D), ldkv = mma_pitch((D + 7) & ~7);
-  const int ldo = dq_dn_for(D) * 8 + 4;
+  const int ldq = pitch_4mod8(D), ldkv = mma_pitch((D + 7) & ~7);
+  const int ldo = dn_tiles(D) * 8 + 4;
   const size_t head = ((static_cast<size_t>(2 * nmq) * sizeof(float)) + 15) & ~size_t(15);
   const size_t stage = ((static_cast<size_t>(2 * nmq) * ldq * esz) + 15) & ~size_t(15);
   const size_t tiles = 2 * static_cast<size_t>(32) * ldkv * esz;
   const size_t dqb = static_cast<size_t>(nmq) * ldo * sizeof(float);
   return head + stage + (tiles > dqb ? tiles : dqb);
 }
-
-#define OMNIMEM_DISPATCH_DQDN(D, ...)                                     \
-  [&] {                                                                   \
-    if ((D) <= 64) { constexpr int DN_ = 8; return __VA_ARGS__(); }       \
-    if ((D) <= 96) { constexpr int DN_ = 12; return __VA_ARGS__(); }      \
-    { constexpr int DN_ = 16; return __VA_ARGS__(); }                     \
-  }()
 
 template <typename scalar_t, typename AccT>
 void launch_dq_wmma(const at::Tensor& q, const at::Tensor& o, const at::Tensor& d_out,
@@ -1266,21 +1135,19 @@ void launch_dq_wmma(const at::Tensor& q, const at::Tensor& o, const at::Tensor& 
   const int nw = ((Gc + 15) >> 4) * 4;
   const size_t smem = dq_wmma_bytes(Gc, Di, sizeof(scalar_t));
   check_grid(MG, nsplit, B * H, what);
-  const bool has_ord = order.defined();
+  const GroupOrder ord = make_group_order(order);
   const dim3 grid(static_cast<unsigned>(MG), static_cast<unsigned>(nsplit),
                   static_cast<unsigned>(B * H));
-  OMNIMEM_DISPATCH_DQDN(Di, [&] {
-    auto kernel = sel_bwd_dq_wmma_kernel<scalar_t, AccT, DN_>;
+  OMNIMEM_DISPATCH_DN(Di, [&] {
+    auto kernel = sel_bwd_dq_wmma_kernel<scalar_t, AccT, DN_MAX>;
     enable_large_smem(kernel, smem, what);
     kernel<<<grid, nw * 32, smem, stream>>>(
         make_strided4_const<scalar_t>(q), make_strided4_const<scalar_t>(o),
         make_strided4_const<scalar_t>(d_out), make_strided4<scalar_t>(dq),
         Strided3<const float>{lse.data_ptr<float>(), lse.stride(0), lse.stride(1),
                               lse.stride(2)},
-        make_strided3<float>(delta), has_ord ? order.data_ptr<int32_t>() : nullptr,
-        has_ord ? order.stride(0) : 0, has_ord ? order.stride(1) : 0,
-        has_ord ? order.stride(2) : 0, acc, static_cast<int>(H), Di, Gi, Gc,
-        static_cast<int>(T), static_cast<int>(chunk_size), static_cast<float>(scale));
+        make_strided3<float>(delta), ord.p, ord.s0, ord.s1, ord.s2, acc, static_cast<int>(H), Di,
+        Gi, Gc, static_cast<int>(T), static_cast<int>(chunk_size), static_cast<float>(scale));
   });
   OMNIMEM_CHECK_LAUNCH();
 }
@@ -1303,9 +1170,9 @@ void launch_dq_mma(const at::Tensor& q, const at::Tensor& o, const at::Tensor& d
   check_grid(MG * n_row_tiles, H, B, what);
   auto kernel = sel_bwd_dq_mma_kernel<scalar_t, AccT>;
   enable_large_smem(kernel, plan.smem, what);
+  const GroupOrder ord = make_group_order(order);
   const dim3 grid(static_cast<unsigned>(MG * n_row_tiles), static_cast<unsigned>(H),
                   static_cast<unsigned>(B));
-  const bool has_ord = order.defined();
   // Needed for 16-byte cp.async staging of K/V; per-block base alignment is checked in the kernel.
   const int vecn = cp_vec<scalar_t>();
   const bool kv_vec = (k_sd == 1 && v_sd == 1 && k_sn % vecn == 0 && v_sn % vecn == 0);
@@ -1313,12 +1180,10 @@ void launch_dq_mma(const at::Tensor& q, const at::Tensor& o, const at::Tensor& d
       make_strided4_const<scalar_t>(q), make_strided4_const<scalar_t>(o),
       make_strided4_const<scalar_t>(d_out), make_strided4<scalar_t>(dq),
       Strided3<const float>{lse.data_ptr<float>(), lse.stride(0), lse.stride(1), lse.stride(2)},
-      make_strided3<float>(delta), has_ord ? order.data_ptr<int32_t>() : nullptr,
-      has_ord ? order.stride(0) : 0, has_ord ? order.stride(1) : 0,
-      has_ord ? order.stride(2) : 0, acc, k_sn, k_sd, v_sn, v_sd, static_cast<int>(G),
-      static_cast<int>(T), static_cast<int>(D), plan.DP, static_cast<int>(chunk_size),
-      static_cast<float>(scale), plan.BGP, plan.TN, plan.pitch, plan.dsp, n_row_tiles,
-      kv_vec);
+      make_strided3<float>(delta), ord.p, ord.s0, ord.s1, ord.s2, acc, k_sn, k_sd, v_sn, v_sd,
+      static_cast<int>(G), static_cast<int>(T), static_cast<int>(D), plan.DP,
+      static_cast<int>(chunk_size), static_cast<float>(scale), plan.BGP, plan.TN, plan.pitch,
+      plan.dsp, n_row_tiles, kv_vec);
   OMNIMEM_CHECK_LAUNCH();
 }
 
@@ -1343,19 +1208,17 @@ void launch_dq_warp(const at::Tensor& q, const at::Tensor& o, const at::Tensor& 
                          : sel_bwd_dq_warp_kernel<scalar_t, AccT, 8>;
   enable_large_smem(kernel, smem, what);
   const int vecn = cp_vec<scalar_t>();
+  const GroupOrder ord = make_group_order(order);
   const bool row_vec = k_sd == 1 && v_sd == 1 && k_sn % vecn == 0 && v_sn % vecn == 0 &&
                        D >= vecn;
-  const bool has_ord = order.defined();
   const dim3 grid(static_cast<unsigned>(nblocks), static_cast<unsigned>(H),
                   static_cast<unsigned>(B));
   kernel<<<grid, 32 * wpb, smem, stream>>>(
       make_strided4_const<scalar_t>(q), make_strided4_const<scalar_t>(o),
       make_strided4_const<scalar_t>(d_out), make_strided4<scalar_t>(dq),
       Strided3<const float>{lse.data_ptr<float>(), lse.stride(0), lse.stride(1), lse.stride(2)},
-      make_strided3<float>(delta), has_ord ? order.data_ptr<int32_t>() : nullptr,
-      has_ord ? order.stride(0) : 0, has_ord ? order.stride(1) : 0,
-      has_ord ? order.stride(2) : 0, acc, k_sn, k_sd, v_sn, v_sd, static_cast<int>(MG),
-      static_cast<int>(G), static_cast<int>(T), static_cast<int>(D),
+      make_strided3<float>(delta), ord.p, ord.s0, ord.s1, ord.s2, acc, k_sn, k_sd, v_sn, v_sd,
+      static_cast<int>(MG), static_cast<int>(G), static_cast<int>(T), static_cast<int>(D),
       static_cast<int>(chunk_size), static_cast<float>(scale), wpb, row_vec,
       static_cast<int>(per_warp));
   OMNIMEM_CHECK_LAUNCH();

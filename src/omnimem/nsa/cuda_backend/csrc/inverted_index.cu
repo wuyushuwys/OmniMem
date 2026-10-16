@@ -33,10 +33,13 @@ __device__ __forceinline__ bool pair_bucket(
   return true;
 }
 
-__global__ void inv_hist_kernel(
+// SCATTER == false counts each bucket into `counts`; true places each group at the cursor in it.
+template <bool SCATTER>
+__global__ void inv_pass_kernel(
     const int32_t* __restrict__ ids, int64_t ids_sb, int64_t ids_sg, int64_t ids_sh,
-    int64_t ids_st, const int32_t* __restrict__ nbh, int32_t* __restrict__ hist, int MG, int T,
-    int H, int NS, int block_size, int chunk_size, bool causal, int group_size) {
+    int64_t ids_st, const int32_t* __restrict__ nbh, int32_t* __restrict__ counts,
+    int32_t* __restrict__ groups, int64_t groups_row, int MG, int T, int H, int NS,
+    int block_size, int chunk_size, bool causal, int group_size) {
   const int pair = blockIdx.x * blockDim.x + threadIdx.x;
   if (pair >= MG * T) return;
   const int h = blockIdx.y;
@@ -47,7 +50,13 @@ __global__ void inv_hist_kernel(
   if (!pair_bucket(ids, ids_sb, ids_sg, ids_sh, ids_st, nbh, b, g, h, t, NS, block_size,
                    chunk_size, causal, group_size, bucket))
     return;
-  atomicAdd(&hist[(static_cast<int64_t>(b) * H + h) * NS + bucket], 1);
+  const int64_t row = static_cast<int64_t>(b) * H + h;
+  if (SCATTER) {
+    const int pos = atomicAdd(&counts[row * NS + bucket], 1);
+    groups[row * groups_row + pos] = g;
+  } else {
+    atomicAdd(&counts[row * NS + bucket], 1);
+  }
 }
 
 // Per-(b, h) exclusive scan: wpos gets the scatter cursors, offsets the CSR boundaries.
@@ -71,21 +80,11 @@ __global__ void inv_scan_kernel(const int32_t* __restrict__ hist, int32_t* __res
   for (int base = 0; base < NS; base += kIdxThreads) {
     const int i = base + threadIdx.x;
     const int v = (i < NS) ? hist[hbase + i] : 0;
-    int x = v;  // warp-inclusive scan
-#pragma unroll
-    for (int off = 1; off < kWarpSize; off <<= 1) {
-      const int y = __shfl_up_sync(0xffffffffu, x, off);
-      if (lane >= off) x += y;
-    }
+    const int x = warp_inclusive_scan(v);
     if (lane == kWarpSize - 1) warp_tot[wid] = x;
     __syncthreads();
     if (wid == 0) {  // scan the NW warp totals in one warp
-      int t = (lane < NW) ? warp_tot[lane] : 0;
-#pragma unroll
-      for (int off = 1; off < kWarpSize; off <<= 1) {
-        const int y = __shfl_up_sync(0xffffffffu, t, off);
-        if (lane >= off) t += y;
-      }
+      const int t = warp_inclusive_scan((lane < NW) ? warp_tot[lane] : 0);
       if (lane < NW) warp_tot[lane] = t;
     }
     __syncthreads();
@@ -99,26 +98,6 @@ __global__ void inv_scan_kernel(const int32_t* __restrict__ hist, int32_t* __res
     if (threadIdx.x == 0) running += tile_tot;
     __syncthreads();
   }
-}
-
-__global__ void inv_scatter_kernel(
-    const int32_t* __restrict__ ids, int64_t ids_sb, int64_t ids_sg, int64_t ids_sh,
-    int64_t ids_st, const int32_t* __restrict__ nbh, int32_t* __restrict__ wpos,
-    int32_t* __restrict__ groups, int64_t groups_row, int MG, int T, int H, int NS,
-    int block_size, int chunk_size, bool causal, int group_size) {
-  const int pair = blockIdx.x * blockDim.x + threadIdx.x;
-  if (pair >= MG * T) return;
-  const int h = blockIdx.y;
-  const int b = blockIdx.z;
-  const int g = pair / T;
-  const int t = pair - g * T;
-  int bucket = 0;
-  if (!pair_bucket(ids, ids_sb, ids_sg, ids_sh, ids_st, nbh, b, g, h, t, NS, block_size,
-                   chunk_size, causal, group_size, bucket))
-    return;
-  const int64_t row = static_cast<int64_t>(b) * H + h;
-  const int pos = atomicAdd(&wpos[row * NS + bucket], 1);
-  groups[row * groups_row + pos] = g;
 }
 
 }  // namespace
@@ -176,26 +155,23 @@ std::tuple<at::Tensor, at::Tensor> build_inverted_index_impl(
                        static_cast<unsigned>(H), static_cast<unsigned>(B));
   TORCH_CHECK(H <= 65535 && B <= 65535, "inverted_index: B/H exceed the CUDA grid limit");
 
-  inv_hist_kernel<<<pair_grid, kIdxThreads, 0, stream>>>(
-      block_indices.data_ptr<int32_t>(), block_indices.stride(0), block_indices.stride(1),
-      block_indices.stride(2), block_indices.stride(3), nbh, hist.data_ptr<int32_t>(),
-      static_cast<int>(MG), static_cast<int>(T), static_cast<int>(H), static_cast<int>(NS),
-      static_cast<int>(block_size), static_cast<int>(chunk_size), causal,
-      static_cast<int>(group_size));
-  OMNIMEM_CHECK_LAUNCH();
+  auto pass = [&](auto kernel, at::Tensor& counts, int32_t* groups_out) {
+    kernel<<<pair_grid, kIdxThreads, 0, stream>>>(
+        block_indices.data_ptr<int32_t>(), block_indices.stride(0), block_indices.stride(1),
+        block_indices.stride(2), block_indices.stride(3), nbh, counts.data_ptr<int32_t>(),
+        groups_out, row_cap, static_cast<int>(MG), static_cast<int>(T), static_cast<int>(H),
+        static_cast<int>(NS), static_cast<int>(block_size), static_cast<int>(chunk_size),
+        causal, static_cast<int>(group_size));
+    OMNIMEM_CHECK_LAUNCH();
+  };
+  pass(inv_pass_kernel<false>, hist, nullptr);
 
   inv_scan_kernel<<<static_cast<unsigned>(B * H), kIdxThreads, 0, stream>>>(
       hist.data_ptr<int32_t>(), offsets.data_ptr<int32_t>(), wpos.data_ptr<int32_t>(),
       static_cast<int>(NS));
   OMNIMEM_CHECK_LAUNCH();
 
-  inv_scatter_kernel<<<pair_grid, kIdxThreads, 0, stream>>>(
-      block_indices.data_ptr<int32_t>(), block_indices.stride(0), block_indices.stride(1),
-      block_indices.stride(2), block_indices.stride(3), nbh, wpos.data_ptr<int32_t>(),
-      groups.data_ptr<int32_t>(), row_cap, static_cast<int>(MG), static_cast<int>(T),
-      static_cast<int>(H), static_cast<int>(NS), static_cast<int>(block_size),
-      static_cast<int>(chunk_size), causal, static_cast<int>(group_size));
-  OMNIMEM_CHECK_LAUNCH();
+  pass(inv_pass_kernel<true>, wpos, groups.data_ptr<int32_t>());
 
   return std::make_tuple(groups, offsets);
 }

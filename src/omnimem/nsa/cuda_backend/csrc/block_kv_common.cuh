@@ -13,7 +13,11 @@
 #include <cstdint>
 #include <limits>
 
+#include "warp_scan.cuh"
+
 namespace omnimem_block_kv {
+
+using omnimem_cuda::warp_inclusive_scan;
 
 #define OMNIMEM_BLOCK_KV_CHECK_LAUNCH() C10_CUDA_KERNEL_LAUNCH_CHECK()
 

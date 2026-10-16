@@ -19,13 +19,10 @@ constexpr size_t kSmemBudget = 96 * 1024;
 __host__ __device__ __forceinline__ int round4(int x) { return (x + 3) & ~3; }
 __host__ __device__ __forceinline__ int round8(int x) { return (x + 7) & ~7; }
 
-// The K tile is indexed by lane, so it is bank-conflict free iff pitch_in_elements % 8 == 4.
-__host__ __device__ __forceinline__ int ldk_for(int D) { return round8(D) + 4; }
-
 // Number of 8-wide dim tiles the TF32 path carries in the O accumulator (template value).
 __host__ __device__ __forceinline__ int dn_for(int D) {
   if (D < 32 || D > 128) return (D + 7) >> 3;          // SIMT-only range
-  return (D <= 64) ? 8 : (D <= 96) ? 12 : 16;
+  return dn_tiles(D);
 }
 // V pitch: the TF32 path reads mma B fragments, which is conflict-free iff pitch % 32 == 8.
 __host__ __device__ __forceinline__ int ldv_for(int D) {
@@ -153,7 +150,7 @@ __host__ __device__ __forceinline__ size_t group_smem_f32_elems(int Gc, int D) {
 }
 __host__ __device__ __forceinline__ size_t group_smem_bytes(int Gc, int D, size_t esize) {
   const size_t f32b = (group_smem_f32_elems(Gc, D) * 4 + 15) & ~static_cast<size_t>(15);
-  return f32b + esize * static_cast<size_t>(kTileN) * (ldk_for(D) + ldv_for(D));
+  return f32b + esize * static_cast<size_t>(kTileN) * (pitch_4mod8(D) + ldv_for(D));
 }
 
 // G > 1: one CTA per (b, g, h) with shared-memory staged K/V tiles.
@@ -165,7 +162,7 @@ __global__ void __launch_bounds__(512) sel_fwd_group_kernel(
     const int64_t os1, const int64_t os2) {
   extern __shared__ __align__(16) char smem_raw[];
   const int Dv = round4(D);
-  const int ldk = ldk_for(D);
+  const int ldk = pitch_4mod8(D);
   const int ldv = ldv_for(D);
   const int ldq = Dv;
   float* sQ = reinterpret_cast<float*>(smem_raw);             // [Gc][ldq]      fp32
@@ -177,9 +174,7 @@ __global__ void __launch_bounds__(512) sel_fwd_group_kernel(
   const int b = bh / H;
   const int h = bh - b * H;
   // Visit groups in ascending first-selected-block order so concurrent CTAs hit in L2.
-  const int g = (order == nullptr)
-                    ? static_cast<int>(blockIdx.x)
-                    : order[b * os0 + static_cast<int64_t>(blockIdx.x) * os1 + h * os2];
+  const int g = cta_group(order, os0, os1, os2, b, h);
   const int q0 = blockIdx.y * Gc;
   const int nq = ::min(Gc, G - q0);
   if (nq <= 0) return;
@@ -362,7 +357,7 @@ __global__ void __launch_bounds__(kTokenWarps * 32) sel_fwd_token_kernel(
   int g = blockIdx.x * nw + warp;         // group == query (G == 1)
   if (g >= MG) return;                    // warp-uniform; this kernel has no __syncthreads()
   // Visit queries in ascending first-selected-block order so neighbouring warps share KV lines.
-  if (order != nullptr) g = order[b * os0 + static_cast<int64_t>(g) * os1 + h * os2];
+  g = group_of(order, os0, os1, os2, b, g, h);
 
   {
     const T* qp = q.at(b, g, h, 0);
@@ -490,50 +485,14 @@ __global__ void __launch_bounds__(kTokenWarps * 32) sel_fwd_token_kernel(
   if (lane == 0) *lse.at(b, h, g) = (l_i > 0.f) ? (m_i + logf(l_i)) : kNegInf;
 }
 
-// TF32 mma path (sm_80), used when allow_tf32; fragment layout as in bwd_common.cuh.
+// TF32 mma path (sm_80), used when allow_tf32; fragment layout as in common.cuh.
 // CTA = one (b, group, h); warp (mt, nt) owns 16 queries x 8 tokens of every KV tile.
-__device__ __forceinline__ uint32_t to_tf32(float x) {
-  uint32_t r;
-  asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
-  return r;
-}
-
-// bf16 is the top half of fp32, so bf16 -> tf32 is an exact shift; fp16 needs a real convert.
-template <typename T>
-__device__ __forceinline__ uint32_t elem_to_tf32(T x);
-template <>
-__device__ __forceinline__ uint32_t elem_to_tf32<c10::BFloat16>(c10::BFloat16 x) {
-  return static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(&x)) << 16;
-}
-template <>
-__device__ __forceinline__ uint32_t elem_to_tf32<c10::Half>(c10::Half x) {
-  return to_tf32(to_f32<c10::Half>(x));
-}
-template <>
-__device__ __forceinline__ uint32_t elem_to_tf32<float>(float x) { return to_tf32(x); }
 
 // sm_80 async global->shared copy: every chunk of a KV tile is in flight at once.
 __device__ __forceinline__ void cp_async8(void* dst, const void* src) {
   asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::
                "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst))), "l"(src));
 }
-__device__ __forceinline__ void cp_async_commit() {
-  asm volatile("cp.async.commit_group;\n" ::);
-}
-template <int N>
-__device__ __forceinline__ void cp_async_wait() {
-  asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
-}
-
-__device__ __forceinline__ void mma_m16n8k8(float (&d)[4], const uint32_t (&a)[4],
-                                            const uint32_t (&b)[2]) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-}
-
 // Reduction over the 4 lanes of a fragment row group (t4 = 0..3).
 __device__ __forceinline__ float grp_max(float v) {
   v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 1));
@@ -548,13 +507,13 @@ __host__ __device__ __forceinline__ int mma_nm(int Gc) { return (Gc + 15) >> 4; 
 __host__ __device__ __forceinline__ int mma_ldo(int D) { return dn_for(D) * 8 + 4; }
 __host__ __device__ __forceinline__ size_t mma_f32_bytes(int Gc, int D) {
   const size_t nmq = static_cast<size_t>(mma_nm(Gc)) * 16;
-  const size_t n = nmq * ldk_for(D)                    // sQ
+  const size_t n = nmq * pitch_4mod8(D)                // sQ
                  + static_cast<size_t>(mma_nm(Gc)) * 4 * 16 * 2   // sM, sL
                  + nmq * 2;                            // sMt, sLt
   return (n * 4 + 15) & ~static_cast<size_t>(15);
 }
 __host__ __device__ __forceinline__ size_t mma_smem_bytes(int Gc, int D, size_t esize) {
-  const size_t kvb = esize * static_cast<size_t>(kTileN) * (ldk_for(D) + ldv_for(D));
+  const size_t kvb = esize * static_cast<size_t>(kTileN) * (pitch_4mod8(D) + ldv_for(D));
   const size_t ob = static_cast<size_t>(mma_nm(Gc)) * 16 * mma_ldo(D) * 4;
   return mma_f32_bytes(Gc, D) + (kvb > ob ? kvb : ob);
 }
@@ -576,7 +535,7 @@ __global__ void __launch_bounds__(512) sel_fwd_group_mma_kernel(
     const float scale, const int32_t* __restrict__ order, const int64_t os0,
     const int64_t os1, const int64_t os2) {
   extern __shared__ __align__(16) char smem_raw[];
-  const int ldq = ldk_for(D), ldk = ldq, ldv = ldv_for(D), ldo = DN * 8 + 4;
+  const int ldq = pitch_4mod8(D), ldk = ldq, ldv = ldv_for(D), ldo = DN * 8 + 4;
   const int nm = mma_nm(Gc), nmq = nm * 16;
   uint32_t* sQ = reinterpret_cast<uint32_t*>(smem_raw);           // [nmq][ldq] tf32 bits
   float* sM = reinterpret_cast<float*>(sQ + static_cast<size_t>(nmq) * ldq);  // [nm*4][16]
@@ -591,9 +550,7 @@ __global__ void __launch_bounds__(512) sel_fwd_group_mma_kernel(
   const int bh = blockIdx.z;
   const int b = bh / H, h = bh - b * H;
   // Visit groups in ascending first-selected-block order so concurrent CTAs hit in L2.
-  const int g = (order == nullptr)
-                    ? static_cast<int>(blockIdx.x)
-                    : order[b * os0 + static_cast<int64_t>(blockIdx.x) * os1 + h * os2];
+  const int g = cta_group(order, os0, os1, os2, b, h);
   const int q0 = blockIdx.y * Gc;
   const int nq = ::min(Gc, G - q0);
   if (nq <= 0) return;
@@ -615,10 +572,10 @@ __global__ void __launch_bounds__(512) sel_fwd_group_mma_kernel(
       if (i < nq) {
         const T* qp = q.at(b, m_base + i, h, 0);
         if (qsd == 1) {
-          for (int d = lane; d < D; d += 32) dst[d] = elem_to_tf32<T>(qp[d]);
+          for (int d = lane; d < D; d += 32) dst[d] = to_tf32<T>(qp[d]);
         } else {
           for (int d = lane; d < D; d += 32)
-            dst[d] = elem_to_tf32<T>(qp[static_cast<int64_t>(d) * qsd]);
+            dst[d] = to_tf32<T>(qp[static_cast<int64_t>(d) * qsd]);
         }
         for (int d = D + lane; d < ldq; d += 32) dst[d] = 0u;
       } else {
@@ -642,20 +599,9 @@ __global__ void __launch_bounds__(512) sel_fwd_group_mma_kernel(
     for (size_t i = threadIdx.x; i < bufel; i += blockDim.x) sKV[i] = z;
   }
   const int cpr = static_cast<int>((static_cast<size_t>(D) * sizeof(T)) >> 3);
-  const int rpp = (cpr > 0 && cpr <= static_cast<int>(blockDim.x))
-                      ? static_cast<int>(blockDim.x) / cpr : 0;   // rows staged per pass
-  const int crow = (rpp > 0) ? static_cast<int>(threadIdx.x) / cpr : 0;
-  const int cchunk = (rpp > 0) ? static_cast<int>(threadIdx.x) - crow * cpr : 0;
-  const int crow_act = (rpp > 0 && crow < rpp) ? crow : kTileN;   // idle tail threads
+  const RowChunk rc = row_chunk(cpr, kTileN);
+  const int rpp = rc.rpp, crow_act = rc.row, cchunk = rc.chunk;
   __syncthreads();
-
-  // Chunk-causal visibility is a prefix of the block, so one division per block gives the count.
-  auto vis_of = [&](const BlockView<T>& bx) -> int {
-    if (bx.token0 < 0) return bx.n_valid;
-    const int64_t lim = static_cast<int64_t>(q_chunk + 1) * chunk_size - bx.token0;
-    if (lim <= 0) return 0;
-    return (lim < bx.n_valid) ? static_cast<int>(lim) : bx.n_valid;
-  };
 
   // Copy one KV tile into buffer bi; cp.async unless the layout cannot be addressed by it.
   auto issue = [&](const BlockView<T>& bx, int tk0, int bi, int vis) {
@@ -701,18 +647,13 @@ __global__ void __launch_bounds__(512) sel_fwd_group_mma_kernel(
                              vvw, lane);
       }
     }
-    cp_async_commit();
+    cp_async_fence();
   };
 
   int t = 0, tok0 = 0, bvis = 0;
   constexpr int buf = 0;
   BlockView<T> bv{nullptr, nullptr, 0, 0, 0, -1};
-  bool have = false;
-  for (; t < Tb; ++t) {
-    bv = kv.block(b, g, h, t, q_chunk);
-    bvis = bv.valid() ? vis_of(bv) : 0;
-    if (bvis > 0) { have = true; break; }
-  }
+  const bool have = find_visible(kv, b, g, h, Tb, q_chunk, chunk_size, t, bv, bvis);
   if (have) issue(bv, 0, buf, bvis);
 
   while (have) {
@@ -722,13 +663,10 @@ __global__ void __launch_bounds__(512) sel_fwd_group_mma_kernel(
     bool nhave = ntok0 < bvis;
     if (!nhave) {
       ntok0 = 0;
-      for (nt_ = t + 1; nt_ < Tb; ++nt_) {
-        nbv = kv.block(b, g, h, nt_, q_chunk);
-        nvis = nbv.valid() ? vis_of(nbv) : 0;
-        if (nvis > 0) { nhave = true; break; }
-      }
+      nt_ = t + 1;
+      nhave = find_visible(kv, b, g, h, Tb, q_chunk, chunk_size, nt_, nbv, nvis);
     }
-    cp_async_wait<0>();
+    cp_async_wait_all();
     __syncthreads();
 
     {
@@ -749,9 +687,9 @@ __global__ void __launch_bounds__(512) sel_fwd_group_mma_kernel(
           a[1] = qrow1[d0 + t4];
           a[2] = qrow0[d0 + t4 + 4];
           a[3] = qrow1[d0 + t4 + 4];
-          bf[0] = elem_to_tf32<T>(krow[d0 + t4]);
-          bf[1] = elem_to_tf32<T>(krow[d0 + t4 + 4]);
-          mma_m16n8k8(sfrag, a, bf);
+          bf[0] = to_tf32<T>(krow[d0 + t4]);
+          bf[1] = to_tf32<T>(krow[d0 + t4 + 4]);
+          mma_m16n8k8_tf32(sfrag, a, bf);
         }
       }
 
@@ -784,29 +722,16 @@ __global__ void __launch_bounds__(512) sel_fwd_group_mma_kernel(
 
       // O += P V; the C -> A fragment remap takes one 8-shuffle permutation per tile
       {
-        const int s1 = (lane & ~3) + (t4 >> 1), s2 = s1 + 2;
-        const bool odd = (t4 & 1) != 0;
-        const float x0 = __shfl_sync(0xffffffffu, pr[0], s1);
-        const float x1 = __shfl_sync(0xffffffffu, pr[1], s1);
-        const float y0 = __shfl_sync(0xffffffffu, pr[2], s1);
-        const float y1 = __shfl_sync(0xffffffffu, pr[3], s1);
-        const float z0 = __shfl_sync(0xffffffffu, pr[0], s2);
-        const float z1 = __shfl_sync(0xffffffffu, pr[1], s2);
-        const float w0 = __shfl_sync(0xffffffffu, pr[2], s2);
-        const float w1 = __shfl_sync(0xffffffffu, pr[3], s2);
         uint32_t pa[4];
-        pa[0] = to_tf32(odd ? x1 : x0);
-        pa[1] = to_tf32(odd ? y1 : y0);
-        pa[2] = to_tf32(odd ? z1 : z0);
-        pa[3] = to_tf32(odd ? w1 : w0);
+        c_to_a_tf32(pr, lane, t4, pa);
         const T* vr0 = sV + static_cast<size_t>(t0 + t4) * ldv;
         const T* vr1 = sV + static_cast<size_t>(t0 + t4 + 4) * ldv;
 #pragma unroll
         for (int n = 0; n < DN; ++n) {
           uint32_t vb[2];
-          vb[0] = elem_to_tf32<T>(vr0[n * 8 + gid]);
-          vb[1] = elem_to_tf32<T>(vr1[n * 8 + gid]);
-          mma_m16n8k8(acc[n], pa, vb);
+          vb[0] = to_tf32<T>(vr0[n * 8 + gid]);
+          vb[1] = to_tf32<T>(vr1[n * 8 + gid]);
+          mma_m16n8k8_tf32(acc[n], pa, vb);
         }
       }
     }
@@ -880,13 +805,6 @@ __global__ void __launch_bounds__(512) sel_fwd_group_mma_kernel(
   }
 }
 
-#define OMNIMEM_DISPATCH_DN(D, ...)                                        \
-  [&] {                                                                    \
-    if ((D) <= 64) { constexpr int DN_MAX = 8; return __VA_ARGS__(); }     \
-    if ((D) <= 96) { constexpr int DN_MAX = 12; return __VA_ARGS__(); }    \
-    { constexpr int DN_MAX = 16; return __VA_ARGS__(); }                   \
-  }()
-
 #define OMNIMEM_DISPATCH_DPL(D, ...)                                       \
   [&] {                                                                    \
     if ((D) <= 64) { constexpr int DPL_MAX = 2; return __VA_ARGS__(); }    \
@@ -912,10 +830,7 @@ void launch_sel_fwd(const at::Tensor& q, at::Tensor& out, at::Tensor& lse, const
   TORCH_CHECK(BH <= 65535, "sel_fwd: B*H = ", BH, " exceeds the grid.z limit");
   const int Di = static_cast<int>(D);
 
-  const int32_t* ord = order.defined() ? order.data_ptr<int32_t>() : nullptr;
-  const int64_t o0 = order.defined() ? order.stride(0) : 0;
-  const int64_t o1 = order.defined() ? order.stride(1) : 0;
-  const int64_t o2 = order.defined() ? order.stride(2) : 0;
+  const GroupOrder ord = make_group_order(order);
 
   if (G == 1) {
     const int nw = kTokenWarps;
@@ -923,7 +838,8 @@ void launch_sel_fwd(const at::Tensor& q, at::Tensor& out, at::Tensor& lse, const
     const dim3 grid(static_cast<unsigned>((MG + nw - 1) / nw), static_cast<unsigned>(BH));
     OMNIMEM_DISPATCH_DPL(Di, [&] {
       sel_fwd_token_kernel<T, ACC, DPL_MAX><<<grid, nw * 32, smem, stream>>>(
-          qs, os, ls, kv, static_cast<int>(H), Di, MG, Tb, chunk_size, sc, ord, o0, o1, o2);
+          qs, os, ls, kv, static_cast<int>(H), Di, MG, Tb, chunk_size, sc, ord.p, ord.s0, ord.s1,
+          ord.s2);
     });
     OMNIMEM_CHECK_LAUNCH();
     return;
@@ -945,7 +861,8 @@ void launch_sel_fwd(const at::Tensor& q, at::Tensor& out, at::Tensor& lse, const
               cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
         }
         sel_fwd_group_mma_kernel<T, ACC, DN_MAX><<<grid, nw * 32, smem, stream>>>(
-            qs, os, ls, kv, static_cast<int>(H), Di, G, Gc, Tb, chunk_size, sc, ord, o0, o1, o2);
+            qs, os, ls, kv, static_cast<int>(H), Di, G, Gc, Tb, chunk_size, sc, ord.p, ord.s0,
+            ord.s1, ord.s2);
       });
       OMNIMEM_CHECK_LAUNCH();
       return;
@@ -968,7 +885,8 @@ void launch_sel_fwd(const at::Tensor& q, at::Tensor& out, at::Tensor& lse, const
           cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
     }
     sel_fwd_group_kernel<T, ACC, DPL_MAX><<<grid, nw * 32, smem, stream>>>(
-        qs, os, ls, kv, static_cast<int>(H), Di, G, Gc, Tb, chunk_size, sc, ord, o0, o1, o2);
+        qs, os, ls, kv, static_cast<int>(H), Di, G, Gc, Tb, chunk_size, sc, ord.p, ord.s0, ord.s1,
+        ord.s2);
   });
   OMNIMEM_CHECK_LAUNCH();
 }

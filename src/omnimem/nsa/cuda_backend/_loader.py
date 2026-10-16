@@ -18,7 +18,7 @@ EXTENSION = Extension(
     what="NSA CUDA extension",
     sources=("bindings.cpp", "topk.cu", "ptr_table.cu", "selection_fwd.cu",
              "selection_bwd.cu", "inverted_index.cu"),
-    headers=("ops.h", "common.cuh", "bwd_common.cuh"),
+    headers=("ops.h", "common.cuh", "bwd_common.cuh", "warp_scan.cuh"),
     cuda_cflags=(
         "-O3",
         "-std=c++17",

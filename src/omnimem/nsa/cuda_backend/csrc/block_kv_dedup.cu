@@ -49,17 +49,6 @@ __global__ void count_epoch_kernel(const int32_t* __restrict__ stamp,
   if (threadIdx.x == 0) counts[blockIdx.x] = n_hit;
 }
 
-// Inclusive warp scan of `v` over a full, converged warp.
-__device__ __forceinline__ int32_t warp_inclusive_scan(int32_t v) {
-  const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
-#pragma unroll
-  for (int d = 1; d < kWarpSize; d <<= 1) {
-    const int32_t n = __shfl_up_sync(0xffffffffu, v, d);
-    if (lane >= d) v += n;
-  }
-  return v;
-}
-
 // Single-CTA exclusive scan of the tile counts; total goes to out[0].
 __global__ void scan_counts_kernel(const int32_t* __restrict__ counts,
                                    int32_t* __restrict__ offsets, int32_t* __restrict__ out,

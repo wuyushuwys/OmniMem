@@ -120,59 +120,90 @@ struct PtrKVGrad {
   }
 };
 
-// TF32 mma.m16n8k8 (sm_80+), operands rounded with cvt.rna.tf32; gid = lane >> 2, t4 = lane & 3:
-//   A [16 x 8] : a0=(gid,t4)   a1=(gid+8,t4)   a2=(gid,t4+4)   a3=(gid+8,t4+4)
-//   B [ 8 x 8] : b0=(t4,gid)   b1=(t4+4,gid)
-//   C [16 x 8] : c0=(gid,2*t4) c1=(gid,2*t4+1) c2=(gid+8,2*t4) c3=(gid+8,2*t4+1)
-
-__device__ __forceinline__ uint32_t f2tf32(float x) {
-  uint32_t r;
-  asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
-  return r;
+// Bytes of a 16-byte cp.async chunk that hold data; the rest is zero-filled.
+__device__ __forceinline__ int cp_bytes16(int nb) {
+  if (nb > 16) nb = 16;
+  if (nb < 0) nb = 0;
+  return nb;
 }
 
-// bf16 is the top 16 bits of fp32 and TF32 keeps 19, so bf16 -> TF32 is a shift.
-template <typename T>
-__device__ __forceinline__ uint32_t to_tf32(T x) {
-  return f2tf32(to_f32(x));
-}
-template <>
-__device__ __forceinline__ uint32_t to_tf32<c10::BFloat16>(c10::BFloat16 x) {
-  return static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(&x)) << 16;
-}
-
-__device__ __forceinline__ void mma_m16n8k8_tf32(float (&d)[4], const uint32_t (&a)[4],
-                                                 const uint32_t (&b)[2]) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-}
-
-// cp.async copies global -> shared without registers; src_bytes < 16 zero-fills the rest.
-__device__ __forceinline__ void cp_async16(void* dst, const void* src, int src_bytes) {
-  const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
-               :
-               : "r"(s), "l"(src), "r"(src_bytes)
-               : "memory");
-}
-__device__ __forceinline__ void cp_async_fence() {
-  asm volatile("cp.async.commit_group;\n" ::: "memory");
-}
-__device__ __forceinline__ void cp_async_wait_all() {
-  asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+// Stage `rows` rows of two tiles with 16-byte cp.async; (row, chunk) advances without division.
+// src(row, d, a, b) sets both sources and returns the bytes to copy, in [0, 16].
+template <typename T, typename Src>
+__device__ __forceinline__ void cp_async_rows16(T* dA, T* dB, int pitch, int rows, int DP,
+                                                int tid, int NT, Src src) {
+  constexpr int kVec = cp_vec<T>();
+  const int cpr = DP / kVec;
+  const int adv_r = NT / cpr, adv_d = NT - (NT / cpr) * cpr;
+  int r = tid / cpr, dc = tid - (tid / cpr) * cpr;
+  for (int c = tid; c < rows * cpr; c += NT) {
+    const int d = dc * kVec;
+    const T* a;
+    const T* b;
+    const int nb = src(r, d, a, b);
+    cp_async16(&dA[r * pitch + d], a, nb);
+    cp_async16(&dB[r * pitch + d], b, nb);
+    dc += adv_d;
+    r += adv_r;
+    if (dc >= cpr) { dc -= cpr; ++r; }
+  }
+  cp_async_fence();
+  cp_async_wait_all();
 }
 
-// Round a shared-memory cursor up to 16 bytes, as cp.async needs aligned source and destination.
-template <typename T>
-__device__ __forceinline__ T* align16(void* p) {
-  return reinterpret_cast<T*>((reinterpret_cast<uintptr_t>(p) + 15u) & ~static_cast<uintptr_t>(15));
+// Element-wise fallback of cp_async_rows16: load(row, d, a, b) sets the values it has (else 0).
+template <typename T, typename Load>
+__device__ __forceinline__ void copy_rows(T* dA, T* dB, int pitch, int rows, int DP, int tid,
+                                          int NT, Load load) {
+  for (int idx = tid; idx < rows * DP; idx += NT) {
+    const int r = idx / DP;
+    const int d = idx - r * DP;
+    float a = 0.f, b = 0.f;
+    load(r, d, a, b);
+    dA[r * pitch + d] = from_f32<T>(a);
+    dB[r * pitch + d] = from_f32<T>(b);
+  }
 }
 
-// Elements per 16-byte cp.async chunk.
-template <typename T> __host__ __device__ constexpr int cp_vec() { return 16 / sizeof(T); }
+// CSR bucket of KV block `bid`: groups[gbase + e] for e < total_q / G list its query groups.
+struct CsrBucket {
+  int64_t gbase;
+  int64_t total_q;
+};
+__device__ __forceinline__ CsrBucket csr_bucket(const int32_t* offsets, int64_t off_sb,
+                                                int64_t off_sh, int64_t groups_sb,
+                                                int64_t groups_sh, int b, int h, int bid, int G) {
+  const int64_t obase = static_cast<int64_t>(b) * off_sb + static_cast<int64_t>(h) * off_sh;
+  const int start = offsets[obase + bid];
+  const int cnt = offsets[obase + bid + 1] - start;
+  return CsrBucket{
+      static_cast<int64_t>(b) * groups_sb + static_cast<int64_t>(h) * groups_sh + start,
+      static_cast<int64_t>(cnt) * G};
+}
+
+// Stage index, chunk, LSE and delta of the nq bucket queries starting at flat query qt.
+__device__ __forceinline__ void stage_bucket_queries(
+    const int32_t* groups, int64_t gbase, int64_t qt, int nq, int BQ, int G, int chunk_size,
+    const Strided3<const float>& lse, const Strided3<const float>& delta, int b, int h, int tid,
+    int NT, int* sQidx, int* sQchunk, float* sLse, float* sDel) {
+  for (int i = tid; i < BQ; i += NT) {
+    int m = -1, qc = 0;
+    float l = kNegInf, dl = 0.f;
+    if (i < nq) {
+      const int64_t f = qt + i;
+      const int64_t e = f / G;
+      const int gid = groups[gbase + e];
+      m = static_cast<int>(static_cast<int64_t>(gid) * G + (f - e * G));
+      qc = static_cast<int>((static_cast<int64_t>(gid) * G) / chunk_size);
+      l = *lse.at(b, h, m);
+      dl = *delta.at(b, h, m);
+    }
+    sQidx[i] = m;
+    sQchunk[i] = qc;
+    sLse[i] = l;
+    sDel[i] = dl;
+  }
+}
 
 // cp.async staging needs D fastest, strides multiples of the chunk, and a 16-byte aligned base.
 __host__ inline bool cp_async_ok(const at::Tensor& t, int vec) {
@@ -307,21 +338,12 @@ __host__ inline TilePlan plan_dkv(int D, int block_size) {
   return TilePlan{tkv, bq, dkv_smem_bytes(pitch, tkv, bq)};
 }
 
-// Row pitch for MMA tiles: P % 16 == 8 keeps k-major fragment loads conflict free.
-// Row pitch for a tile read as an mma A fragment: conflict-free iff pitch % 8 == 4.
-__host__ __device__ inline int mma_pitch_a(int n) {
-  int p = ((n + 7) & ~7) + 4;
-  return p;
-}
-// Number of 8-wide dim tiles the warp-private dQ accumulator carries (template value).
-__host__ __device__ inline int dq_dn_for(int D) {
-  return (D <= 64) ? 8 : (D <= 96) ? 12 : 16;
-}
 // The warp-private dQ kernel needs 32 <= D <= 128 (accumulator in registers) and G >= 8.
 __host__ inline bool dq_wmma_eligible(int G, int D) {
   return G >= 8 && D >= 32 && D <= 128;   // G >= 8: see dq_mma_profitable below
 }
 
+// Row pitch for MMA tiles: P % 16 == 8 keeps k-major fragment loads conflict free.
 __host__ __device__ inline int mma_pitch(int n) {
   int p = n + 8;
   if ((p & 15) != 8) p += 8;

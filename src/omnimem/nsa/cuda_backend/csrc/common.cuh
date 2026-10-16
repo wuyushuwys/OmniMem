@@ -23,7 +23,11 @@
 #include <cstdint>
 #include <limits>
 
+#include "warp_scan.cuh"
+
 namespace omnimem_nsa {
+
+using omnimem_cuda::warp_inclusive_scan;
 
 constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 constexpr float kLog2e = 1.4426950408889634f;
@@ -228,6 +232,153 @@ inline Precision parse_precision(c10::string_view s) {
 // Returns the current stream for tensor t's device (respects torch.cuda.stream()).
 inline cudaStream_t current_stream(const at::Tensor& t) {
   return at::cuda::getCurrentCUDAStream(t.device().index()).stream();
+}
+
+// Smallest pitch >= n with pitch % 8 == 4: conflict free for lane-indexed rows and mma A fragments.
+__host__ __device__ __forceinline__ int pitch_4mod8(int n) { return ((n + 7) & ~7) + 4; }
+
+// 8-wide dim tiles of a register accumulator for 32 <= D <= 128 (template value).
+__host__ __device__ __forceinline__ int dn_tiles(int D) {
+  return (D <= 64) ? 8 : (D <= 96) ? 12 : 16;
+}
+
+#define OMNIMEM_DISPATCH_DN(D, ...)                                        \
+  [&] {                                                                    \
+    if ((D) <= 64) { constexpr int DN_MAX = 8; return __VA_ARGS__(); }     \
+    if ((D) <= 96) { constexpr int DN_MAX = 12; return __VA_ARGS__(); }    \
+    { constexpr int DN_MAX = 16; return __VA_ARGS__(); }                   \
+  }()
+
+// TF32 mma.m16n8k8 (sm_80+), operands rounded with cvt.rna.tf32; gid = lane >> 2, t4 = lane & 3:
+//   A [16 x 8] : a0=(gid,t4)   a1=(gid+8,t4)   a2=(gid,t4+4)   a3=(gid+8,t4+4)
+//   B [ 8 x 8] : b0=(t4,gid)   b1=(t4+4,gid)
+//   C [16 x 8] : c0=(gid,2*t4) c1=(gid,2*t4+1) c2=(gid+8,2*t4) c3=(gid+8,2*t4+1)
+
+__device__ __forceinline__ uint32_t f2tf32(float x) {
+  uint32_t r;
+  asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
+  return r;
+}
+
+// bf16 is the top 16 bits of fp32 and TF32 keeps 19, so bf16 -> TF32 is a shift.
+template <typename T>
+__device__ __forceinline__ uint32_t to_tf32(T x) {
+  return f2tf32(to_f32(x));
+}
+template <>
+__device__ __forceinline__ uint32_t to_tf32<c10::BFloat16>(c10::BFloat16 x) {
+  return static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(&x)) << 16;
+}
+
+__device__ __forceinline__ void mma_m16n8k8_tf32(float (&d)[4], const uint32_t (&a)[4],
+                                                 const uint32_t (&b)[2]) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// Remap an mma C fragment to the A fragment of the next mma, rounded to TF32 (t4 = lane & 3).
+__device__ __forceinline__ void c_to_a_tf32(const float (&c)[4], int lane, int t4,
+                                            uint32_t (&a)[4]) {
+  const int s1 = (lane & ~3) + (t4 >> 1), s2 = s1 + 2;
+  const bool odd = (t4 & 1) != 0;
+  const float x0 = __shfl_sync(0xffffffffu, c[0], s1);
+  const float x1 = __shfl_sync(0xffffffffu, c[1], s1);
+  const float y0 = __shfl_sync(0xffffffffu, c[2], s1);
+  const float y1 = __shfl_sync(0xffffffffu, c[3], s1);
+  const float z0 = __shfl_sync(0xffffffffu, c[0], s2);
+  const float z1 = __shfl_sync(0xffffffffu, c[1], s2);
+  const float w0 = __shfl_sync(0xffffffffu, c[2], s2);
+  const float w1 = __shfl_sync(0xffffffffu, c[3], s2);
+  a[0] = f2tf32(odd ? x1 : x0);
+  a[1] = f2tf32(odd ? y1 : y0);
+  a[2] = f2tf32(odd ? z1 : z0);
+  a[3] = f2tf32(odd ? w1 : w0);
+}
+
+// cp.async copies global -> shared without registers; src_bytes < 16 zero-fills the rest.
+__device__ __forceinline__ void cp_async16(void* dst, const void* src, int src_bytes) {
+  const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+               :
+               : "r"(s), "l"(src), "r"(src_bytes)
+               : "memory");
+}
+__device__ __forceinline__ void cp_async_fence() {
+  asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+__device__ __forceinline__ void cp_async_wait_all() {
+  asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+}
+
+// Round a shared-memory cursor up to 16 bytes, as cp.async needs aligned source and destination.
+template <typename T>
+__device__ __forceinline__ T* align16(void* p) {
+  return reinterpret_cast<T*>((reinterpret_cast<uintptr_t>(p) + 15u) & ~static_cast<uintptr_t>(15));
+}
+
+// Elements per 16-byte cp.async chunk.
+template <typename T> __host__ __device__ constexpr int cp_vec() { return 16 / sizeof(T); }
+
+// Tokens of a block a query chunk may see; chunk-causal visibility is a prefix of the block.
+template <typename T>
+__device__ __forceinline__ int visible_prefix(const BlockView<T>& bx, int q_chunk, int chunk_size) {
+  if (bx.token0 < 0) return bx.n_valid;
+  const int64_t lim = static_cast<int64_t>(q_chunk + 1) * chunk_size - bx.token0;
+  if (lim <= 0) return 0;
+  return (lim < bx.n_valid) ? static_cast<int>(lim) : bx.n_valid;
+}
+
+// Advances t to the first block in [t, Tb) with visible tokens (bv / vis describe it).
+template <typename T, typename ACC>
+__device__ __forceinline__ bool find_visible(const ACC& acc, int b, int g, int h, int Tb,
+                                             int q_chunk, int chunk_size, int& t,
+                                             BlockView<T>& bv, int& vis) {
+  for (; t < Tb; ++t) {
+    bv = acc.block(b, g, h, t, q_chunk);
+    vis = bv.valid() ? visible_prefix(bv, q_chunk, chunk_size) : 0;
+    if (vis > 0) return true;
+  }
+  return false;
+}
+
+// This thread's (row, chunk) in a CTA-wide copy of `cpr` chunks per row, decoded once.
+struct RowChunk {
+  int rpp;     // rows per pass; 0 when a row has more chunks than the CTA has threads
+  int row;     // first row of this thread (`tile` for idle tail threads)
+  int chunk;
+};
+__device__ __forceinline__ RowChunk row_chunk(int cpr, int tile) {
+  const int rpp = (cpr > 0 && cpr <= static_cast<int>(blockDim.x))
+                      ? static_cast<int>(blockDim.x) / cpr : 0;
+  const int crow = (rpp > 0) ? static_cast<int>(threadIdx.x) / cpr : 0;
+  const int cchunk = (rpp > 0) ? static_cast<int>(threadIdx.x) - crow * cpr : 0;
+  return RowChunk{rpp, (rpp > 0 && crow < rpp) ? crow : tile, cchunk};
+}
+
+// Query group served by slot gs: an optional argsort of the first selected block, for L2 reuse.
+__device__ __forceinline__ int group_of(const int32_t* __restrict__ order, int64_t s0, int64_t s1,
+                                        int64_t s2, int b, int gs, int h) {
+  return (order == nullptr) ? gs
+                            : order[static_cast<int64_t>(b) * s0 + static_cast<int64_t>(gs) * s1 +
+                                    static_cast<int64_t>(h) * s2];
+}
+// group_of(blockIdx.x); reading blockIdx.x in each branch keeps the forward kernels' codegen.
+__device__ __forceinline__ int cta_group(const int32_t* __restrict__ order, int64_t s0, int64_t s1,
+                                         int64_t s2, int b, int h) {
+  return (order == nullptr) ? static_cast<int>(blockIdx.x)
+                            : order[b * s0 + static_cast<int64_t>(blockIdx.x) * s1 + h * s2];
+}
+// Host side of group_of's (order, s0, s1, s2) kernel arguments.
+struct GroupOrder {
+  const int32_t* p;
+  int64_t s0, s1, s2;
+};
+inline GroupOrder make_group_order(const at::Tensor& order) {
+  if (!order.defined()) return GroupOrder{nullptr, 0, 0, 0};
+  return GroupOrder{order.data_ptr<int32_t>(), order.stride(0), order.stride(1), order.stride(2)};
 }
 
 }  // namespace omnimem_nsa

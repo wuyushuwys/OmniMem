@@ -15,7 +15,7 @@ EXTENSION = Extension(
     what="block-KV CUDA extension",
     sources=("block_kv_bindings.cpp", "block_kv_gather.cu", "block_kv_range.cu",
              "block_kv_dedup.cu"),
-    headers=("block_kv_ops.h", "block_kv_common.cuh"),
+    headers=("block_kv_ops.h", "block_kv_common.cuh", "warp_scan.cuh"),
     cuda_cflags=("-O3", "-std=c++17", "-lineinfo"),
     python_module=True,
     error=BlockKVBackendError,
