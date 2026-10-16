@@ -19,6 +19,7 @@ from omnimem.utils.torch_utils import (
     resume_dcp_checkpoint,
 )
 from omnimem.utils.misc import (
+    init_gate_on_all_ranks,
     unwrap_model,
     is_main_process,
 )
@@ -84,14 +85,8 @@ class WanNSASelfForcingTrainer(SelfForcingCheckpointMixin, WanSelfForcingTrainer
             **self.nsa_kwargs
         )
         if self.enable_gate_init:
-            self.logger.info("Initialize g_proj weights and boardcast")
-            model.init_gate()
-            if dist.is_initialized():
-                for name, p in model.named_parameters():
-                    if 'g_proj' in name:
-                        broadcast_value = p.data.to(self.device)
-                        dist.broadcast(broadcast_value, src=0)
-                        p.data.copy_(broadcast_value.to(p.device))
+            self.logger.info("Initialize g_proj weights and broadcast them from rank 0")
+            init_gate_on_all_ranks(model, self.device)
 
         if self.adapter and self.adapter.get("type") == "lora":
             model = configure_lora_for_model(

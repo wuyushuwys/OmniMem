@@ -2,7 +2,6 @@ import math
 
 import torch
 import torch.nn.functional as F
-import torch.distributed as dist
 from torch.optim.lr_scheduler import LRScheduler
 
 
@@ -19,6 +18,7 @@ from omnimem.utils.meter import TimerMeter
 from omnimem.evaluate import evaluation_wan
 from omnimem.utils.misc import (
     clip_grad_norm,
+    init_gate_on_all_ranks,
     reduce_dict,
     unwrap_model,
 )
@@ -70,13 +70,7 @@ class WanCausalNSATrainer(WanCausalTrainer):
             **self.nsa_kwargs
         )
         if not self.preserve_pretrained_gate:
-            model.init_gate()
-            if dist.is_initialized():
-                for name, parameter in model.named_parameters():
-                    if 'g_proj' in name:
-                        tensor = parameter.detach().to(self.device)
-                        dist.broadcast(tensor, src=0)
-                        parameter.data.copy_(tensor.to(parameter.device))
+            init_gate_on_all_ranks(model, self.device)
 
         return model
 
