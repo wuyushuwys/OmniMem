@@ -9,12 +9,12 @@ import dataclasses
 import json
 import logging
 import os
-import re
 import sys
 import time
 import warnings
 
 from omnimem.utils.streaming_recipe import Recipe
+from omnimem.utils.validation_prompts import PROMPT_ID, parse_jsonl, read_prompt_lines
 
 warnings.filterwarnings("ignore")
 # omnimem's logger forces root handlers to ERROR; keep our progress on a private logger.
@@ -53,16 +53,17 @@ def timing_summary(timings, frames_delivered: int) -> str:
 
 def load_prompt_file(path: str) -> list:
     """Requests of a prompt file: (name, prompt, switch_prompts, switch_frame_indices) per line."""
-    with open(path, encoding="utf-8") as f:
-        lines = [line.strip() for line in f if line.strip()]
-    if not lines:
+    if path.endswith(".jsonl"):
+        with open(path, encoding="utf-8") as f:
+            records = parse_jsonl(f.read(), path)
+    else:
+        records = [{"prompts": [line]} for line in read_prompt_lines(path)]
+    if not records:
         raise ValueError(f"{path} contains no prompts")
-    if not path.endswith(".jsonl"):
-        return [(f"prompt-{i:03d}", line, None, None) for i, line in enumerate(lines)]
     requests = []
-    for i, record in enumerate(map(json.loads, lines)):
+    for i, record in enumerate(records):
         name, prompts = record.get("id", f"prompt-{i:03d}"), record.get("prompts")
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) or name in {r[0] for r in requests}:
+        if not PROMPT_ID.fullmatch(name) or name in {r[0] for r in requests}:
             raise ValueError(f"{path}: ids must be unique file names, got {name!r}")
         if not isinstance(prompts, list) or not prompts:
             raise ValueError(f"{path}: {name} needs a nonempty prompts list")

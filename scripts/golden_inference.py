@@ -13,7 +13,6 @@ Example:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import platform
@@ -50,14 +49,6 @@ SPEC_KEYS_COMPARED = ("gpus", "kv_tier", "nframes", "seed", "lru_max_size", "com
 
 
 # ----------------------------------------------------------------------------- helpers
-def _sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for blk in iter(lambda: f.read(1 << 24), b""):
-            h.update(blk)
-    return h.hexdigest()
-
-
 def _git_head(repo: str) -> Optional[str]:
     try:
         return subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip()
@@ -385,7 +376,23 @@ def _run_checks(res, args, label: str) -> list:
     return problems
 
 
+def run_repeats(rt, spec, args, work: Path, tag: str, on_run) -> list:
+    """Run the request ``--repeat`` times, ``on_run(i, res, wall, payload)`` after each; returns the check problems."""
+    problems = []
+    for i in range(max(1, args.repeat)):
+        res, wall = run_once(rt, spec, work, f"{tag}_r{i}")
+        on_run(i, res, wall, payload_from_result(res))
+        # EVERY repeat is checked: a single final-run check hides a first-run-only
+        # whole-chunk reload or a repeat that never fetched a block.
+        rp = _run_checks(res, args, f"r{i}")
+        for msg in rp:
+            print(f"[golden] FAIL {msg}", flush=True)
+        problems.extend(rp)
+    return problems
+
+
 def cmd_record(args) -> int:
+    from omnimem.pipelines.streaming_inference import file_sha256
     gdir = Path(args.golden_dir)
     rt = make_runtime(args)      # a refused request exits here: nothing is written yet
     gdir.mkdir(parents=True, exist_ok=True)
@@ -394,21 +401,16 @@ def cmd_record(args) -> int:
     spec = request_spec(args)
     print(f"[golden] record {spec} load_s={load_s:.1f}", flush=True)
     runs, payloads = [], []
-    problems: list = []
-    for i in range(max(1, args.repeat)):
-        res, wall = run_once(rt, spec, work, f"record_r{i}")
-        payloads.append(payload_from_result(res))
+
+    def on_run(i, res, wall, payload):
+        payloads.append(payload)
         runs.append({"repeat": i, "wall_s": wall, **_stats_of(res)})
         print(f"[golden] run r{i}: wall={wall:.2f}s total_s={res.timings.get('total_s'):.2f} "
               f"first_frames={res.timings.get('first_frames_delivered_s')} "
               f"reload_bytes={(res.cache_stats or {}).get('bytes')} "
               f"block_h2d_bytes={(res.cache_stats or {}).get('block_h2d_bytes')}", flush=True)
-        # EVERY repeat is checked: a single final-run check hides a first-run-only
-        # whole-chunk reload or a repeat that never fetched a block.
-        rp = _run_checks(res, args, f"r{i}")
-        for msg in rp:
-            print(f"[golden] FAIL {msg}", flush=True)
-        problems.extend(rp)
+
+    problems = run_repeats(rt, spec, args, work, "record", on_run)
     repeat_cmp = [compare_payloads(payloads[0], p, check_trace=spec["trace"]) for p in payloads[1:]]
     for i, c in enumerate(repeat_cmp, start=1):
         _print_summary(f"repeat r{i} vs r0", c)
@@ -423,7 +425,7 @@ def cmd_record(args) -> int:
         "assets": {k: getattr(args, k) for k in ASSET_ARGS},
         "load_s": load_s, "load_info": _jsonable(load_info), "runs": runs,
         "repeat_exact": [c["exact"] for c in repeat_cmp], "repeat_compare": repeat_cmp,
-        "golden_sha256": _sha256_file(gdir / "golden.pt"), "env": _env_info(),
+        "golden_sha256": file_sha256(gdir / "golden.pt"), "env": _env_info(),
         "latent_shape": list(payloads[0]["latents"].shape), "frames_shape": list(payloads[0]["frames"].shape),
         "selection_calls": None if payloads[0]["selection_trace"] is None else len(payloads[0]["selection_trace"]),
         "problem": problem, "problems": problems,
@@ -462,22 +464,17 @@ def cmd_compare(args) -> int:
         spec["switch_prompts"], spec["switch_frame_indices"] = gspec["switch_prompts"], gspec["switch_frame_indices"]
     work = Path(args.work_dir) if args.work_dir else gdir / "work"
     results = []
-    problems: list = []
-    for i in range(max(1, args.repeat)):
-        res, wall = run_once(rt, spec, work, f"compare_{args.tag}_r{i}")
-        p = payload_from_result(res)
+
+    def on_run(i, res, wall, payload):
         # Trace on (no --no_trace) means BOTH sides must have a trace and it must match:
         # a golden without one is a failure with a reason, not a silent skip.
-        c = compare_payloads(golden, p, check_trace=spec["trace"])
+        c = compare_payloads(golden, payload, check_trace=spec["trace"])
         _print_summary(f"{args.tag} r{i} vs golden", c)
         results.append({"repeat": i, "wall_s": wall, "compare": c, **_stats_of(res)})
-        # EVERY repeat is checked, not just the last one.
-        rp = _run_checks(res, args, f"r{i}")
-        for msg in rp:
-            print(f"[golden] FAIL {msg}", flush=True)
-        problems.extend(rp)
         if args.save_run:
-            torch.save(p, gdir / f"run_{args.tag or 'run'}_r{i}.pt")
+            torch.save(payload, gdir / f"run_{args.tag or 'run'}_r{i}.pt")
+
+    problems = run_repeats(rt, spec, args, work, f"compare_{args.tag}", on_run)
     problem = "; ".join(problems) if problems else None
     report = {"kind": "compare", "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tag": args.tag,
               "golden_dir": str(gdir), "golden_sha256": gman.get("golden_sha256"), "spec": spec,

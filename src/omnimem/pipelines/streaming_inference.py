@@ -5,6 +5,7 @@ Shared by ``inference_single_gpu.py``, ``inference_dual_gpu.py`` and
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import shutil
@@ -31,7 +32,7 @@ from omnimem.utils.stage_marks import StageMarks
 from omnimem.utils.streaming_recipe import DEFAULT_BLOCK_POOL_GB, DEFAULT_BLOCK_SCRATCH_GB, Recipe
 from omnimem.utils.streaming_video_writer import StreamingVideoWriter
 from omnimem.utils.torch_utils import indexed_device
-from omnimem.utils.validation_prompts import validate_prompt_schedules
+from omnimem.utils.validation_prompts import decoded_frames, latent_frames, validate_prompt_schedules
 
 
 def _block_store_device_bytes(store_cfg: dict) -> int:
@@ -56,12 +57,8 @@ class ModelPaths:
 VAE_SPATIAL_STRIDE = 8
 
 
-def latent_frames(nframes: int, temporal_stride: int = 4) -> int:
-    return (nframes - 1) // temporal_stride + 1
-
-
 def actual_frames(nframes: int, temporal_stride: int = 4) -> int:
-    return 1 + temporal_stride * (latent_frames(nframes, temporal_stride) - 1)
+    return decoded_frames(latent_frames(nframes, temporal_stride), temporal_stride)
 
 
 def validate_request(nframes: int, frame_per_block: int, *,
@@ -815,7 +812,6 @@ class StreamingRuntime:
 
 
 def _hash_tensor(t: torch.Tensor) -> str:
-    import hashlib
     return hashlib.sha256(t.cpu().contiguous().numpy().tobytes()).hexdigest()[:16]
 
 
@@ -841,6 +837,15 @@ def compare_frames(a: np.ndarray, b: np.ndarray) -> Dict[str, Any]:
     first = int(np.argmax(per_frame_max > 0)) if per_frame_max.max() > 0 else None
     return {"exact": bool(d.max() == 0), "max_abs": int(d.max()), "mean_abs": float(d.mean()),
             "psnr_db": psnr, "first_mismatch_frame": first, "frames": int(a.shape[0])}
+
+
+def file_sha256(path) -> str:
+    """Hex SHA-256 of a file, read in 16 MiB blocks."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for blk in iter(lambda: f.read(1 << 24), b""):
+            digest.update(blk)
+    return digest.hexdigest()
 
 
 def git_info(repo: str) -> Dict[str, str]:

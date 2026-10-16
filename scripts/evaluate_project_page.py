@@ -4,26 +4,18 @@ import argparse
 from datetime import datetime, timezone
 from fractions import Fraction
 import gc
-import hashlib
 import json
 import math
 import os
 from pathlib import Path
-import re
 import time
 import traceback
+
+from omnimem.utils.validation_prompts import PROMPT_ID, decoded_frames
 
 
 def timestamp():
     return datetime.now(timezone.utc).isoformat()
-
-
-def file_sha256(path):
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def atomic_json(path, value):
@@ -59,7 +51,7 @@ def timing_plan(record, fps=16, block=3):
     actual_frames = [4 * p - 3 for p in positions]
     return {
         "declared_duration_seconds": seconds, "fps": fps,
-        "export_frames": export_frames, "generated_frames": 4 * (latent_frames - 1) + 1,
+        "export_frames": export_frames, "generated_frames": decoded_frames(latent_frames),
         "latent_frames": latent_frames, "frame_per_block": block,
         "requested_switch_times_seconds": switches, "switch_latent_indices": positions,
         "first_affected_rgb_frame_indices": actual_frames,
@@ -81,7 +73,7 @@ def load_records(path, selected):
     seen = set()
     for record in records:
         name = record["id"]
-        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) or name in seen:
+        if not isinstance(name, str) or not PROMPT_ID.fullmatch(name) or name in seen:
             raise ValueError(f"Example IDs must be unique filesystem-safe names: {name!r}")
         seen.add(name)
     if selected and not set(selected).issubset(seen):
@@ -178,6 +170,7 @@ def main():
         torch.cuda.set_device(local_rank)
         from omnimem.utils.numa_bind import bind_to_gpu_numa
         from omnimem.pipelines import CausalWanT2VPipeline
+        from omnimem.pipelines.streaming_inference import file_sha256
         import inspect
 
         bind_to_gpu_numa()

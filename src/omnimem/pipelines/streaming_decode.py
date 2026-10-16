@@ -14,6 +14,7 @@ import torch
 
 from omnimem.utils.stage_marks import StageMarks
 from omnimem.utils.torch_utils import indexed_device
+from omnimem.utils.validation_prompts import decoded_frames
 
 __all__ = [
     "LatentChunk",
@@ -69,7 +70,7 @@ def output_frames_for_latents(num_latents: int, first_chunk: bool) -> int:
     """Wan VAE temporal rule: first latent -> 1 frame, every later latent -> 4 frames."""
     if num_latents <= 0:
         return 0
-    return 1 + 4 * (num_latents - 1) if first_chunk else 4 * num_latents
+    return decoded_frames(num_latents) if first_chunk else 4 * num_latents
 
 
 def rgb_uint8_from_decoded(video: torch.Tensor) -> torch.Tensor:

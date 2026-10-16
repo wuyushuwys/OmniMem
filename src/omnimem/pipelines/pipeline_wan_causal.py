@@ -28,6 +28,7 @@ from omnimem.utils.train_utils import pred_x0
 from omnimem.pipelines.utils import masks_like
 from omnimem.utils.train_utils import vae_encode
 from omnimem.utils.logging_tool import get_logger
+from omnimem.utils.validation_prompts import latent_frames
 from omnimem.models.text_encoders.t5 import T5EncoderModel
 from omnimem.pipelines import compile_state
 from omnimem.pipelines.streaming_decode import (
@@ -357,7 +358,7 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
 
         # preprocess
         F = frame_num
-        target_shape = (self.vae.z_dim, (F - 1) // self.vae_stride[0] + 1,
+        target_shape = (self.vae.z_dim, latent_frames(F, self.vae_stride[0]),
                         size[1] // self.vae_stride[1],
                         size[0] // self.vae_stride[2])
 
@@ -671,8 +672,19 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
             gate_data = {}
             switch_idx = 0
             switch_frame_indices_sorted = sorted(switch_frame_indices) if switch_frame_indices else []
-            chunks_since_evict_cond = 0
-            chunks_since_evict_uncond = 0
+            # Chunks since the last offload flush of the cond / uncond cache ('chunk_lru').
+            chunks_since_evict = [0, 0]
+
+            def release_history(i, cache):
+                """'block_lru' retires the completed history; 'chunk_lru' flushes evictions every evict_every_k_chunks."""
+                if block_policy:
+                    cache.retire_completed_history()
+                    return
+                chunks_since_evict[i] += 1
+                if enable_kv_evict and chunks_since_evict[i] >= evict_every_k_chunks:
+                    cache.flush_offload()
+                    chunks_since_evict[i] = 0
+
             torch.cuda.synchronize(dit_device)
             t0 = time.perf_counter()
             with self.progress_bar(total=math.ceil(num_frames / frame_per_block)) as progress_bar:
@@ -835,14 +847,7 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
                         start_frame=start_frame,
                         kv_cache=kv_cache,
                     )
-                    if block_policy:
-                        # 'block_lru': retire completed history outside sink/window at each chunk.
-                        kv_cache.retire_completed_history()
-                    else:
-                        chunks_since_evict_cond += 1
-                        if enable_kv_evict and chunks_since_evict_cond >= evict_every_k_chunks:
-                            kv_cache.flush_offload()
-                            chunks_since_evict_cond = 0
+                    release_history(0, kv_cache)
 
                     if guide_scale > 1:
                         set_selection_trace_context(chunk=start_frame // frame_per_block,
@@ -855,13 +860,7 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
                             start_frame=start_frame,
                             kv_cache=kv_cache_uncond,
                         )
-                        if block_policy:
-                            kv_cache_uncond.retire_completed_history()
-                        else:
-                            chunks_since_evict_uncond += 1
-                            if enable_kv_evict and chunks_since_evict_uncond >= evict_every_k_chunks:
-                                kv_cache_uncond.flush_offload()
-                                chunks_since_evict_uncond = 0
+                        release_history(1, kv_cache_uncond)
 
                     _block_rate = None
                     if block_policy:
