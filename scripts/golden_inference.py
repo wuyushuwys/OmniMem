@@ -139,7 +139,7 @@ def build_recipe(args):
 
 def resolve_layout(args) -> None:
     """Resolve ``args.dit_device`` / ``args.decode_device`` to indexed devices."""
-    from omnimem.pipelines.streaming_decode import indexed_device
+    from omnimem.utils.torch_utils import indexed_device
     from omnimem.pipelines.streaming_inference import check_layout
 
     try:

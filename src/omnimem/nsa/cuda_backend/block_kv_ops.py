@@ -4,6 +4,7 @@ from __future__ import annotations
 import torch
 
 from omnimem.nsa.backend import BlockKVBackendError
+from omnimem.utils.torch_utils import indexed_device
 from . import _block_kv_loader
 
 __all__ = ["gather_publish_clear", "block_range", "dedup_run",
@@ -75,10 +76,8 @@ _warmed: set = set()
 @torch.compiler.disable()
 def warmup(device) -> int:
     """Launch every kernel variant once on tiny private tensors; idempotent per device."""
-    device = torch.device(device)
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    device = torch.device(device.type, index)
-    key = (device.type, index)
+    device = indexed_device(device)
+    key = (device.type, device.index)
     if key in _warmed:
         return 0
     load()

@@ -1,7 +1,7 @@
 import json
 import os
 import copy
-from typing import Dict, Optional, Any, Type
+from typing import TYPE_CHECKING, Dict, Optional, Any, Type
 from dataclasses import dataclass
 from collections.abc import Mapping
 import torch
@@ -11,7 +11,6 @@ from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict, se
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from safetensors.torch import load_file, save_file
 
-from omnimem.models.transformers.wan_model import WanModel
 from omnimem.utils.logging_tool import get_logger
 from omnimem.utils.misc import is_main_process, wait_for_everyone, get_world_size
 
@@ -19,7 +18,18 @@ from omnimem.utils.misc import is_main_process, wait_for_everyone, get_world_siz
 from torch.distributed.tensor import DTensor
 from torch.distributed.fsdp import FSDPModule
 
+if TYPE_CHECKING:  # the models import this module
+    from omnimem.models.transformers.wan_model import WanModel
+
 logger = get_logger()
+
+
+def indexed_device(device) -> torch.device:
+    """``device`` as a :class:`torch.device` that names its GPU (``'cuda'`` != ``cuda:N``)."""
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return device
 
 
 def unsharded_param_dtype(module) -> torch.dtype:
@@ -291,7 +301,7 @@ def load_and_broadcast_diffuser(model_cls, model_name_or_path, device, **kwargs)
 
 
 def build_sharded_model(
-        module_cls: Type[WanModel],
+        module_cls: "Type[WanModel]",
         model_dir,
         fsdp_kwargs: FullyShardDistributedParallelArgs,
         module='blocks'

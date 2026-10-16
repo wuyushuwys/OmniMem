@@ -11,6 +11,7 @@ from collections import OrderedDict, deque
 import torch
 
 from omnimem.nsa.backend import resolve_block_kv_backend
+from omnimem.utils.torch_utils import indexed_device
 
 
 # Exact-size pinned host buffers (cudaHostRegister) avoid the allocator's power-of-two rounding.
@@ -28,13 +29,6 @@ def exact_pinned_kv_enabled() -> bool:
     if value == '1':
         return True
     raise ValueError(f'{EXACT_PINNED_KV_ENV} must be unset, 0 or 1, got {value!r}')
-
-
-def _cuda_device_index(device) -> int:
-    device = torch.device(device)
-    if device.type == 'cuda' and device.index is not None:
-        return device.index
-    return torch.cuda.current_device()
 
 
 class _HostRegisteredMapping(mmap.mmap):
@@ -80,8 +74,10 @@ def exact_pinned_empty(shape, dtype: torch.dtype, device='cuda') -> torch.Tensor
     )
     mapping.madvise(mmap.MADV_DONTFORK)
     flat = torch.frombuffer(mapping, dtype=dtype, count=numel)
+    device = indexed_device(device)
     # Registration page-locks and zero-fills every page up front, like cudaHostAlloc.
-    mapping._register(flat.data_ptr(), nbytes, _cuda_device_index(device))
+    mapping._register(flat.data_ptr(), nbytes,
+                      device.index if device.type == 'cuda' else torch.cuda.current_device())
     del mapping
     return flat.view(shape)
 
@@ -463,13 +459,6 @@ class MMCache(_HostCopyEvent):
     def reset_ptr_stats(self) -> None:
         self.ptr_stats = self._fresh_ptr_stats()
 
-    def _cache_device(self) -> torch.device:
-        """``self.device`` as a concrete device (``'cuda'`` -> the current ordinal)."""
-        dev = torch.device(self.device)
-        if dev.type == 'cuda' and dev.index is None:
-            dev = torch.device('cuda', torch.cuda.current_device())
-        return dev
-
     def configure_gpu_tier(self, device, budget_bytes: int = 0) -> None:
         """Enable (or disable, with ``device=None``) the peer-GPU history tier; idempotent."""
         if device is None:
@@ -481,12 +470,10 @@ class MMCache(_HostCopyEvent):
             raise ValueError(
                 "the GPU history tier and the block KV cache are mutually exclusive; "
                 "call configure_block_store(0, 0) first")
-        device = torch.device(device)
+        device = indexed_device(device)
         if device.type != 'cuda':
             raise ValueError(f"GPU tier device must be a CUDA device, got {device}")
-        if device.index is None:
-            device = torch.device('cuda', torch.cuda.current_device())
-        src = self._cache_device()
+        src = indexed_device(self.device)
         if src.type != 'cuda':
             raise ValueError(
                 f"GPU tier needs a CUDA cache device, but this cache lives on {src}")
@@ -689,7 +676,7 @@ class MMCache(_HostCopyEvent):
             chunk_len=int(chunk_len),
             max_chunks=max_chunks,
             batch=int(shape[0]),
-            device=self._cache_device(),
+            device=indexed_device(self.device),
             dtype=self.dtype,
             persistent_bytes=persistent_bytes,
             scratch_bytes=scratch_bytes,
@@ -1762,7 +1749,7 @@ class MMCache(_HostCopyEvent):
             return None
 
         # A tier chunk is on the peer GPU; torch.cat needs one device.
-        device = self._cache_device() if self._tier_bytes else None
+        device = indexed_device(self.device) if self._tier_bytes else None
 
         if name in self.chunk_per_head_types:
             H = self.num_heads
@@ -2235,7 +2222,7 @@ class MMCache(_HostCopyEvent):
 
         if evicted:
             # The D2H copies run on the cache device's current stream, not the thread's device.
-            torch.cuda.current_stream(self._cache_device()).synchronize()
+            torch.cuda.current_stream(indexed_device(self.device)).synchronize()
             self._has_cpu_chunks = True
 
     def _evict_chunk_per_head(self, li, name, chunks, wb, sb, min_gpu_chunks):

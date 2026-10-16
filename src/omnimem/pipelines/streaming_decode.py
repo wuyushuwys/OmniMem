@@ -13,9 +13,9 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 import torch
 
 from omnimem.utils.stage_marks import StageMarks
+from omnimem.utils.torch_utils import indexed_device
 
 __all__ = [
-    "indexed_device",
     "LatentChunk",
     "LatentGenerationOutput",
     "DecodedChunk",
@@ -29,14 +29,6 @@ __all__ = [
     "StreamingSession",
     "SessionResult",
 ]
-
-
-def indexed_device(device) -> torch.device:
-    """``device`` as a :class:`torch.device` that names its GPU (``'cuda'`` != ``cuda:N``)."""
-    device = torch.device(device)
-    if device.type == "cuda" and device.index is None:
-        return torch.device("cuda", torch.cuda.current_device())
-    return device
 
 
 @dataclass

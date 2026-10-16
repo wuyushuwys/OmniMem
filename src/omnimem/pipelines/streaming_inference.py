@@ -25,10 +25,10 @@ from omnimem.pipelines.streaming_decode import (
     StreamingSession,
     WanChunkDecoder,
     decoder_thread_streams,
-    indexed_device,
 )
 from omnimem.utils.stage_marks import StageMarks
 from omnimem.utils.streaming_video_writer import StreamingVideoWriter
+from omnimem.utils.torch_utils import indexed_device
 from omnimem.utils.validation_prompts import validate_prompt_schedules
 
 

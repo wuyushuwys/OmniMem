@@ -7,6 +7,8 @@ import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
+from omnimem.utils.torch_utils import indexed_device
+
 from .attention import attention 
 
 __all__ = [
@@ -50,13 +52,6 @@ _ROPE_TABLE_CACHE = {}
 _ROPE_TABLE_CACHE_ENABLED = True
 
 
-def _normalized_device_key(device):
-    dev = torch.device(device)
-    if dev.type == 'cuda' and dev.index is None:
-        dev = torch.device('cuda', torch.cuda.current_device())
-    return dev.type, dev.index
-
-
 def build_rope_table_uncached(dim: int, num_heads: int, device) -> torch.Tensor:
     """The original ``get_rope_params`` body, with no memoisation."""
     d = dim // num_heads
@@ -70,7 +65,8 @@ def build_rope_table_uncached(dim: int, num_heads: int, device) -> torch.Tensor:
 @torch.compiler.disable()
 def build_rope_table(dim: int, num_heads: int, device) -> torch.Tensor:
     """Memoised RoPE frequency table for (dim, num_heads, device); read-only."""
-    key = (int(dim), int(num_heads)) + _normalized_device_key(device)
+    device = indexed_device(device)
+    key = (int(dim), int(num_heads), device.type, device.index)
     cached = _ROPE_TABLE_CACHE.get(key)
     if cached is not None:
         return cached
