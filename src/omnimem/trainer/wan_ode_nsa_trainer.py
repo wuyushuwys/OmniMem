@@ -1,10 +1,10 @@
 import torch
-import torch.distributed as dist
 from torch.optim.lr_scheduler import LRScheduler
 
 from omnimem.models.transformers.causal_wan_nsa_model import CausalWanNSAModel, CausalWanNSAttentionBlock
 from omnimem.utils.torch_utils import load_and_broadcast_diffuser
 from omnimem.utils.meter import TimerMeter
+from omnimem.utils.misc import init_gate_on_all_ranks
 
 from omnimem.trainer.wan_ode_trainer import WanODETrainer
 
@@ -37,11 +37,7 @@ class WanNSAODETrainer(WanODETrainer):
         )
         # NSA checkpoints already contain trained gates. Keep them when finetuning.
         if not self.preserve_pretrained_gate:
-            model.init_gate()
-            if dist.is_initialized():
-                for name, p in model.named_parameters():
-                    if 'g_proj' in name:
-                        dist.broadcast(p.data.to(self.device), src=0)
+            init_gate_on_all_ranks(model, self.device)
 
         if self.train_gate_only:
             for name, p in model.named_parameters():
