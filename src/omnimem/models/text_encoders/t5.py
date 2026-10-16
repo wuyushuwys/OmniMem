@@ -451,12 +451,16 @@ class T5EncoderModel:
         self,
         text_len,
         dtype=torch.bfloat16,
-        device=torch.cuda.current_device(),
+        device=None,
         checkpoint_path=None,
         tokenizer_path=None,
         shard_fn=None,
         fsdp_kwargs=None,
     ):
+        if device is None:
+            # The current CUDA device, resolved at call time: importing this module
+            # must not need a visible GPU.
+            device = torch.cuda.current_device()
         self.text_len = text_len
         self.dtype = dtype
         self.device = device

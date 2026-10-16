@@ -29,6 +29,7 @@ from omnimem.utils.torch_utils import (
 from omnimem.utils.meter import TimerMeter
 from omnimem.evaluate import evaluation_wan
 from omnimem.utils.misc import (
+    clip_grad_norm,
     is_main_process,
     wait_for_everyone,
     reduce_dict,
@@ -76,7 +77,8 @@ class WanConsistencyDistillTrainer(BaseWanTrainer):
         self._neg_embeddings_cache = None
 
         super().__init__(config)
-        self.model_compile(mode="max-autotune-no-cudagraphs")
+        if self.torch_compile:
+            self.model_compile(mode="max-autotune-no-cudagraphs")
 
     def load_noise_scheduler(self):
         self.noise_scheduler = RectifiedFlowScheduler.from_config(
@@ -212,12 +214,7 @@ class WanConsistencyDistillTrainer(BaseWanTrainer):
                 path=os.path.join(self.output_dir, "checkpoints", "ema"),
                 module=self.ema,
             )
-        if dist.is_initialized():
-            for block in self.ema.blocks:
-                fully_shard(block, **self.fsdp_kwargs)
-            fully_shard(self.ema, **self.fsdp_kwargs.root_kwargs)
-        else:
-            self.ema.to(self.device)
+        self.wrap_ema_fsdp()
 
     def model_compile(self, mode="max-autotune-no-cudagraphs"):
         self.model.compile(mode=mode)
@@ -580,8 +577,7 @@ class WanConsistencyDistillTrainer(BaseWanTrainer):
         loss.backward()
 
         if self.accumulation_index == 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            log_dict["train/grad_norm"] = grad_norm.to_local().item()
+            log_dict["train/grad_norm"] = clip_grad_norm(self.model.parameters(), self.max_grad_norm)
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
             self.lr_scheduler.step()

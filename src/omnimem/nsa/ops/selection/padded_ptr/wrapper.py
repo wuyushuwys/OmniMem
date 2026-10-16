@@ -21,6 +21,21 @@ def _check_bf16_storage(k_t: torch.Tensor, v_t: torch.Tensor, h: int, idx: int) 
         )
 
 
+def _refuse_under_block_policy(kv_cache, entry: str) -> None:
+    """The chunk-level history path must never run under block_lru; count the call, then refuse."""
+    store = getattr(kv_cache, "block_store", None)
+    if store is None:
+        return
+    try:
+        store.stats['whole_chunk_reload_calls'] += 1
+    except Exception:                       # pragma: no cover - stats must never mask
+        pass
+    raise RuntimeError(
+        f"whole-chunk reload entered under kv_cache_policy='block_lru' "
+        f"({entry}): the block store owns history residency; the chunk LRU and the "
+        f"pinned whole-chunk reload are 'chunk_lru'-only paths")
+
+
 def _compute_needed_bids_per_head(block_indices: torch.Tensor) -> List[List[int]]:
     """Derive needed bids per head. Single GPU-to-CPU sync via whole-tensor move."""
     B, MG, H, T = block_indices.shape
@@ -219,37 +234,7 @@ def _find_sample_block(
     return None
 
 
-def _build_fresh_chunk_base_ptrs(
-    template_k: torch.Tensor,
-    template_v: torch.Tensor,
-    kv_cache,
-    layer_idx: int,
-    device: torch.device,
-):
-    """Build fresh [H, max_n_chunks] int64 ptr table from live cache chunks (race-free).
-    CPU-resident chunks get ptr=0; caller should reload via _touch_lru_and_detect_missing."""
-    H, max_n = template_k.shape
-    chunks_k = kv_cache.cache[layer_idx]['k_cache']
-    chunks_v = kv_cache.cache[layer_idx]['v_cache']
-
-    base_k_cpu = torch.zeros(H, max_n, dtype=torch.int64)
-    base_v_cpu = torch.zeros(H, max_n, dtype=torch.int64)
-    for h in range(H):
-        head_k = chunks_k[h]
-        head_v = chunks_v[h]
-        n = min(len(head_k), len(head_v))
-        for cid in range(n):
-            k_t = head_k[cid]
-            v_t = head_v[cid]
-            if k_t.is_cuda and v_t.is_cuda:
-                base_k_cpu[h, cid] = k_t.data_ptr()
-                base_v_cpu[h, cid] = v_t.data_ptr()
-    return (
-        base_k_cpu.to(device, non_blocking=True),
-        base_v_cpu.to(device, non_blocking=True),
-    )
-
-
+# CPU->GPU reload (inference only): a missing chunk is copied head by head from pinned memory.
 def _touch_lru_and_detect_missing(
     block_indices: torch.Tensor,
     chunk_base_ptrs_k: torch.Tensor,
@@ -260,8 +245,8 @@ def _touch_lru_and_detect_missing(
     device: torch.device,
     detect_missing: bool,
 ):
-    """Touch LRU for all (h, cid) in block_indices; reload missing GPU chunks if detect_missing.
-    Returns True if anything was reloaded (caller should rebuild ptr table)."""
+    """Touch LRU for all (h, cid) in block_indices; reload missing GPU chunks if detect_missing."""
+    _refuse_under_block_policy(kv_cache, "_touch_lru_and_detect_missing")
     H = block_indices.shape[2]
     max_n = chunk_base_ptrs_k.shape[1]
 
@@ -273,36 +258,32 @@ def _touch_lru_and_detect_missing(
     keys = h_idx * max_n + cids
 
     valid_mask = block_indices >= 0
-    unique_keys = keys[valid_mask].unique()
+    unique_keys = keys[valid_mask].unique()   # ascending == head-major, then cid
 
     if detect_missing:
         ptrs_k = chunk_base_ptrs_k.flatten()[unique_keys]
         ptrs_v = chunk_base_ptrs_v.flatten()[unique_keys]
         missing_local = (ptrs_k == 0) | (ptrs_v == 0)
-        any_missing = missing_local.any().item()
+        payload = unique_keys * 2 + missing_local.to(torch.int64)
     else:
-        any_missing = False
+        payload = unique_keys       # nothing to detect: no flag bit needed
 
-    unique_keys_cpu = unique_keys.cpu().tolist()
+    # The one D2H copy of this call.
+    payload_cpu = payload.cpu().tolist()
+    touch_pairs = [divmod(p >> 1 if detect_missing else p, max_n)
+                   for p in payload_cpu]
+    kv_cache.lru_touch_many(layer_idx, 'k_cache', touch_pairs)
 
-    for key in unique_keys_cpu:
-        h = int(key // max_n)
-        cid = int(key % max_n)
-        kv_cache.lru_touch_per_head(layer_idx, 'k_cache', h, cid)
-
-    if not any_missing:
+    if not detect_missing:
         return False
 
-    missing_local_cpu = missing_local.cpu().tolist()
     chunks_k = kv_cache.cache[layer_idx]['k_cache']
     chunks_v = kv_cache.cache[layer_idx]['v_cache']
 
     by_cid = defaultdict(list)
-    for key, is_missing in zip(unique_keys_cpu, missing_local_cpu):
-        if not is_missing:
+    for p, (h, cid) in zip(payload_cpu, touch_pairs):
+        if not (p & 1):
             continue
-        h = int(key // max_n)
-        cid = int(key % max_n)
         if cid >= len(chunks_k[h]):
             continue
         assert chunks_k[h][cid].is_cuda == chunks_v[h][cid].is_cuda, \
@@ -316,13 +297,13 @@ def _touch_lru_and_detect_missing(
     if not by_cid:
         return False
 
-    if hasattr(kv_cache, '_wait_offload'):
-        kv_cache._wait_offload()
-
     all_h = []
     all_cid = []
     all_pk = []
     all_pv = []
+    stats = getattr(kv_cache, "reload_stats", None)
+    if stats is not None:
+        stats["calls"] += 1
     for cid, heads in by_cid.items():
         needs_reload = []
         for h in heads:
@@ -339,26 +320,34 @@ def _touch_lru_and_detect_missing(
         if not needs_reload:
             continue
 
-        cpu_stack_k = torch.stack([chunks_k[h][cid] for h in needs_reload], dim=0)
-        gpu_stack_k = cpu_stack_k.to(device, non_blocking=True)
-        cpu_stack_v = torch.stack([chunks_v[h][cid] for h in needs_reload], dim=0)
-        gpu_stack_v = cpu_stack_v.to(device, non_blocking=True)
-        for idx, h in enumerate(needs_reload):
-            k_view = gpu_stack_k[idx].clone()
-            v_view = gpu_stack_v[idx].clone()
+        # Direct H2D from the host chunk into owned GPU storage; no host wait.
+        for h in needs_reload:
+            src_k = chunks_k[h][cid]
+            src_v = chunks_v[h][cid]
+            k_view = torch.empty(src_k.shape, dtype=src_k.dtype, device=device)
+            v_view = torch.empty(src_v.shape, dtype=src_v.dtype, device=device)
+            k_view.copy_(src_k, non_blocking=True)
+            v_view.copy_(src_v, non_blocking=True)
             chunks_k[h][cid] = k_view
             chunks_v[h][cid] = v_view
             all_h.append(h)
             all_cid.append(cid)
             all_pk.append(k_view.data_ptr())
             all_pv.append(v_view.data_ptr())
+        if stats is not None:
+            stats["cids"] += 1
+            stats["head_chunks"] += len(needs_reload)
+            stats["bytes"] += sum(
+                chunks_k[h][cid].numel() * chunks_k[h][cid].element_size()
+                + chunks_v[h][cid].numel() * chunks_v[h][cid].element_size()
+                for h in needs_reload)
 
-    h_t = torch.tensor(all_h, dtype=torch.long, device=device)
-    c_t = torch.tensor(all_cid, dtype=torch.long, device=device)
-    pk_t = torch.tensor(all_pk, dtype=torch.int64, device=device)
-    pv_t = torch.tensor(all_pv, dtype=torch.int64, device=device)
-    chunk_base_ptrs_k[h_t, c_t] = pk_t
-    chunk_base_ptrs_v[h_t, c_t] = pv_t
+    # Publish K and V in one batch: they share the pinned ring slot and the ptr scatter.
+    entries = []
+    for h, cid, pk, pv in zip(all_h, all_cid, all_pk, all_pv):
+        entries.append(('k_cache', h, cid, pk))
+        entries.append(('v_cache', h, cid, pv))
+    kv_cache.publish_chunk_ptrs(layer_idx, entries)
     return True
 
 
@@ -487,6 +476,7 @@ def selection_attention_padded_ptr_fast(
     assert n_chunks_per_head.dtype == torch.int32
     assert n_chunks_per_head.shape == (H,)
     assert chunk_len % block_size == 0
+    _refuse_under_block_policy(kv_cache, "selection_attention_padded_ptr_fast")
 
     if softmax_scale is None:
         softmax_scale = D ** -0.5
@@ -501,11 +491,19 @@ def selection_attention_padded_ptr_fast(
     stride_bd = chunk_strides['stride_bd']
     in_chunk_block_bytes = block_size * token_stride_bytes
 
-    # race-free rebuild: MMCache's async H2D can leave stale ptrs; rebuild from live chunks
+    # Order: LRU touch / missing detection / reload, then one build_ptr_table, then SLC.
     if kv_cache is not None and layer_idx is not None:
-        chunk_base_ptrs_k, chunk_base_ptrs_v = _build_fresh_chunk_base_ptrs(
-            chunk_base_ptrs_k, chunk_base_ptrs_v, kv_cache, layer_idx, device,
-        )
+        # Fully-resident fast path (opt-in): skip LRU bookkeeping when nothing is host-resident.
+        if ((not verify_complete)
+                and getattr(kv_cache, '_resident_fast_path', False)
+                and kv_cache.selection_resident_fast_path()):
+            kv_cache.fast_path_stats['skipped'] += 1
+        else:
+            _touch_lru_and_detect_missing(
+                block_indices, chunk_base_ptrs_k, chunk_base_ptrs_v,
+                blocks_per_chunk, kv_cache, layer_idx, device,
+                detect_missing=verify_complete,
+            )
 
     # Capture the NSA backend once so the ptr build and the forward of ONE call agree
     # even if the process default is switched concurrently (same rule as block_wrapper).
@@ -520,24 +518,6 @@ def selection_attention_padded_ptr_fast(
         in_chunk_block_bytes=in_chunk_block_bytes,
         backend=backend,
     )
-
-    if kv_cache is not None and layer_idx is not None:
-        reloaded = _touch_lru_and_detect_missing(
-            block_indices, chunk_base_ptrs_k, chunk_base_ptrs_v,
-            blocks_per_chunk, kv_cache, layer_idx, device,
-            detect_missing=verify_complete,
-        )
-        if reloaded:
-            ptr_table_k, ptr_table_v = build_ptr_table(
-                block_indices=block_indices,
-                block_base_ptrs_k=chunk_base_ptrs_k,
-                block_base_ptrs_v=chunk_base_ptrs_v,
-                n_blocks_per_head=n_global_blocks,
-                batch_stride=batch_stride_bytes,
-                blocks_per_chunk=blocks_per_chunk,
-                in_chunk_block_bytes=in_chunk_block_bytes,
-                backend=backend,
-            )
 
     out, lse = launch_ptr_fwd(
         q, ptr_table_k, ptr_table_v,

@@ -33,6 +33,9 @@ window_size:
   kv_cmp: null
 
 # streaming training
+complete_sf_resume: true
+# Non-first windows: VAE decode -> last 9 RGB frames -> 3 boundary latents + 18 new latents.
+# Start a fresh checkpoint namespace when initializing from pre-boundary streaming weights.
 streaming_chunk_size: 21
 streaming_max_length: 237
 streaming_min_new_frame: 18
@@ -76,7 +79,8 @@ real_model_path: wan_models/Wan2.1-T2V-14B
 fake_model_path: wan_models/Wan2.1-T2V-1.3B
 
 model_path: outputs/nsa-sf-swa-b2x15-top16-ew3-qg15
-# resume_ckpt_path: outputs/<some_run>/checkpoints
+# For full resume, reuse the same run or set checkpoint_dir to its shared checkpoint root.
+# checkpoint_dir: outputs/<some_run>/checkpoints
 vae_path: wan_models/vae-2.1/vae
 text_encoder_path: wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
 tokenizer_path: wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl
@@ -108,7 +112,7 @@ kv_cache_lru_max_size: 7  # 0 to disable LRU offload entirely
 
 
 max_train_steps: 600
-checkpointing_steps: 50
+checkpointing_steps: 20
 
 log_steps: 10
 

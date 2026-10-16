@@ -19,3 +19,5 @@ $train --config configs/self_forcing/training_wan_nsa_self_forcing_4step_flow.ya
 
 # ===== Long-video finetuning (optional) =====
 # $train --config configs/self_forcing/training_wan_nsa_self_forcing_4step_flow_streaming.yaml --task nsa-self-forcing-streaming --name omnimem_nsa_sf_streaming
+# Same complete-resume config, with mid-rollout prompt switching:
+# $train --config configs/self_forcing/training_wan_nsa_self_forcing_4step_flow_streaming.yaml --task nsa-self-forcing-switch --name omnimem_nsa_sf_switch

@@ -2,11 +2,11 @@ import os
 import datetime
 import wandb
 from abc import ABC, abstractmethod
-from omegaconf import OmegaConf, ListConfig
+from omegaconf import OmegaConf
 
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp import FSDPModule
+from torch.distributed.fsdp import FSDPModule, fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import apply_activation_checkpointing
 from torch.utils.data import DataLoader
 
@@ -21,6 +21,8 @@ from omnimem.utils.meter import LossesMeter, TimerMeter
 from omnimem.utils.aws_handler import S3
 from omnimem.utils.logging_tool import get_logger
 from omnimem.utils.misc import set_seed, is_main_process, format_numel_str, get_model_numel
+from omnimem.utils.ode_training_state import restore_rng_state
+from omnimem.utils.validation_prompts import prepare_validation_prompts
 
 
 class BaseTrainer(ABC):
@@ -148,14 +150,8 @@ class BaseTrainer(ABC):
 
 
     def setup_dataloader(self):
-        if 'prompt_file' in self.validation_data:
-            if isinstance(self.validation_data['prompt_file'], ListConfig):
-                self.validation_data.prompts = []
-                for pf in self.validation_data['prompt_file']:
-                    self.validation_data.prompts.extend([p.strip() for p in open(pf, 'r').readlines()])
-            else:
-                self.validation_data.prompts = [p.strip() for p in
-                                                open(self.validation_data.prompt_file, 'r').readlines()]
+        prepare_validation_prompts(
+            self.validation_data, frame_per_block=self.config.get("frame_per_block"))
 
         self.train_dataloader = prepare_dataloader(
             dataset_type=self.dataset_type,
@@ -223,6 +219,15 @@ class BaseTrainer(ABC):
     def setup_ema_model(self, try_resume=False):
         if self.ema_model and self.ema_start_step <= self.global_step:
             raise NotImplementedError("Child classes to implement EMA.")
+
+    def wrap_ema_fsdp(self):
+        """Shard the EMA model like the trained model, or move it to the device without FSDP."""
+        if dist.is_initialized():
+            for block in self.ema.blocks:
+                fully_shard(block, **self.fsdp_kwargs)
+            fully_shard(self.ema, **self.fsdp_kwargs.root_kwargs)
+        else:
+            self.ema.to(self.device)
 
     def _get_resume_dir(self):
         """Return the directory the resume helpers read from. Subclasses may override to support external checkpoints."""
@@ -293,6 +298,19 @@ class BaseTrainer(ABC):
                 if self.global_step >= self.max_train_steps:
                     self.logger.info("Finish training")
                     return
+
+    def _already_trained(self):
+        """Log and return True when a resumed run has no optimizer steps left."""
+        if self.global_step < self.max_train_steps:
+            return False
+        self.logger.info(f"Training already complete at step {self.global_step}; nothing to run.")
+        return True
+
+    def _restore_resume_rng(self):
+        """Restore the checkpoint's RNG once, after startup work that consumes random numbers."""
+        if getattr(self, "_resume_rng_state", None) is not None:
+            restore_rng_state(self._resume_rng_state)
+            self._resume_rng_state = None
 
     def set_requires_gradient_reduce(self, *models: torch.nn.Module):
         """Toggle FSDP2 all-reduce: skip on intermediate accumulation steps, enable on the final step."""

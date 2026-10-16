@@ -20,6 +20,7 @@ from omnimem.utils.misc import get_model_numel, format_numel_str
 from omnimem.models.transformers.wan_model import WanModel
 from omnimem.schedulers.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from omnimem.models.text_encoders.t5 import T5EncoderModel
+from omnimem.utils.validation_prompts import latent_frames
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -150,7 +151,7 @@ if __name__ == "__main__":
 
     size = (width, height)
     vae_stride = (vae.temporal_downscale_factor, vae.spatial_downscale_factor, vae.spatial_downscale_factor)
-    target_shape = (vae.z_dim, (num_frames - 1) // vae_stride[0] + 1, size[1] // vae_stride[1],
+    target_shape = (vae.z_dim, latent_frames(num_frames, vae_stride[0]), size[1] // vae_stride[1],
                     size[0] // vae_stride[2])
     logger.info(f"Generate {target_shape} shape")
     rank_prompt_list = prompt_list[rank::world_size]

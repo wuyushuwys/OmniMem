@@ -28,10 +28,18 @@ from omnimem.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
 from omnimem.pipelines.utils import masks_like
 from omnimem.utils.train_utils import vae_encode
 from omnimem.utils.logging_tool import get_logger
+from omnimem.utils.validation_prompts import latent_frames
 
 from omnimem.models.text_encoders.t5 import T5EncoderModel
 
 logger = get_logger()
+
+# Negative prompt of a sampling call that passes none (``n_prompt=""``).
+NEG_PROMPT = ("Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, "
+              "images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, "
+              "incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, "
+              "misshapen limbs, fused fingers, still picture, messy background, three legs, many people in "
+              "the background, walking backwards")
 
 if is_bs4_available():
     from bs4 import BeautifulSoup
@@ -70,6 +78,7 @@ class WanTI2VPipeline(DiffusionPipeline):
     )  # noqa
 
     _optional_components = ["tokenizer", "text_encoder"]
+    sample_neg_prompt = NEG_PROMPT
     model_cpu_offload_seq = "text_encoder->transformer->vae"
     _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds"]
 
@@ -313,7 +322,7 @@ class WanTI2VPipeline(DiffusionPipeline):
         """
         # preprocess
         F = frame_num
-        target_shape = (self.vae.z_dim, (F - 1) // self.vae_stride[0] + 1,
+        target_shape = (self.vae.z_dim, latent_frames(F, self.vae_stride[0]),
                         size[1] // self.vae_stride[1],
                         size[0] // self.vae_stride[2])
 

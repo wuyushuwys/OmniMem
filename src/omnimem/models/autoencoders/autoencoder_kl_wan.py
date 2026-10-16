@@ -68,6 +68,9 @@ class WanCausalConv3d(nn.Conv3d):
         # Set up causal padding
         self._padding = (self.padding[2], self.padding[2], self.padding[1], self.padding[1], 2 * self.padding[0], 0)
         self.padding = (0, 0, 0)
+        # Fast decode: the conv pads spatially; only the first chunk's temporal pad needs F.pad.
+        self._spatial_padding = (0, self._padding[2], self._padding[0])
+        self.fast = False
 
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
@@ -75,6 +78,13 @@ class WanCausalConv3d(nn.Conv3d):
             cache_x = cache_x.to(x.device)
             x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
+        if self.fast:
+            if padding[4]:
+                x = F.pad(x, (0, 0, 0, 0, padding[4], 0))
+            # channels_last_3d is the faster cuDNN layout for these convolutions.
+            x = x.contiguous(memory_format=torch.channels_last_3d)
+            return F.conv3d(x, self.weight, self.bias, self.stride, self._spatial_padding,
+                            self.dilation, self.groups)
         x = F.pad(x, padding)
         return super().forward(x)
 
@@ -100,15 +110,27 @@ class WanRMS_norm(nn.Module):
         self.scale = dim**0.5
         self.gamma = nn.Parameter(torch.ones(shape))
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
+        # Fast decode: scale * gamma folded into one operand (set by enable_fast_decode).
+        self._fast_gamma = None
 
     def forward(self, x):
-        return F.normalize(x, dim=(1 if self.channel_first else -1)) * self.scale * self.gamma + self.bias
+        dim = 1 if self.channel_first else -1
+        if self._fast_gamma is not None:
+            out = F.normalize(x, dim=dim) * self._fast_gamma
+            return out if isinstance(self.bias, float) and self.bias == 0.0 else out + self.bias
+        return F.normalize(x, dim=dim) * self.scale * self.gamma + self.bias
 
 
 class WanUpsample(nn.Upsample):
     r"""Upsample while preserving the input dtype."""
 
+    fast = False
+
     def forward(self, x):
+        if self.fast:
+            # ``nearest-exact`` is a pure gather: upsampling in the input dtype is
+            # bit-identical to the float() round trip at half the bandwidth.
+            return super().forward(x)
         return super().forward(x.float()).type_as(x)
 
 
@@ -125,6 +147,8 @@ class WanResample(nn.Module):
             - 'downsample2d': 2D downsampling with zero-padding and convolution.
             - 'downsample3d': 3D downsampling with zero-padding, convolution, and causal 3D convolution.
     """
+
+    fast = False
 
     def __init__(self, dim: int, mode: str) -> None:
         super().__init__()
@@ -177,6 +201,10 @@ class WanResample(nn.Module):
                     x = x.reshape(b, 2, c, t, h, w)
                     x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
                     x = x.reshape(b, c, t * 2, h, w)
+                    if self.fast:
+                        # ``stack`` writes NCDHW; put the stream back into
+                        # channels_last_3d so the 2D resample below stays view-only.
+                        x = x.contiguous(memory_format=torch.channels_last_3d)
         t = x.shape[2]
         x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
         x = self.resample(x)
@@ -709,6 +737,41 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             base_dim, z_dim, dim_mult, num_res_blocks, attn_scales, self.temperal_upsample, dropout
         )
 
+    # Fast decode: channels_last convs, one temporal pass per chunk, fused RMS norm.
+    _fast_decode: Optional[bool] = None
+
+    def enable_fast_decode(self, enabled: bool = True) -> None:
+        """Turn the opt-in fast decode path on or off."""
+        self._fast_decode = bool(enabled)
+        self._apply_fast_decode()
+
+    def _apply_fast_decode(self) -> None:
+        """Push the fast-decode flags onto the submodules; re-run after .to()."""
+        enabled = self._fast_decode
+        for m in self.decoder.modules():
+            if isinstance(m, (WanCausalConv3d, WanResample)):
+                m.fast = enabled
+            elif isinstance(m, WanUpsample):
+                m.fast = enabled
+            elif isinstance(m, WanRMS_norm):
+                m._fast_gamma = ((m.gamma.detach() * m.scale).to(m.gamma.dtype)
+                                 if enabled else None)
+        self.post_quant_conv.fast = enabled
+        # Layout change only; contiguous is a no-op when the layout already matches.
+        for m in list(self.decoder.modules()) + [self.post_quant_conv]:
+            if not isinstance(m, (nn.Conv2d, nn.Conv3d)):
+                continue
+            w = m.weight
+            fmt = torch.channels_last_3d if w.dim() == 5 else torch.channels_last
+            m.weight.data = (w.data.contiguous(memory_format=fmt) if enabled
+                             else w.data.contiguous())
+
+    def _apply(self, *args, **kwargs):
+        out = super()._apply(*args, **kwargs)
+        if self._fast_decode is not None:
+            self._apply_fast_decode()
+        return out
+
     def clear_cache(self):
         def _count_conv3d(model):
             count = 0
@@ -787,13 +850,28 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         iter_ = z.shape[2]
         x = self.post_quant_conv(z)
-        for i in range(iter_):
-            self._conv_idx = [0]
-            if i == 0:
-                out = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
-            else:
-                out_ = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
-                out = torch.cat([out, out_], 2)
+        if self._fast_decode:
+            # One temporal pass per chunk; the first decoder call of a request stays alone.
+            parts = []
+            start = 0
+            if self._feat_map[0] is None:
+                self._conv_idx = [0]
+                parts.append(self.decoder(x[:, :, :1, :, :], feat_cache=self._feat_map,
+                                          feat_idx=self._conv_idx))
+                start = 1
+            if start < iter_:
+                self._conv_idx = [0]
+                parts.append(self.decoder(x[:, :, start:, :, :], feat_cache=self._feat_map,
+                                          feat_idx=self._conv_idx))
+            out = parts[0] if len(parts) == 1 else torch.cat(parts, 2)
+        else:
+            for i in range(iter_):
+                self._conv_idx = [0]
+                if i == 0:
+                    out = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                else:
+                    out_ = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                    out = torch.cat([out, out_], 2)
 
         out = torch.clamp(out, min=-1.0, max=1.0)
         if not return_dict:

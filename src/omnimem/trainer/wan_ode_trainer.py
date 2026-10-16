@@ -1,4 +1,3 @@
-import os
 import math
 import wandb
 
@@ -14,20 +13,20 @@ from omnimem.models.flex_attention_utils import create_causal_block_mask_cached
 from omnimem.models.transformers.causal_wan_model import CausalWanModel, CausalWanAttentionBlock
 from omnimem.pipelines import CausalWanT2VPipeline
 from omnimem.schedulers import RectifiedFlowScheduler
-from omnimem.utils.torch_utils import get_fsdp_state_dict, save_fsdp_checkpoint, load_and_broadcast_diffuser, resume_model, save_sharded_safetensors
+from omnimem.utils.torch_utils import load_and_broadcast_diffuser
 from omnimem.utils.meter import TimerMeter
 from omnimem.evaluate import evaluation_wan
 from omnimem.utils.misc import (
-    is_main_process,
+    clip_grad_norm,
     wait_for_everyone,
     reduce_dict,
-    unwrap_model,
 )
 
 from omnimem.trainer.base_wan_trainer import BaseWanTrainer
+from omnimem.trainer.complete_checkpoint import CompleteCheckpointMixin
 
 
-class WanODETrainer(BaseWanTrainer):
+class WanODETrainer(CompleteCheckpointMixin, BaseWanTrainer):
     model: CausalWanModel
 
     optimizer: torch.optim.Optimizer
@@ -88,10 +87,13 @@ class WanODETrainer(BaseWanTrainer):
         self.count_model_parameter(model, name="Model")
         self.model = model
 
+    def _checkpoint_extra_state(self):
+        return {"scheduler_config": self._scheduler_config()}
+
     def resume_from_checkpoint(self):
-        checkpoint_path = os.path.join(self.output_dir, "checkpoints")
-        resume_model(os.path.join(checkpoint_path, "model"), self.model)
-        self._check_model(self.model, 'after resume ckpt')
+        if self._resume_checkpoint is not None:
+            self._restore_checkpoint_weights("model", self.model, name="Model")
+            self._check_model(self.model, 'after resume ckpt')
 
     def wrap_model_fsdp(self):
         if dist.is_initialized():
@@ -124,9 +126,9 @@ class WanODETrainer(BaseWanTrainer):
             **self.lr_scheduler_kwargs
         )
 
-        for _ in range(self.global_step):
-            self.lr_scheduler.step()
-
+        state = self._restore_training_state()
+        if state is not None and state["extra_state"].get("scheduler_config") != self._scheduler_config():
+            raise ValueError("The LR schedule configuration differs from the completed checkpoint")
 
     def setup_timers(self):
         super().setup_timers()
@@ -169,24 +171,6 @@ class WanODETrainer(BaseWanTrainer):
             self.logger.info(f"step: {self.global_step}/{max_train_steps}[{self.global_step / max_train_steps:.02%}]||"
                              f'time:[{time_log}]'
                              f" loss: {self.loss_meter.mavg.get('train/loss', 0):.04f}")
-
-    def save_models(self):
-        output_dir = self.output_dir
-        model_state_dict = get_fsdp_state_dict(unwrap_model(self.model))
-        if is_main_process():
-            self.logger.info(f"saving checkpoint to {output_dir} ...")
-            save_dir = os.path.join(output_dir, "checkpoints", "model")
-            self.model.save_config(save_directory=save_dir)
-            save_sharded_safetensors(state_dict=model_state_dict, save_dir=save_dir)
-            self.logger.info("Save model.")
-
-            save_fsdp_checkpoint(None, None, self.global_step, output_dir=os.path.join(output_dir, "checkpoints"))
-            self.logger.info("Save checkpoints.")
-
-            self.s3.upload_folder(
-                folder_path=os.path.join(output_dir, "checkpoints"),
-                global_step=self.global_step,
-            )
 
     def evaluate_init(self):
         evaluation_wan(
@@ -333,8 +317,7 @@ class WanODETrainer(BaseWanTrainer):
         loss.backward()
 
         if self.accumulation_index == 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            log_dict["train/grad_norm"] = grad_norm.to_local().item()
+            log_dict["train/grad_norm"] = clip_grad_norm(self.model.parameters(), self.max_grad_norm)
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
             self.lr_scheduler.step()
@@ -349,22 +332,30 @@ class WanODETrainer(BaseWanTrainer):
         return log_dict
 
     def train(self):
+        if self._already_trained():
+            return
         # evaluate initial model
-        self.evaluate_init()
+        self._evaluate_without_rng_change(initial=True)
         # main training loop
         self.logger.info("***** Running training *****")
 
         for epoch in range(self.num_train_epochs):
             self.loss_meter.reset()
             self.data_timer.tic()
-            for step, tuple_batch in enumerate(self.train_dataloader, start=1):
+            data_iterator = iter(self.train_dataloader)
+            for step, tuple_batch in enumerate(data_iterator, start=1):
+                # WebDataset starts its workers lazily on the first next(), not iter().
+                self._restore_resume_rng()
                 self.accumulation_index = step % self.gradient_accumulation_steps
 
                 # load data
                 data = dict(
-                    ode=tuple_batch['ode'].to(device=self.device, dtype=torch.float32, non_blocking=True),
-                    timesteps=tuple_batch['timesteps'].to(device=self.device, dtype=torch.float32, non_blocking=True),
-                    text_embeddings=tuple_batch['t5_embed'],
+                    ode=torch.as_tensor(tuple_batch['ode']).to(device=self.device, dtype=torch.float32, non_blocking=True),
+                    timesteps=torch.as_tensor(tuple_batch['timesteps']).to(device=self.device, dtype=torch.float32, non_blocking=True),
+                    text_embeddings=[
+                        torch.as_tensor(embedding).to(device=self.device, dtype=self.dtype, non_blocking=True)
+                        for embedding in tuple_batch['t5_embed']
+                    ],
                 )
 
                 self.data_timer.toc()
@@ -383,7 +374,7 @@ class WanODETrainer(BaseWanTrainer):
                         self.save_models()
 
                     if self.global_step % self.validation_steps == 0 or self.global_step >= self.max_train_steps:
-                        self.evaluate()
+                        self._evaluate_without_rng_change()
 
                 self.data_timer.tic()
                 if self.global_step >= self.max_train_steps:

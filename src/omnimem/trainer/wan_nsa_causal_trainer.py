@@ -1,13 +1,9 @@
-import os
 import math
 
 import torch
 import torch.nn.functional as F
-import torch.distributed as dist
-from torch.distributed.fsdp import fully_shard
 from torch.optim.lr_scheduler import LRScheduler
 
-from peft import PeftModel
 
 from omnimem.models.flex_attention_utils import create_causal_block_mask_cached
 from omnimem.models.transformers.causal_wan_nsa_model import CausalWanNSAModel, CausalWanNSAttentionBlock
@@ -16,12 +12,13 @@ from omnimem.schedulers import RectifiedFlowScheduler
 from omnimem.utils.torch_utils import (
     get_fsdp_state_dict, 
     load_and_broadcast_diffuser, 
-    resume_model, 
     update_ema_fsdp,
     )
 from omnimem.utils.meter import TimerMeter
 from omnimem.evaluate import evaluation_wan
 from omnimem.utils.misc import (
+    clip_grad_norm,
+    init_gate_on_all_ranks,
     reduce_dict,
     unwrap_model,
 )
@@ -40,12 +37,14 @@ class WanCausalNSATrainer(WanCausalTrainer):
     backward_timer: TimerMeter
 
     checkpoint_modules = CausalWanNSAttentionBlock
+    ema_module_cls = CausalWanNSAModel
 
     def __init__(self, config):
         self.config = config
         self.window_size = self._get_and_record("window_size", None)
         self.sink_size = self._get_and_record("sink_size", None)
         self.nsa_kwargs = self._get_and_record("nsa_kwargs")
+        self.preserve_pretrained_gate = self._get_and_record("preserve_pretrained_gate", False)
         super().__init__(config)
         self._evaluate_kwargs = dict(
             pipeline_cls=CausalWanT2VPipeline,
@@ -70,11 +69,8 @@ class WanCausalNSATrainer(WanCausalTrainer):
             low_cpu_mem_usage=False,
             **self.nsa_kwargs
         )
-        model.init_gate()
-        if dist.is_initialized():
-            for name, p in model.named_parameters():
-                if 'g_proj' in name:
-                    dist.broadcast(p.data.to(self.device), src=0)
+        if not self.preserve_pretrained_gate:
+            init_gate_on_all_ranks(model, self.device)
 
         return model
 
@@ -89,31 +85,6 @@ class WanCausalNSATrainer(WanCausalTrainer):
 
         info = ema.load_state_dict(state_dict, strict=False)
         return ema, info
-
-    def setup_ema_model(self, try_resume=False):
-        if self.ema_model:
-            ema_module_cls = CausalWanNSAModel
-            self.ema, info = self.create_ema_model_peft(
-                unwrap_model(self.model), module_cls=ema_module_cls
-            )
-            self.logger.info(
-                f"EMA load info: missing={len(info.missing_keys)}, "
-                f"unexpected={len(info.unexpected_keys)}"
-            )
-            self.logger.info(f"{info}")
-            if self.lora_weights is not None:
-                self.ema = PeftModel.from_pretrained(self.ema, self.lora_weights)
-        else:
-            self.ema = None
-            return
-        if try_resume:
-            resume_model(path=os.path.join(self.output_dir, "checkpoints", 'ema'), module=self.ema)
-        if dist.is_initialized():
-            for block in self.ema.blocks:
-                fully_shard(block, **self.fsdp_kwargs)
-            fully_shard(self.ema, **self.fsdp_kwargs.root_kwargs)
-        else:
-            self.ema.to(self.device) 
 
     def evaluate(self):
         if self.ema is not None:
@@ -246,8 +217,7 @@ class WanCausalNSATrainer(WanCausalTrainer):
         loss.backward()
 
         if self.accumulation_index == 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            log_dict["train/grad_norm"] = grad_norm.to_local().item()
+            log_dict["train/grad_norm"] = clip_grad_norm(self.model.parameters(), self.max_grad_norm)
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
             self.lr_scheduler.step()

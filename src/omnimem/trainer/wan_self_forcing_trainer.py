@@ -4,7 +4,6 @@ from typing import Union
 
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp import fully_shard
 
 from omnimem.models.transformers.wan_model import WanAttentionBlock
 from omnimem.models.transformers.causal_wan_model import CausalWanModel, CausalWanAttentionBlock
@@ -56,9 +55,7 @@ class WanSelfForcingTrainer(WanDMDTrainer):
             self.ema, info = create_ema_model(unwrap_model(self.generator), module_cls=CausalWanModel)
             if try_resume:
                 resume_model(path=os.path.join(self.output_dir, "checkpoints", 'ema'), module=self.ema)
-            for block in self.ema.blocks:
-                fully_shard(block, **self.fsdp_kwargs)
-            fully_shard(self.ema, **self.fsdp_kwargs.root_kwargs)
+            self.wrap_ema_fsdp()
 
     def evaluate_init(self):
         if self.original_step and self.original_cfg:
@@ -97,7 +94,6 @@ class WanSelfForcingTrainer(WanDMDTrainer):
             frame_per_block=self.frame_per_block,
             sink_size=self.sink_size,
             window_size=self.window_size,
-            enable_block_level_cache=getattr(self, 'enable_block_level_cache', False),
             enable_chunk_per_head_cache=getattr(self, 'enable_chunk_per_head_cache', False),
             enable_kv_evict=getattr(self, 'enable_kv_evict', True),
             lru_max_size=getattr(self, 'kv_cache_lru_max_size', 10),
@@ -127,7 +123,6 @@ class WanSelfForcingTrainer(WanDMDTrainer):
                 frame_per_block=self.frame_per_block,
                 sink_size=self.sink_size,
                 window_size=self.window_size,
-                enable_block_level_cache=getattr(self, 'enable_block_level_cache', False),
                 enable_chunk_per_head_cache=getattr(self, 'enable_chunk_per_head_cache', False),
                 enable_kv_evict=getattr(self, 'enable_kv_evict', True),
                 s3_bucket=self.s3_bucket,
@@ -150,7 +145,6 @@ class WanSelfForcingTrainer(WanDMDTrainer):
             frame_per_block=self.frame_per_block,
             sink_size=self.sink_size,
             window_size=self.window_size,
-            enable_block_level_cache=getattr(self, 'enable_block_level_cache', False),
             enable_chunk_per_head_cache=getattr(self, 'enable_chunk_per_head_cache', False),
             enable_kv_evict=getattr(self, 'enable_kv_evict', True),
             s3_bucket=self.s3_bucket,

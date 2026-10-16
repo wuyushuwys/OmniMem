@@ -14,16 +14,22 @@ class WanNSASelfForcingStreamingSwitchTrainer(WanNSASelfForcingStreamingTrainer)
     Config keys: switch_prompt_file (str), switch_mode (str), switch_choices (list[int]).
     Falls back to base behavior when switch_prompt_file is not set.
     """
+    _sf_trainer_family = "nsa-self-forcing-switch"
 
     def __init__(self, config):
-        self.switch_prompt_file = config.get("switch_prompt_file", None)
+        self.switch_prompt_file = config.get(
+            "switch_prompt_file", config.get("train_data", {}).get("switch_prompt_path"))
         self.switch_mode = config.get("switch_mode", "random_choice")
         self.switch_choices = list(config.get("switch_choices", []))
+        if self.switch_mode != "random_choice":
+            raise ValueError("Only switch_mode: random_choice is supported")
+        if any(type(value) is not int for value in self.switch_choices):
+            raise ValueError("switch_choices must contain integer frame positions")
 
         super().__init__(config)
 
         if self.switch_prompt_file is not None:
-            with open(self.switch_prompt_file, "r") as f:
+            with open(self.switch_prompt_file, "r", encoding="utf-8") as f:
                 self._switch_prompts = [l.strip() for l in f if l.strip()]
         else:
             self._switch_prompts = []

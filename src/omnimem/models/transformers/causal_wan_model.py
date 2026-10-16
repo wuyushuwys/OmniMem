@@ -15,7 +15,9 @@ from .wan_model import (
     WanCrossAttention,
     WanLayerNorm,
     Head,
-    sinusoidal_embedding_1d
+    sinusoidal_embedding_1d,
+    patch_embed_linear,
+    patch_embed_linear_enabled,
 )
 
 from .attention import attention
@@ -262,7 +264,10 @@ class CausalWanModel(WanModel):
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
         # embeddings
-        x = self.patch_embedding(x)
+        if patch_embed_linear_enabled() and x.dim() == 5:
+            x = patch_embed_linear(self.patch_embedding, x)
+        else:
+            x = self.patch_embedding(x)
         grid_sizes = torch.tensor(x.shape[2:], dtype=torch.long).expand(x.shape[0], -1)  # [b, 3] --> [[f, h, w],...]
 
         x = x.flatten(2).transpose(1, 2).contiguous()
@@ -271,7 +276,10 @@ class CausalWanModel(WanModel):
 
         teacher_forcing = teacher is not None
         if teacher_forcing:
-            x_t = self.patch_embedding(teacher)
+            if patch_embed_linear_enabled() and teacher.dim() == 5:
+                x_t = patch_embed_linear(self.patch_embedding, teacher)
+            else:
+                x_t = self.patch_embedding(teacher)
             x_t = x_t.flatten(2).transpose(1, 2).contiguous()
             x = torch.cat([x_t, x], dim=1)
 

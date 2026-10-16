@@ -81,6 +81,23 @@ def reduce_dict(dictionary, op=dist.ReduceOp.AVG):
                 dist.all_reduce(v, op=op)
 
 
+def init_gate_on_all_ranks(model, device):
+    """Re-initialize the NSA gates and give every rank the values drawn on rank zero."""
+    model.init_gate()
+    if dist.is_initialized():
+        for name, parameter in model.named_parameters():
+            if "g_proj" in name:
+                tensor = parameter.detach().to(device)
+                dist.broadcast(tensor, src=0)
+                parameter.data.copy_(tensor.to(parameter.device))
+
+
+def clip_grad_norm(parameters, max_norm) -> float:
+    """Clip gradients in place and return the total norm, also when FSDP returns it as a DTensor."""
+    norm = torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+    return (norm.to_local() if hasattr(norm, "to_local") else norm).item()
+
+
 def format_numel_str(numel: int) -> str:
     B = 1024 ** 3
     M = 1024 ** 2

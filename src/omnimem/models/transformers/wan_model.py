@@ -7,12 +7,16 @@ import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
+from omnimem.utils.torch_utils import indexed_device
+
 from .attention import attention 
 
 __all__ = [
     'WanModel',
     'rope_params',
     'rope_apply',
+    'build_rope_table',
+    'build_rope_table_uncached',
     'sinusoidal_embedding_1d',
     'WanSelfAttention',
     'WanCrossAttention',
@@ -42,6 +46,93 @@ def rope_params(max_seq_len, dim, theta=10000):
     freqs = torch.polar(torch.ones_like(freqs), freqs)
     return freqs
 
+
+# RoPE frequency table is memoised per (dim, num_heads, device) so caches can key on identity.
+_ROPE_TABLE_CACHE = {}
+_ROPE_TABLE_CACHE_ENABLED = True
+
+
+def build_rope_table_uncached(dim: int, num_heads: int, device=None) -> torch.Tensor:
+    """The original ``get_rope_params`` body, with no memoisation; ``device=None`` keeps the build device."""
+    d = dim // num_heads
+    return torch.cat([
+        rope_params(1024, d - 4 * (d // 6)),
+        rope_params(1024, 2 * (d // 6)),
+        rope_params(1024, 2 * (d // 6))
+    ], dim=1).to(device=device)
+
+
+@torch.compiler.disable()
+def build_rope_table(dim: int, num_heads: int, device) -> torch.Tensor:
+    """Memoised RoPE frequency table for (dim, num_heads, device); read-only."""
+    device = indexed_device(device)
+    key = (int(dim), int(num_heads), device.type, device.index)
+    cached = _ROPE_TABLE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    table = build_rope_table_uncached(dim, num_heads, device)
+    _ROPE_TABLE_CACHE[key] = table
+    return table
+
+
+# Patch-embedding fast path (opt-in): reshape + F.linear instead of Conv3d; output bits can differ.
+_PATCH_EMBED_LINEAR_ENABLED = False
+
+
+def set_patch_embed_linear(enabled: bool) -> bool:
+    """Enable/disable the reshape+linear patch embedding.  Returns the previous state."""
+    global _PATCH_EMBED_LINEAR_ENABLED
+    previous = _PATCH_EMBED_LINEAR_ENABLED
+    _PATCH_EMBED_LINEAR_ENABLED = bool(enabled)
+    return previous
+
+
+def _patch_embed_linear_usable(conv, x) -> bool:
+    """True when ``conv`` is a pure non-overlapping patchifier over a 5-D ``x``."""
+    if not isinstance(conv, nn.Conv3d) or conv.groups != 1 or conv.bias is None:
+        return False
+    if x.dim() != 5:
+        return False
+    k, st, pad, dil = conv.kernel_size, conv.stride, conv.padding, conv.dilation
+    if tuple(k) != tuple(st) or tuple(pad) != (0, 0, 0) or tuple(dil) != (1, 1, 1):
+        return False
+    return all(int(n) % int(p) == 0 for n, p in zip(x.shape[2:], k))
+
+
+def patch_embed_linear_enabled() -> bool:
+    """Whether the reshape+linear patch embedding is on."""
+    return _PATCH_EMBED_LINEAR_ENABLED
+
+
+def patch_embed_linear(conv, x):
+    """Blocked-reshape + F.linear patch embedding -> [B, C_out, F', H', W']; falls back to conv."""
+    if not _patch_embed_linear_usable(conv, x):
+        return conv(x)
+    pf, ph, pw = (int(v) for v in conv.kernel_size)
+    b, c = x.shape[0], x.shape[1]
+    nf, nh, nw = (int(x.shape[2]) // pf, int(x.shape[3]) // ph, int(x.shape[4]) // pw)
+    cols = (x.view(b, c, nf, pf, nh, ph, nw, pw)
+             .permute(0, 2, 4, 6, 1, 3, 5, 7)
+             .reshape(b * nf * nh * nw, c * pf * ph * pw))
+    out = F.linear(cols, conv.weight.reshape(conv.out_channels, -1), conv.bias)
+    return out.view(b, nf, nh, nw, conv.out_channels).permute(0, 4, 1, 2, 3).contiguous()
+
+
+# rope_tail / rope_finish skip the empty-tail cat; the cat stays while grads reach x.
+def rope_finish(output, x):
+    """``torch.stack(output).type_as(x)``, without the copy when there is one sample."""
+    if len(output) == 1:
+        return output[0].unsqueeze(0).type_as(x)
+    return torch.stack(output).type_as(x)
+
+
+def rope_tail(x_i, x, i, seq_len):
+    """torch.cat([x_i, x[i, seq_len:]]), skipping the copy when the tail is empty and no grad."""
+    if seq_len == x.size(1) and not x.requires_grad:
+        return x_i
+    return torch.cat([x_i, x[i, seq_len:]])
+
+
 @torch.compiler.disable()
 def rope_apply(x, grid_sizes, freqs):
     n, c = x.size(2), x.size(3) // 2
@@ -58,9 +149,9 @@ def rope_apply(x, grid_sizes, freqs):
         ],
             dim=-1).reshape(seq_len, 1, -1)
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
+        x_i = rope_tail(x_i, x, i, seq_len)
         output.append(x_i)
-    return torch.stack(output).type_as(x)
+    return rope_finish(output, x)
 
 
 class WanRMSNorm(nn.Module):
@@ -325,25 +416,17 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # freqs: not via register_buffer to avoid dtype change on .to()
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
-        d = dim // num_heads
-        self.freqs = torch.cat([
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6))
-        ],
-            dim=1)
+        self.freqs = build_rope_table_uncached(dim, num_heads)
 
         # initialize weights
         self.init_weights()
 
     def get_rope_params(self, device):
-        d = self.dim // self.num_heads
-        freqs = torch.cat([
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6))
-        ], dim=1).to(device=device)
-        return freqs
+        # Memoised by default: the table only depends on (dim, num_heads, device).
+        # See the `build_rope_table` block above for the exactness argument.
+        if _ROPE_TABLE_CACHE_ENABLED:
+            return build_rope_table(self.dim, self.num_heads, device)
+        return build_rope_table_uncached(self.dim, self.num_heads, device)
 
     def forward(
             self,
@@ -366,7 +449,10 @@ class WanModel(ModelMixin, ConfigMixin):
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
         # embeddings
-        x = self.patch_embedding(x)
+        if patch_embed_linear_enabled() and x.dim() == 5:
+            x = patch_embed_linear(self.patch_embedding, x)
+        else:
+            x = self.patch_embedding(x)
         grid_sizes = torch.tensor(x.shape[2:], dtype=torch.long).expand(x.shape[0], -1)
         x = x.flatten(2).transpose(1, 2).contiguous()
         seq_lens = torch.tensor([u.size(0) for u in x], dtype=torch.long)
