@@ -20,6 +20,7 @@ from omnimem.models.cache import MMCache
 from omnimem.models.transformers.causal_wan_model import CausalWanModel
 from omnimem.models.transformers.causal_wan_nsa_model import CausalWanNSAModel, set_selection_trace_context
 from omnimem.models.transformers.wan_model import patch_embed_linear_enabled
+from omnimem.models.autoencoders import get_autoencoder
 from omnimem.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
 from omnimem.schedulers import RectifiedFlowScheduler
 from omnimem.pipelines import WanTI2VPipeline
@@ -223,6 +224,27 @@ class CausalWanT2VPipeline(WanTI2VPipeline):
         self._kv_cache = None
         self._kv_cache_uncond = None
         self._cache_signature = None
+
+    @classmethod
+    def from_checkpoints(cls, pretrained, vae_path, t5_path, tokenizer_path, *, shift,
+                         frame_per_block, model_cls=CausalWanNSAModel, timings=None):
+        """Pipeline of frozen models on the CPU (VAE, umT5 in bf16, DiT); ``timings`` gets each load's seconds."""
+        t0 = time.monotonic()
+        vae = get_autoencoder(vae_path)
+        t1 = time.monotonic()
+        text_encoder = T5EncoderModel(text_len=512, dtype=torch.bfloat16, device=torch.device("cpu"),
+                                      checkpoint_path=t5_path, tokenizer_path=tokenizer_path,
+                                      shard_fn=None)
+        t2 = time.monotonic()
+        transformer = model_cls.from_pretrained(pretrained)
+        for model in (vae, text_encoder.model, transformer):
+            model.requires_grad_(False).eval()
+        if timings is not None:
+            timings.update(load_vae_s=t1 - t0, load_t5_s=t2 - t1, load_dit_s=time.monotonic() - t2)
+        return cls(transformer=transformer, tokenizer=text_encoder.tokenizer,
+                   text_encoder=text_encoder, vae=vae,
+                   scheduler=FlowUniPCMultistepScheduler(shift=shift),
+                   frame_per_block=frame_per_block)
 
     def _compiled_request(self, *, dit_device, latent_shape, window_size, sink_size,
                           image_conditioned, switch_frames, slice_last_frames, recache_mode):

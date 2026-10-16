@@ -33,6 +33,13 @@ from omnimem.models.text_encoders.t5 import T5EncoderModel
 
 logger = get_logger()
 
+# Negative prompt of a sampling call that passes none (``n_prompt=""``).
+NEG_PROMPT = ("Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, "
+              "images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, "
+              "incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, "
+              "misshapen limbs, fused fingers, still picture, messy background, three legs, many people in "
+              "the background, walking backwards")
+
 if is_bs4_available():
     from bs4 import BeautifulSoup
 
@@ -70,6 +77,7 @@ class WanTI2VPipeline(DiffusionPipeline):
     )  # noqa
 
     _optional_components = ["tokenizer", "text_encoder"]
+    sample_neg_prompt = NEG_PROMPT
     model_cpu_offload_seq = "text_encoder->transformer->vae"
     _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds"]
 

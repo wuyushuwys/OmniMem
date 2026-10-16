@@ -162,7 +162,6 @@ def evaluation_wan(
             with torch.amp.autocast(dtype=torch.bfloat16, device_type='cuda'):
                 images = pipeline.generate(
                     prompt,
-                    n_prompt="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
                     size=(width, height),
                     frame_num=num_frames,
                     shift=timestep_shift,

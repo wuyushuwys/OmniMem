@@ -177,10 +177,6 @@ def main():
         # runs, so code that asks for the current device agrees with ``device`` below.
         torch.cuda.set_device(local_rank)
         from omnimem.utils.numa_bind import bind_to_gpu_numa
-        from omnimem.models.text_encoders.t5 import T5EncoderModel
-        from omnimem.models.transformers.causal_wan_nsa_model import CausalWanNSAModel
-        from omnimem.models.autoencoders import get_autoencoder
-        from omnimem.schedulers.fm_solvers_unipc import FlowUniPCMultistepScheduler
         from omnimem.pipelines import CausalWanT2VPipeline
         import inspect
 
@@ -189,17 +185,11 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.manual_seed(args.seed)
-        transformer = CausalWanNSAModel.from_pretrained(str(args.pretrained))
-        vae = get_autoencoder(str(args.vae_path))
-        text_encoder = T5EncoderModel(text_len=512, dtype=torch.bfloat16, device=torch.device("cpu"),
-                                     checkpoint_path=str(args.t5_path), tokenizer_path=str(args.tokenizer_path), shard_fn=None)
-        for model in (transformer, vae, text_encoder.model):
-            model.requires_grad_(False).eval()
+        pipeline = CausalWanT2VPipeline.from_checkpoints(
+            str(args.pretrained), str(args.vae_path), str(args.t5_path), str(args.tokenizer_path),
+            shift=args.shift, frame_per_block=3)
         if args.compile:
-            transformer.compile(mode="default", dynamic=False)
-        pipeline = CausalWanT2VPipeline(transformer=transformer, vae=vae, text_encoder=text_encoder,
-                                       tokenizer=text_encoder.tokenizer, scheduler=FlowUniPCMultistepScheduler(shift=args.shift),
-                                       frame_per_block=3)
+            pipeline.transformer.compile(mode="default", dynamic=False)
         pipeline.to(device=device, dtype=torch.bfloat16)
         pipeline.set_progress_bar_config(disable=True)
         inference = {"checkpoint_role": args.checkpoint_role, "checkpoint_step": args.checkpoint_step, "checkpoint_directory": str(args.pretrained.resolve()),
@@ -234,7 +224,6 @@ def main():
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
                 generated = pipeline.generate(
                     input_prompt=record["prompts"][0], size=(args.width, args.height),
-                    n_prompt="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
                     frame_num=timing["generated_frames"], shift=args.shift, sampling_steps=args.steps,
                     guide_scale=args.cfg, generator=generator, offload_model=False,
                     window_size=inference["window_size"], sink_size=inference["sink_size"],

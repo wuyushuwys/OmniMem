@@ -19,6 +19,7 @@ import torch
 
 from omnimem.models.cache import EXACT_PINNED_KV_ENV, exact_pinned_kv_enabled
 from omnimem.pipelines import compile_state
+from omnimem.pipelines.pipeline_wan import NEG_PROMPT
 from omnimem.pipelines.pipeline_wan_causal import validate_kv_policy
 from omnimem.pipelines.streaming_decode import (
     LatentChunk,
@@ -39,12 +40,6 @@ def _block_store_device_bytes(store_cfg: dict) -> int:
         return int(store_cfg.get("resident_history_bytes") or 0)
     return int(store_cfg.get("pool_bytes") or 0) + int(store_cfg.get("scratch_bytes") or 0)
 
-
-NEG_PROMPT = ("Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, "
-              "images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, "
-              "incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, "
-              "misshapen limbs, fused fingers, still picture, messy background, three legs, many people in "
-              "the background, walking backwards")
 
 DEFAULT_PROMPT = "A cat sitting at a grand piano, elegantly playing a classical piece with its paws."
 
@@ -340,10 +335,7 @@ class StreamingRuntime:
     # ------------------------------------------------------------------ loading
     def load(self) -> Dict[str, Any]:
         from omnimem.nsa import backend as nsa_backend
-        from omnimem.models.text_encoders.t5 import T5EncoderModel
         from omnimem.models.transformers.causal_wan_nsa_model import CausalWanNSAModel
-        from omnimem.models.autoencoders import get_autoencoder
-        from omnimem.schedulers.fm_solvers_unipc import FlowUniPCMultistepScheduler
         from omnimem.pipelines import CausalWanT2VPipeline
         from omnimem.models.transformers.wan_model import set_patch_embed_linear
 
@@ -359,19 +351,13 @@ class StreamingRuntime:
             block_kv_ops.load()
             block_kv_ops.warmup(self.dit_device)
 
-        t0 = time.monotonic()
-        scheduler = FlowUniPCMultistepScheduler(shift=r.shift)
-        vae = get_autoencoder(self.paths.vae_path)
-        t_vae = time.monotonic()
-        text_encoder = T5EncoderModel(text_len=512, dtype=torch.bfloat16, device=torch.device("cpu"),
-                                      checkpoint_path=self.paths.t5_path,
-                                      tokenizer_path=self.paths.tokenizer_path, shard_fn=None)
-        text_encoder.model.requires_grad_(False).eval()
+        timings = {}
+        pipeline = CausalWanT2VPipeline.from_checkpoints(
+            self.paths.pretrained, self.paths.vae_path, self.paths.t5_path,
+            self.paths.tokenizer_path, shift=r.shift, frame_per_block=r.frame_per_block,
+            timings=timings)
+        transformer, vae, text_encoder = pipeline.transformer, pipeline.vae, pipeline.text_encoder
         t5_param_bytes = sum(p.numel() * p.element_size() for p in text_encoder.model.parameters())
-        t_t5 = time.monotonic()
-        transformer = CausalWanNSAModel.from_pretrained(self.paths.pretrained)
-        transformer.requires_grad_(False).eval()
-        vae.requires_grad_(False).eval()
         t_dit = time.monotonic()
 
         transformer.to(device=self.dit_device, dtype=torch.bfloat16)
@@ -382,15 +368,11 @@ class StreamingRuntime:
             compile_state.pin_compile_settings()
             transformer.compile(mode=r.compile_mode)
             self._compiled = True
-        pipeline = CausalWanT2VPipeline(transformer=transformer, tokenizer=text_encoder.tokenizer,
-                                        text_encoder=text_encoder, vae=vae, scheduler=scheduler,
-                                        frame_per_block=r.frame_per_block)
         # Explicit placement: never pipeline.to(device) once the VAE may live elsewhere.
         self.pipeline, self.transformer, self.vae, self.text_encoder = pipeline, transformer, vae, text_encoder
         self.place_vae(self.decode_device)
         self.load_info = {
-            "load_vae_s": t_vae - t0, "load_t5_s": t_t5 - t_vae, "load_dit_s": t_dit - t_t5,
-            "to_device_s": time.monotonic() - t_dit,
+            **timings, "to_device_s": time.monotonic() - t_dit,
             "flash_attention": flash_attention_backend(),
             "nsa_backend": nsa_backend.get_backend(),
             "compile": r.compile, "compile_mode": r.compile_mode if r.compile else None,

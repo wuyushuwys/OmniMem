@@ -43,11 +43,8 @@ if not result and result.reason not in ("single-NUMA machine (no perf impact)",)
 
 import transformers
 import diffusers
-from omnimem.models.text_encoders.t5 import T5EncoderModel
 from omnimem.models.transformers.causal_wan_model import CausalWanModel
 from omnimem.models.transformers.causal_wan_nsa_model import CausalWanNSAModel
-from omnimem.models.autoencoders import get_autoencoder
-from omnimem.schedulers.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from omnimem.pipelines import CausalWanT2VPipeline
 from omnimem.utils.io import save_videos_grid_pil
 from omnimem.utils.aws_handler import S3
@@ -118,22 +115,6 @@ s3 = S3(
 with open(args.prompt_path, 'r') as f:
     prompt_list = [line.strip() for line in f.readlines()]
 
-# Build the pipeline.
-noise_scheduler = FlowUniPCMultistepScheduler(shift=args.shift)
-vae = get_autoencoder(args.vae_path)
-text_encoder = T5EncoderModel(
-    text_len=512,
-    dtype=torch.bfloat16,
-    device=torch.device('cpu'),
-    checkpoint_path=args.t5_path,
-    tokenizer_path=args.tokenizer_path,
-    shard_fn=None,
-)
-tokenizer = text_encoder.tokenizer
-text_encoder.model.requires_grad_(False)
-text_encoder.model.eval()
-
-
 def get_model_name(pretrained_path: str) -> str:
     parts = pretrained_path.rstrip('/').split('/')
     skip = {'generator', 'ema', 'model', 'checkpoints', 'checkpoint'}
@@ -145,8 +126,11 @@ def get_model_name(pretrained_path: str) -> str:
 
 model_name = get_model_name(args.pretrained)
 
-model_cls = CausalWanNSAModel if args.nsa else CausalWanModel
-transformer = model_cls.from_pretrained(args.pretrained)
+# Build the pipeline.
+pipeline = CausalWanT2VPipeline.from_checkpoints(
+    args.pretrained, args.vae_path, args.t5_path, args.tokenizer_path, shift=args.shift,
+    frame_per_block=args.frame_per_block, model_cls=CausalWanNSAModel if args.nsa else CausalWanModel)
+transformer = pipeline.transformer
 model_numel, model_numel_trainable = get_model_numel(transformer)
 if rank == 0:
     logger.info(
@@ -154,20 +138,7 @@ if rank == 0:
         f"Total model params: {format_numel_str(model_numel)}"
     )
 
-vae.requires_grad_(False)
-vae.eval()
-transformer.requires_grad_(False)
-transformer.eval()
 transformer.compile(mode='max-autotune-no-cudagraphs')
-
-pipeline = CausalWanT2VPipeline(
-    transformer=transformer,
-    tokenizer=tokenizer,
-    text_encoder=text_encoder,
-    vae=vae,
-    scheduler=noise_scheduler,
-    frame_per_block=args.frame_per_block,
-)
 pipeline.to(dtype=torch.bfloat16, device='cuda')
 
 # Dict form caps only the full-res KV window (SWA); the cmp cache stays unlimited.
@@ -175,7 +146,6 @@ window_size_dict = {'kv': args.window_size, 'kv_cmp': None}
 sink_size_dict = {'kv': args.sink_size, 'kv_cmp': None}
 
 pipe_kwargs = dict(
-    n_prompt="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
     size=(args.width, args.height),
     frame_num=args.nframes,
     shift=args.shift,
