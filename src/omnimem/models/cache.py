@@ -86,6 +86,44 @@ def exact_pinned_empty(shape, dtype: torch.dtype, device='cuda') -> torch.Tensor
     return flat.view(shape)
 
 
+def pinned_host_empty(shape, dtype: torch.dtype, device, exact: bool) -> torch.Tensor:
+    """Uninitialized page-locked CPU tensor, exact-size or from torch's allocator."""
+    if exact:
+        return exact_pinned_empty(shape, dtype, device)
+    return torch.empty(shape, dtype=dtype, device='cpu', pin_memory=True)
+
+
+class _HostCopyEvent:
+    """Mixin: one reusable event marking when the last D2H batch into pinned host memory has landed."""
+
+    _host_event: Optional[torch.cuda.Event] = None
+    _host_event_stream = None
+    _host_event_pending: bool = False
+
+    def _record_host_event(self, device, wait_pending=None) -> None:
+        """Record on ``device``'s current stream; a point pending on another stream is waited first."""
+        stream = torch.cuda.current_stream(device)
+        ev = self._host_event
+        if ev is None or self._host_event_stream != stream:
+            if ev is not None and self._host_event_pending:
+                # Consume the pending point first, or the previous D2H batch becomes unobservable.
+                (wait_pending or self._wait_host_event)()
+            ev = torch.cuda.Event()
+            self._host_event = ev
+            self._host_event_stream = stream
+        ev.record(stream)
+        self._host_event_pending = True
+
+    def _wait_host_event(self) -> bool:
+        """Block the CPU until the recorded batch has landed; False when none is pending."""
+        ev = self._host_event
+        if ev is None or not self._host_event_pending:
+            return False
+        self._host_event_pending = False
+        ev.synchronize()
+        return True
+
+
 class _PtrStagingRing:
     """Event-protected ring of pinned host staging slots for ptr-table publishes."""
 
@@ -104,14 +142,7 @@ class _PtrStagingRing:
     def drain(self, stats: Optional[dict] = None) -> None:
         """Wait for every outstanding H2D, then clear the pending state."""
         for i in range(self.slots):
-            ev = self._events[i]
-            if self._pending[i] and ev is not None and not ev.query():
-                t0 = time.perf_counter()
-                ev.synchronize()
-                if stats is not None:
-                    stats['ring_waits'] += 1
-                    stats['ring_wait_s'] += time.perf_counter() - t0
-            self._pending[i] = False
+            self._wait(i, stats)
         self._cursor = 0
 
     def _wait(self, i: int, stats: Optional[dict]) -> None:
@@ -126,33 +157,24 @@ class _PtrStagingRing:
 
     def acquire(self, n: int, stats: dict):
         """Return ``(slot_id, host_tensor, numpy_view)`` for a batch of ``n`` entries."""
-        i = self._cursor
-        self._cursor = (self._cursor + 1) % self.slots
-        self._wait(i, stats)
-        host = self._host[i]
-        # Safe to reallocate only *after* acquire() proved the old buffer is idle.
-        if host is None or host.numel() < 2 * n:
-            if host is not None:
-                stats['ring_grows'] += 1
-            cap = max(n, self._capacity)
-            host = torch.empty(2 * cap, dtype=torch.int64, device='cpu', pin_memory=True)
-            self._host[i] = host
-            self._np[i] = host.numpy()
-        return i, host, self._np[i]
+        return self._acquire(2 * n, 2 * max(n, self._capacity), stats)
 
     def acquire_elems(self, n_elems: int, stats: dict):
         """Like :meth:`acquire`, but sized in elements."""
+        n_elems = int(n_elems)
+        return self._acquire(n_elems, max(n_elems, self._capacity), stats)
+
+    def _acquire(self, need: int, alloc: int, stats: dict):
+        """The next slot, regrown to ``alloc`` elements if it holds fewer than ``need``."""
         i = self._cursor
         self._cursor = (self._cursor + 1) % self.slots
         self._wait(i, stats)
         host = self._host[i]
-        n_elems = int(n_elems)
         # Safe to reallocate only *after* _wait() proved the old buffer is idle.
-        if host is None or host.numel() < n_elems:
+        if host is None or host.numel() < need:
             if host is not None:
                 stats['ring_grows'] += 1
-            cap = max(n_elems, self._capacity)
-            host = torch.empty(cap, dtype=torch.int64, device='cpu', pin_memory=True)
+            host = torch.empty(alloc, dtype=torch.int64, device='cpu', pin_memory=True)
             self._host[i] = host
             self._np[i] = host.numpy()
         return i, host, self._np[i]
@@ -166,7 +188,7 @@ class _PtrStagingRing:
         self._pending[slot_id] = True
 
 
-class MMCache:
+class MMCache(_HostCopyEvent):
     """
     Multi-modal cache with chunked + per-head storage and GPU-resident ptr tables
     for selection-attention fast path.
@@ -338,10 +360,6 @@ class MMCache:
         self._chunk_version: Dict[int, Dict[str, List[List[int]]]] = {}
         # _slot_meta[name][layer][head][cid] = (version, shape, dtype) of the pinned slot, or None.
         self._slot_meta: Dict[str, Dict[int, List[List[Optional[tuple]]]]] = {}
-        # Recorded after each flush's D2H batch; host reads of a slot must wait on it.
-        self._offload_event: Optional[torch.cuda.Event] = None
-        self._offload_event_stream = None
-        self._offload_event_pending: bool = False
         # Runtime-only, like reload_stats/ptr_stats: never serialized.
         self.offload_stats: Dict[str, int] = self._fresh_offload_stats()
 
@@ -1169,25 +1187,8 @@ class MMCache:
         """Block the CPU until the last ``flush_offload`` D2H batch has landed."""
         if self._block_store is not None:
             self._block_store.wait_host()
-        ev = self._offload_event
-        if ev is None or not self._offload_event_pending:
-            return
-        self._offload_event_pending = False
-        self.offload_stats['host_waits'] += 1
-        ev.synchronize()
-
-    def _record_offload_event(self, device) -> None:
-        stream = torch.cuda.current_stream(device)
-        ev = self._offload_event
-        if ev is None or self._offload_event_stream != stream:
-            if ev is not None and self._offload_event_pending:
-                # Consume the pending point first, or the previous flush's D2H becomes unobservable.
-                self.wait_offload_host()
-            ev = torch.cuda.Event()
-            self._offload_event = ev
-            self._offload_event_stream = stream
-        ev.record(stream)
-        self._offload_event_pending = True
+        if self._wait_host_event():
+            self.offload_stats['host_waits'] += 1
 
     # ──────────────────────────────────────────────────────────
     # Chunk ptr table maintenance
@@ -2015,31 +2016,7 @@ class MMCache:
         if self.lru_max_size <= 0:
             return
         key = (layer_idx, name, head)
-        lru = self._ensure_lru(key)
-
-        if cid in lru:
-            lru.move_to_end(cid)
-            self._lru_total_access += 1
-            self._lru_hits[key] += 1
-            self._lru_total_hits += 1
-            self._lru_recent_window.append(1)
-        else:
-            cold = self._is_chunk_on_gpu(layer_idx, name, head, cid)
-
-            if len(lru) >= self.lru_max_size:
-                evicted_cid, _ = lru.popitem(last=False)
-                self._mark_for_offload(layer_idx, name, head, evicted_cid)
-            lru[cid] = None
-            if len(lru) > self._lru_maxlen:
-                self._lru_maxlen = len(lru)
-
-            if cold:
-                self._lru_cold_misses[key] += 1
-                self._lru_total_cold_misses += 1
-            else:
-                self._lru_total_access += 1
-                self._lru_misses[key] += 1
-                self._lru_recent_window.append(0)
+        self._lru_touch(key, self._ensure_lru(key), cid)
 
     def lru_touch_many(self, layer_idx: int, name: str, pairs: Iterable[Tuple[int, int]]):
         """Same as looping lru_touch_per_head over the pairs, with the key lookup hoisted."""
@@ -2053,30 +2030,34 @@ class MMCache:
                 cur_h = h
                 key = (layer_idx, name, h)
                 lru = self._ensure_lru(key)
+            self._lru_touch(key, lru, cid)
 
-            if cid in lru:
-                lru.move_to_end(cid)
-                self._lru_total_access += 1
-                self._lru_hits[key] += 1
-                self._lru_total_hits += 1
-                self._lru_recent_window.append(1)
-            else:
-                cold = self._is_chunk_on_gpu(layer_idx, name, h, cid)
+    def _lru_touch(self, key: tuple, lru: OrderedDict, cid: int) -> None:
+        """Mark ``cid`` most recently used in ``lru``, the LRU of ``key = (layer, name, head)``."""
+        if cid in lru:
+            lru.move_to_end(cid)
+            self._lru_total_access += 1
+            self._lru_hits[key] += 1
+            self._lru_total_hits += 1
+            self._lru_recent_window.append(1)
+            return
+        layer_idx, name, head = key
+        cold = self._is_chunk_on_gpu(layer_idx, name, head, cid)
 
-                if len(lru) >= self.lru_max_size:
-                    evicted_cid, _ = lru.popitem(last=False)
-                    self._mark_for_offload(layer_idx, name, h, evicted_cid)
-                lru[cid] = None
-                if len(lru) > self._lru_maxlen:
-                    self._lru_maxlen = len(lru)
+        if len(lru) >= self.lru_max_size:
+            evicted_cid, _ = lru.popitem(last=False)
+            self._mark_for_offload(layer_idx, name, head, evicted_cid)
+        lru[cid] = None
+        if len(lru) > self._lru_maxlen:
+            self._lru_maxlen = len(lru)
 
-                if cold:
-                    self._lru_cold_misses[key] += 1
-                    self._lru_total_cold_misses += 1
-                else:
-                    self._lru_total_access += 1
-                    self._lru_misses[key] += 1
-                    self._lru_recent_window.append(0)
+        if cold:
+            self._lru_cold_misses[key] += 1
+            self._lru_total_cold_misses += 1
+        else:
+            self._lru_total_access += 1
+            self._lru_misses[key] += 1
+            self._lru_recent_window.append(0)
 
     def lru_contains(self, layer_idx: int, name: str, cid: int) -> bool:
         if self.lru_max_size <= 0:
@@ -2396,9 +2377,9 @@ class MMCache:
 
     def _alloc_offload_buffer(self, shape, dtype, pin_memory: bool) -> torch.Tensor:
         """Allocate an offload buffer without host-allocator rounding when enabled."""
-        if pin_memory and self.exact_pinned_host():
-            return exact_pinned_empty(shape, dtype, self.device)
-        return torch.empty(shape, dtype=dtype, device='cpu', pin_memory=pin_memory)
+        if not pin_memory:
+            return torch.empty(shape, dtype=dtype, device='cpu')
+        return pinned_host_empty(shape, dtype, self.device, self.exact_pinned_host())
 
     def _pinned_buffers_match(self, per_slot_shape, dtype, segment_cids, layer_ids) -> bool:
         bufs = self._pinned_buffers
@@ -2591,7 +2572,7 @@ class MMCache:
         finally:
             # In a ``finally``: chunks moved before an interruption have still left this card.
             if copied_from is not None:
-                self._record_offload_event(copied_from)
+                self._record_host_event(copied_from, self.wait_offload_host)
 
             # Phase 4: one publish batch per layer; the table is authoritative on return.
             for li, entries in ptr_by_layer.items():

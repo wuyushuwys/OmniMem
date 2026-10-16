@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from omnimem.models.cache import _HostCopyEvent, _PtrStagingRing, pinned_host_empty
 from omnimem.nsa.backend import resolve_block_kv_backend
 from omnimem.nsa.ops.selection.padded_ptr.kernels.block_kv_kernels import (
     clear_block_range,
@@ -90,7 +91,7 @@ class BlockSelectionLease:
 _EMPTY_LEASE = BlockSelectionLease()
 
 
-class BlockKVStore:
+class BlockKVStore(_HostCopyEvent):
     """Per-``MMCache`` block pools, authoritative address table and block LRU."""
 
     def __init__(self, *, layers: Sequence[int], num_heads: int, block_tokens: int,
@@ -99,8 +100,6 @@ class BlockKVStore:
                  resident_if_fits: bool = True, history_bytes: int = 0,
                  dedup: str = 'device',
                  block_kv_backend: str | None = None):
-        from omnimem.models.cache import _PtrStagingRing  # local: avoid a cycle
-
         self.layers: List[int] = sorted(int(x) for x in layers)
         if not self.layers:
             raise ValueError("the block KV store needs at least one layer")
@@ -209,9 +208,6 @@ class BlockKVStore:
         self._scratch_event: Optional[torch.cuda.Event] = None
         self._scratch_stream = None
         self._owner_stream = None
-        self._host_event: Optional[torch.cuda.Event] = None
-        self._host_event_stream = None
-        self._host_event_pending = False
         # K3 dedup object: built lazily from the first call's ``block_indices`` shape.
         self._dedup = None
 
@@ -340,8 +336,10 @@ class BlockKVStore:
         rows = max(rows, old_rows)
         self.wait_host()
         self.backing = {}
+        shape = (rows, self.H, self.B, self.S_max, self.D)
         for L in self.layers:
-            self.backing[L] = {n: self._host_buffer(rows, exact_pinned) for n in NAMES}
+            self.backing[L] = {n: pinned_host_empty(shape, self.dtype, self.device, exact_pinned)
+                               for n in NAMES}
             prev = old_backing.get(L)
             if prev is not None and old_rows > 0:
                 keep = min(old_rows, rows)
@@ -351,14 +349,6 @@ class BlockKVStore:
         self._refresh_host_base()
         self._refresh_capacity_stats()
         return True
-
-    def _host_buffer(self, rows: int, exact_pinned: bool) -> torch.Tensor:
-        """One uninitialised page-locked ``[rows, H, B, S_max, D]`` backing buffer."""
-        shape = (rows, self.H, self.B, self.S_max, self.D)
-        if exact_pinned:
-            from omnimem.models.cache import exact_pinned_empty  # local: avoid a cycle
-            return exact_pinned_empty(shape, self.dtype, self.device)
-        return torch.empty(shape, dtype=self.dtype, device='cpu', pin_memory=True)
 
     def rebind_host_views(self, cache) -> int:
         """Re-point the cache's host chunk views at the current backing rows; returns the count."""
@@ -458,6 +448,26 @@ class BlockKVStore:
         self._pc_layer = self._pc_layer[keep]
         self._pc_row = self._pc_row[keep]
         self._pc_key = self._pc_key[keep]
+
+    def _drop_stale_copies(self, L: int, cid_lo: int, cid_hi: int) -> None:
+        """Chunks ``[cid_lo, cid_hi)`` changed: drop their pool copies, deferred clears and fetch records."""
+        self._invalidate_pool_cids(L, cid_lo, cid_hi)
+        self._purge_pending(L, cid_lo, cid_hi)
+        # The cid range is ONE key slice.
+        self.fetched_once[L][cid_lo * self._cid_stride:cid_hi * self._cid_stride] = False
+
+    def _register_cid(self, L: int, cid: int, nb: int, k_base: int, v_base: int,
+                      row_bytes: int, n_valid_value: int = _KEEP_EXTENT) -> None:
+        """Point the first ``nb`` blocks of ``cid`` at their GPU owner (a 0 base keeps that name) and zero the rest."""
+        lo = cid * self.bpc
+        if k_base or v_base:
+            register_block_range(self.table[L], self.n_valid[L], lo, nb, k_base, v_base,
+                                 row_bytes, self.block_bytes, n_valid_value,
+                                 backend=self.block_kv_backend)
+            self.stats['register_launches'] += 1
+        if nb < self.bpc:
+            # A short chunk: every entry past its real extent must read 0 so the block is skipped.
+            self._clear_range(L, lo + nb, self.bpc - nb)
 
     def _clear_pending_all(self) -> None:
         self._pc_layer, self._pc_row, self._pc_key = _EMPTY_I32, _EMPTY_I8, _EMPTY_I64
@@ -1026,12 +1036,8 @@ class BlockKVStore:
                 f"L{L}/{name} chunk dtype {stacked.dtype} != store dtype {self.dtype}")
 
         nb = S // self.bt
-        lo = cid * self.bpc
-        klo, khi = self.cid_key_range(cid)            # ONE contiguous key slice
         # New content: every pool copy, fetch record and deferred clear of this cid is stale.
-        self._invalidate_pool_cids(L, cid, cid + 1)
-        self._purge_pending(L, cid, cid + 1)
-        self.fetched_once[L][klo:khi] = False
+        self._drop_stale_copies(L, cid, cid + 1)
         self.cver[L][n][:, cid] = int(version)
         self.prot[L][n][cid] = True
         self.gpu_chunk[L][n][cid] = stacked
@@ -1040,17 +1046,9 @@ class BlockKVStore:
             self.retired[L][cid] = False
         self._refresh_host_active(L)
         nvv = self._recompute_n_valid(L)
-
-        if nb < self.bpc:
-            # A short chunk: every entry past its real extent must read 0 so the block is skipped.
-            self._clear_range(L, lo + nb, self.bpc - nb)
         base = stacked.data_ptr()
-        register_block_range(self.table[L], self.n_valid[L], lo, nb,
-                             base if n == 'k' else 0, base if n == 'v' else 0,
-                             stacked.stride(0) * self.elem, self.block_bytes,
-                             nvv if n == 'v' else _KEEP_EXTENT,
-                             backend=self.block_kv_backend)
-        self.stats['register_launches'] += 1
+        self._register_cid(L, cid, nb, base if n == 'k' else 0, base if n == 'v' else 0,
+                           stacked.stride(0) * self.elem, nvv if n == 'v' else _KEEP_EXTENT)
 
     def on_chunk_freed(self, layer_idx: int, name: str, cid: int) -> None:
         """``free_last_chunk`` popped ``cid``: forget it completely."""
@@ -1060,9 +1058,7 @@ class BlockKVStore:
             return
         lo = cid * self.bpc
         klo, khi = self.cid_key_range(cid)            # ONE contiguous key slice
-        self._invalidate_pool_cids(L, cid, cid + 1)
-        self._purge_pending(L, cid, cid + 1)
-        self.fetched_once[L][klo:khi] = False
+        self._drop_stale_copies(L, cid, cid + 1)
         self.fetched_ever[L][klo:khi] = False
         self.cver[L][n][:, cid] = -1
         self.host_ver[L][n][:, cid] = -1
@@ -1134,32 +1130,15 @@ class BlockKVStore:
 
         for run_lo, run_hi in _runs(cids):
             self._clear_range(L, run_lo * self.bpc, (run_hi - run_lo) * self.bpc)
-        self._record_host_event()
+        self._record_host_event(self.device)
         return views
-
-    def _record_host_event(self) -> None:
-        """Record this retirement batch's D2H completion point (one reusable event)."""
-        stream = torch.cuda.current_stream(self.device)
-        ev = self._host_event
-        if ev is None or self._host_event_stream != stream:
-            if ev is not None and self._host_event_pending:
-                ev.synchronize()
-            ev = torch.cuda.Event()
-            self._host_event = ev
-            self._host_event_stream = stream
-        ev.record(stream)
-        self._host_event_pending = True
 
     def wait_host(self) -> None:
         """Block the CPU until the last retirement D2H batch has landed."""
-        ev = self._host_event
-        if ev is None or not self._host_event_pending:
-            return
-        self._host_event_pending = False
-        ev.synchronize()
+        self._wait_host_event()
 
-    def reset(self) -> None:
-        """New request: forget every mapping.  Pools, scratch, backing, desc survive."""
+    def _forget_mappings(self) -> None:
+        """Wait for the in-flight copies, then empty every table and its metadata."""
         self._ring.drain(self.stats)
         self.wait_host()
         for L in self.layers:
@@ -1170,6 +1149,10 @@ class BlockKVStore:
         self._clear_pending_all()
         self._scratch_event = None
         self._scratch_stream = None
+
+    def reset(self) -> None:
+        """New request: forget every mapping.  Pools, scratch, backing, desc survive."""
+        self._forget_mappings()
         self._owner_stream = None
         self.generation += 1
 
@@ -1208,16 +1191,7 @@ class BlockKVStore:
         """Canonicalise every chunk of ``cache`` into the store's layout."""
         H = self.H
         self.flush_pending_clears()
-        self._ring.drain(self.stats)
-        self.wait_host()
-        for L in self.layers:
-            self.table[L].zero_()
-            self.n_valid[L].zero_()
-            self._init_layer_meta(L)
-        self._clear_pending_all()
-        self._scratch_event = None
-        self._scratch_stream = None
-        self._refresh_host_base()
+        self._forget_mappings()
 
         plan: Dict[int, Dict[int, dict]] = {}
         rows = 0
@@ -1305,13 +1279,7 @@ class BlockKVStore:
                     to_host and set(entry['cols']) == set(NAMES))
             nvv = self._recompute_n_valid(L)
             for n, cid, nb, base, hs in pending:
-                register_block_range(self.table[L], self.n_valid[L], cid * self.bpc, nb,
-                                     base if n == 'k' else 0, base if n == 'v' else 0,
-                                     hs, self.block_bytes, _KEEP_EXTENT,
-                                     backend=self.block_kv_backend)
-                self.stats['register_launches'] += 1
-                if nb < self.bpc:
-                    self._clear_range(L, cid * self.bpc + nb, self.bpc - nb)
+                self._register_cid(L, cid, nb, base if n == 'k' else 0, base if n == 'v' else 0, hs)
             self._publish_n_valid(L, nvv)
             self._refresh_host_active(L)
         return total
@@ -1343,10 +1311,7 @@ class BlockKVStore:
         L = snap['layer']
         lo, hi = snap['lo'], snap['hi']
         if hi > lo:
-            # The whole restored cid range is ONE key slice.
-            self._invalidate_pool_cids(L, lo, hi)
-            self._purge_pending(L, lo, hi)
-            self.fetched_once[L][lo * self._cid_stride:hi * self._cid_stride] = False
+            self._drop_stale_copies(L, lo, hi)
             for n in NAMES:
                 self.cver[L][n][:, lo:hi] = snap['cver'][n]
                 self.host_ver[L][n][:, lo:hi] = snap['host_ver'][n]
@@ -1379,17 +1344,11 @@ class BlockKVStore:
                   for n in NAMES}
         kb = owners['k'].data_ptr() if owners['k'] is not None else 0
         vb = owners['v'].data_ptr() if owners['v'] is not None else 0
-        if kb or vb:
-            ref = owners['k'] if owners['k'] is not None else owners['v']
-            register_block_range(self.table[L], self.n_valid[L], lo, nb, kb, vb,
-                                 ref.stride(0) * self.elem, self.block_bytes,
-                                 _KEEP_EXTENT, backend=self.block_kv_backend)
-            self.stats['register_launches'] += 1
+        ref = owners['k'] if owners['k'] is not None else owners['v']
+        self._register_cid(L, cid, nb, kb, vb, 0 if ref is None else ref.stride(0) * self.elem)
         for n in NAMES:
             if owners[n] is None:
                 self._clear_range(L, lo, nb, which=n)
-        if nb < self.bpc:
-            self._clear_range(L, lo + nb, self.bpc - nb)
 
     def block_hit_rate(self) -> float:
         """``(protected + persistent) / selected_unique`` over non-fast-path calls."""
